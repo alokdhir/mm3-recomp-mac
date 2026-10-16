@@ -129,6 +129,15 @@ static int saved_render_lines(void)
     nv2a_metal_toggle_texture_pack();
 }
 
+/* Debug > Keep a Log: from the next launch, what the game prints is kept in
+ * ~/Library/Logs/Midtown Madness 3.log (see redirect_log). Off by default. */
+- (void)toggleKeepLog:(NSMenuItem *)item
+{
+    BOOL on = [item state] != NSControlStateValueOn;
+    [item setState:on ? NSControlStateValueOn : NSControlStateValueOff];
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"KeepLog"];
+}
+
 - (void)saveRecentFrames:(id)sender
 {
     extern void xbox_FramebufferReleaseKeys(void);
@@ -202,13 +211,15 @@ static int find_game_dir(void)
     return access("game_files/default.xbe", R_OK) == 0;
 }
 
-/* Opened from Finder there is no terminal: keep the log where Console and a
- * bug report can find it, ~/Library/Logs/Midtown Madness 3.log. */
+/* Opened from Finder the game's output goes nowhere, unless Debug > Keep a
+ * Log is on: then to ~/Library/Logs/Midtown Madness 3.log, where Console and
+ * a bug report can find it. */
 static void redirect_log(void)
 {
     char path[4096];
     const char *home = getenv("HOME");
     struct stat st, null_st;
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:@"KeepLog"]) return;
     /* LaunchServices hands an app /dev/null; a terminal, file or pipe that
      * the caller chose stays as it is. */
     if (!home || fstat(STDERR_FILENO, &st) != 0 || stat("/dev/null", &null_st) != 0 ||
@@ -378,6 +389,16 @@ static void build_menu(void)
             [pack setState:NSControlStateValueOn];
             [dbg addItem:pack];
             [pack release];
+        }
+        {
+            NSMenuItem *log = [[NSMenuItem alloc] initWithTitle:@"Keep a Log (from Next Launch)"
+                                                        action:@selector(toggleKeepLog:)
+                                                 keyEquivalent:@""];
+            [log setTarget:[NSApp delegate]];
+            [log setState:[[NSUserDefaults standardUserDefaults] boolForKey:@"KeepLog"]
+                          ? NSControlStateValueOn : NSControlStateValueOff];
+            [dbg addItem:log];
+            [log release];
         }
         [dbg_item setSubmenu:dbg];
         [bar addItem:dbg_item];

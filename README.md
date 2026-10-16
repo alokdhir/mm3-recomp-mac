@@ -96,8 +96,8 @@ the GPU and audio chip are modelled and translated to Metal and Core Audio.
   Privacy & Security → *Open Anyway*.
 - **Debug → Save Recent Frames** (⌘⇧S) writes the last 48 frames to
   `~/Library/Logs/Midtown Madness 3 Frames/`, handy for reporting a visual
-  glitch. When opened from Finder the log is
-  `~/Library/Logs/Midtown Madness 3.log`.
+  glitch. The game keeps no log unless **Debug → Keep a Log** is on; from
+  the next launch it then writes `~/Library/Logs/Midtown Madness 3.log`.
 
 ## Credits
 
