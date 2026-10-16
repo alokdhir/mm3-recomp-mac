@@ -65,7 +65,8 @@ see its log in the terminal.
   and are remembered. The defaults are 1440p with 4x on Pro, Max and Ultra
   chips, 1080p with 2x on the base chips.
 - The picture follows the window's shape (widescreen by default).
-- Saves live in `~/Library/Application Support/xboxrecomp/`.
+- Saves live in `~/Library/Application Support/Midtown Madness 3/`
+  (earlier builds used `.../xboxrecomp/`; the first launch moves it).
 
 Xbox One, Series and PlayStation controllers work over Bluetooth or USB.
 

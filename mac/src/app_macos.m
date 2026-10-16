@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/file.h>
@@ -261,15 +262,53 @@ static void mac_defaults(void)
     if (!getenv("RECOMP_ANISO")) setenv("RECOMP_ANISO", "16", 1);
 }
 
+/* Whether another process holds dir/.running (a copy of the game on it). */
+static int save_dir_busy(const char *dir)
+{
+    char path[4200];
+    int fd, busy;
+    snprintf(path, sizeof path, "%s/.running", dir);
+    if ((fd = open(path, O_RDWR | O_CLOEXEC)) < 0) return 0;
+    busy = flock(fd, LOCK_EX | LOCK_NB) != 0;
+    close(fd);
+    return busy;
+}
+
+/* The save drive: ~/Library/Application Support/Midtown Madness 3, unless
+ * MM3_SAVE_DIR names one. Builds before 2026-10-16 used the runtime's
+ * generic ".../xboxrecomp"; that folder is moved here once (a rename, so
+ * instant), unless the new one exists already or a copy of an older build
+ * is still playing from it. Returns 0 when such a copy is running. */
+static int choose_save_dir(void)
+{
+    char dir[4096], old[4096];
+    const char *home = getenv("HOME");
+    struct stat st;
+    if (getenv("MM3_SAVE_DIR") && *getenv("MM3_SAVE_DIR")) return 1;
+    if (!home || !*home) home = ".";
+    snprintf(dir, sizeof dir, "%s/Library/Application Support/Midtown Madness 3", home);
+    snprintf(old, sizeof old, "%s/Library/Application Support/xboxrecomp", home);
+    if (stat(dir, &st) != 0 && stat(old, &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (save_dir_busy(old)) return 0;
+        if (rename(old, dir) == 0)
+            fprintf(stderr, "[SAVE] moved the saves from %s to %s\n", old, dir);
+        else {
+            fprintf(stderr, "[SAVE] cannot move %s (%s); using it where it is\n", old, strerror(errno));
+            snprintf(dir, sizeof dir, "%s", old);
+        }
+    }
+    setenv("MM3_SAVE_DIR", dir, 1);
+    return 1;
+}
+
 /* One game per save drive: two would write the same disk images and saves.
  * Held until exit (the descriptor is never closed). */
 static int single_instance(void)
 {
     char dir[4096], path[4200];
-    const char *save = getenv("MM3_SAVE_DIR"), *home = getenv("HOME");
+    const char *save = getenv("MM3_SAVE_DIR");
     int fd;
-    if (save && *save) snprintf(dir, sizeof dir, "%s", save);
-    else snprintf(dir, sizeof dir, "%s/Library/Application Support/xboxrecomp", home ? home : ".");
+    snprintf(dir, sizeof dir, "%s", save && *save ? save : ".");
     mkdir(dir, 0755);
     snprintf(path, sizeof path, "%s/.running", dir);
     fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
@@ -399,7 +438,7 @@ int main(int argc, char **argv)
             no_game_alert();
             return 1;
         }
-        if (!single_instance()) {
+        if (!choose_save_dir() || !single_instance()) {
             fprintf(stderr, "another copy is running on this save drive\n");
             already_running_alert();
             return 1;
