@@ -53,6 +53,22 @@ set(XBOX_VIDEO_BACKEND_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/mac/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/video"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mm3-recomp/tools/xboxrecomp/src/platform")
+# The shader source, embedded in the renderer (nv2a_metal_source.inc): with
+# no precompiled library the renderer compiles it at launch (about half a
+# second), so a build needs only the Command Line Tools, not Xcode's Metal
+# compiler. Regenerated whenever the shader changes.
+set(NV2A_METAL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/video/nv2a.metal")
+set(MM3_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${NV2A_METAL_SRC}")
+file(READ "${NV2A_METAL_SRC}" nv2a_metal_hex HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," nv2a_metal_hex "${nv2a_metal_hex}")
+file(WRITE "${MM3_GENERATED_DIR}/nv2a_metal_source.inc.new"
+     "/* Generated from mac/src/video/nv2a.metal by CMakeLists.txt. */\n"
+     "static const unsigned char nv2a_metal_source[] = { ${nv2a_metal_hex} 0x00 };\n")
+file(COPY_FILE "${MM3_GENERATED_DIR}/nv2a_metal_source.inc.new"
+     "${MM3_GENERATED_DIR}/nv2a_metal_source.inc" ONLY_IF_DIFFERENT)
+list(APPEND XBOX_VIDEO_BACKEND_INCLUDES "${MM3_GENERATED_DIR}")
+
 set(XBOX_VIDEO_BACKEND_LIBRARIES
     "-framework Metal" "-framework QuartzCore" "-framework Cocoa" "-framework Carbon"
     "-framework ImageIO" "-framework CoreGraphics")
@@ -80,9 +96,26 @@ set_property(SOURCE ${MM3_GEN_SOURCES} DIRECTORY third_party/mm3-recomp APPEND P
     COMPILE_OPTIONS -Wno-error=implicit-function-declaration -Wno-parentheses-equality
     -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0)
 
-# The renderer's shaders, compiled ahead of time beside the executable.
-set(NV2A_METAL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/video/nv2a.metal")
+# The renderer's shaders, compiled ahead of time beside the executable when
+# a Metal compiler is installed (Xcode); otherwise they are compiled from the
+# embedded source at launch.
 set(NV2A_METALLIB "${CMAKE_CURRENT_BINARY_DIR}/third_party/mm3-recomp/nv2a.metallib")
+# -DMM3_PRECOMPILE_SHADERS=OFF builds as a machine without Xcode would.
+if(NOT DEFINED MM3_PRECOMPILE_SHADERS)
+    execute_process(COMMAND ${CMAKE_COMMAND} -E env TOOLCHAINS=Metal xcrun -sdk macosx metal --version
+                    RESULT_VARIABLE mm3_metal_rc OUTPUT_QUIET ERROR_QUIET)
+    if(mm3_metal_rc EQUAL 0)
+        set(MM3_PRECOMPILE_SHADERS ON)
+    else()
+        set(MM3_PRECOMPILE_SHADERS OFF)
+    endif()
+endif()
+if(MM3_PRECOMPILE_SHADERS)
+    message(STATUS "Metal compiler found: shaders precompiled")
+else()
+    message(STATUS "No Metal compiler (Xcode): shaders compile at launch from the embedded source")
+endif()
+if(MM3_PRECOMPILE_SHADERS)
 # TOOLCHAINS=Metal: newer Xcodes ship the Metal compiler as a separate
 # download (xcodebuild -downloadComponent MetalToolchain), which plain xcrun
 # does not always find; naming it works either way.
@@ -97,20 +130,28 @@ add_custom_command(OUTPUT "${NV2A_METALLIB}"
     COMMENT "Compiling the NV2A Metal shaders")
 add_custom_target(nv2a_metallib ALL DEPENDS "${NV2A_METALLIB}")
 add_dependencies(mm3_recomp nv2a_metallib)
+endif()
 
 # Without game_files/ beside the app (or above it, as in this checkout), the
 # app looks here: the tree it was built from.
 set_property(SOURCE mac/src/app_macos.m APPEND PROPERTY
     COMPILE_DEFINITIONS "MM3_BUILD_ROOT=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
 
-# build/Midtown Madness 3.app: the same executable, the shaders in Resources,
-# ad-hoc signed. The game data stays outside it (game_files/).
+# build/Midtown Madness 3.app: the same executable, the shaders in Resources
+# (when precompiled), ad-hoc signed. The game data stays outside it (game_files/).
 if(CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET_OR_DEFAULT "${CMAKE_OSX_DEPLOYMENT_TARGET}")
 else()
     set(CMAKE_OSX_DEPLOYMENT_TARGET_OR_DEFAULT "13.0")
 endif()
 set(MM3_APP "${CMAKE_CURRENT_BINARY_DIR}/Midtown Madness 3.app")
+set(MM3_APP_METALLIB_COPY "")
+set(MM3_APP_METALLIB_DEP "")
+if(MM3_PRECOMPILE_SHADERS)
+    set(MM3_APP_METALLIB_COPY COMMAND ${CMAKE_COMMAND} -E copy "${NV2A_METALLIB}"
+                              "${MM3_APP}/Contents/Resources/")
+    set(MM3_APP_METALLIB_DEP "${NV2A_METALLIB}")
+endif()
 configure_file(mac/bundle/Info.plist.in "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)
 # The same Info.plist inside the executable, so the bare build-tree binary
 # carries the app's identity too: system services such as controller haptics
@@ -132,13 +173,13 @@ add_custom_target(mm3_signed ALL DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/mm3_recomp
 add_custom_command(OUTPUT "${MM3_APP}/Contents/MacOS/mm3_recomp"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${MM3_APP}/Contents/MacOS" "${MM3_APP}/Contents/Resources"
     COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" "${MM3_APP}/Contents/Info.plist"
-    COMMAND ${CMAKE_COMMAND} -E copy "${NV2A_METALLIB}" "${MM3_APP}/Contents/Resources/"
+    ${MM3_APP_METALLIB_COPY}
     # Replaced by rename, so a copy of the game already running keeps its
     # executable (overwriting it in place kills that process).
     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:mm3_recomp>" "${MM3_APP}/Contents/MacOS/mm3_recomp.new"
     COMMAND ${CMAKE_COMMAND} -E rename "${MM3_APP}/Contents/MacOS/mm3_recomp.new" "${MM3_APP}/Contents/MacOS/mm3_recomp"
     COMMAND codesign --force --sign - "${MM3_APP}"
-    DEPENDS mm3_recomp "${CMAKE_CURRENT_BINARY_DIR}/mm3_recomp.signed" "${NV2A_METALLIB}"
+    DEPENDS mm3_recomp "${CMAKE_CURRENT_BINARY_DIR}/mm3_recomp.signed" ${MM3_APP_METALLIB_DEP}
             "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
     COMMENT "Packaging Midtown Madness 3.app")
 add_custom_target(mm3_app ALL DEPENDS "${MM3_APP}/Contents/MacOS/mm3_recomp")
@@ -160,9 +201,11 @@ target_include_directories(test_metal_render PRIVATE ${XBOX_VIDEO_BACKEND_INCLUD
     third_party/mm3-recomp/tools/xboxrecomp/src/video
     third_party/mm3-recomp/tools/xboxrecomp/src/kernel)
 target_link_libraries(test_metal_render PRIVATE platform ${XBOX_VIDEO_BACKEND_LIBRARIES})
-add_dependencies(test_metal_render nv2a_metallib)
-add_custom_command(TARGET test_metal_render POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NV2A_METALLIB}" "$<TARGET_FILE_DIR:test_metal_render>/")
+if(MM3_PRECOMPILE_SHADERS)
+    add_dependencies(test_metal_render nv2a_metallib)
+    add_custom_command(TARGET test_metal_render POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NV2A_METALLIB}" "$<TARGET_FILE_DIR:test_metal_render>/")
+endif()
 
 # The Xbox memory model and trapped MMIO on this host, on a synthetic XBE.
 add_executable(test_memory_layout EXCLUDE_FROM_ALL mac/tests/test_memory_layout.c)

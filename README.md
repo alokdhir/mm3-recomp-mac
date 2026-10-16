@@ -19,8 +19,9 @@ game code matches the version the recompilation was made from.
 ## Requirements
 
 - A Mac with Apple Silicon (M1 or later), macOS 14 Sonoma or later
-- Xcode (the full app: it provides the Metal shader compiler), then
-  `xcodebuild -downloadComponent MetalToolchain` if Xcode asks for it
+- The Xcode Command Line Tools: `xcode-select --install`. Full Xcode is not
+  needed; if it is installed, its Metal compiler precompiles the shaders,
+  otherwise the game compiles them in about half a second when it starts.
 - [Homebrew](https://brew.sh): `brew install cmake ninja python`
 - About 10 GB free: the extracted game (2.6 GB), the generated code and build
 - An image of **Midtown Madness 3** for the original Xbox. Known-good dumps:

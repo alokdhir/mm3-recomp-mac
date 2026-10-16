@@ -30,12 +30,10 @@ need clang "xcode-select --install"
 need cmake "brew install cmake"
 need ninja "brew install ninja"
 need python3 "brew install python"
-# The Metal shader compiler comes with Xcode (newer Xcodes download it as a
-# separate component), not with the command line tools alone.
-TOOLCHAINS=Metal xcrun -sdk macosx metal --version >/dev/null 2>&1 || {
-    echo "missing the Metal compiler: install Xcode, then run" >&2
-    echo "    xcodebuild -downloadComponent MetalToolchain" >&2
-    exit 1; }
+# Xcode is optional: with its Metal compiler the shaders are precompiled,
+# without it the game compiles them at launch (about half a second).
+TOOLCHAINS=Metal xcrun -sdk macosx metal --version >/dev/null 2>&1 ||
+    echo "(no Metal compiler: fine -- the shaders compile when the game starts)"
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' || {
     echo "python3 is too old ($(python3 --version)); brew install python" >&2; exit 1; }
 

@@ -622,20 +622,52 @@ static const char *const s_psv_names[6] = { "ps_main", "ps_main_flat", "ps_wdept
 
 /* The library built beside the executable (nv2a.metallib), or next to the
  * app's resources. */
+#include "nv2a_metal_source.inc"
+
+/* The shaders: the library built beside the executable or in the app's
+ * resources (nv2a.metallib, when the build had Xcode's Metal compiler), else
+ * the embedded source compiled now -- about half a second -- with the same
+ * language version and relaxed math (inf and NaN kept) as the offline build.
+ * RECOMP_METALLIB names a library; RECOMP_METAL_FROM_SOURCE=1 skips it. */
 static id<MTLLibrary> load_library(void)
 {
     NSError *err = nil;
     NSString *path = nil;
-    const char *env = getenv("RECOMP_METALLIB");
-    id<MTLLibrary> lib;
-    if (env) path = [NSString stringWithUTF8String:env];
-    if (!path) path = [[NSBundle mainBundle] pathForResource:@"nv2a" ofType:@"metallib"];
-    if (!path) {
-        NSString *exe = [[[NSBundle mainBundle] executablePath] stringByDeletingLastPathComponent];
-        path = [exe stringByAppendingPathComponent:@"nv2a.metallib"];
+    const char *env = getenv("RECOMP_METALLIB"), *src_only = getenv("RECOMP_METAL_FROM_SOURCE");
+    id<MTLLibrary> lib = nil;
+    if (!(src_only && *src_only && strcmp(src_only, "0"))) {
+        if (env) path = [NSString stringWithUTF8String:env];
+        if (!path) path = [[NSBundle mainBundle] pathForResource:@"nv2a" ofType:@"metallib"];
+        if (!path) {
+            NSString *exe = [[[NSBundle mainBundle] executablePath] stringByDeletingLastPathComponent];
+            path = [exe stringByAppendingPathComponent:@"nv2a.metallib"];
+        }
+        if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            lib = [s_dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:&err];
+            if (!lib) fail([[NSString stringWithFormat:@"loading %@", path] UTF8String], err);
+            return lib;
+        }
     }
-    lib = [s_dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:&err];
-    if (!lib) fail([[NSString stringWithFormat:@"loading %@", path] UTF8String], err);
+    {
+        NSString *source = [NSString stringWithUTF8String:(const char *)nv2a_metal_source];
+        MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
+        int64_t t0 = qpc();
+        opt.languageVersion = MTLLanguageVersion3_1;
+        if (@available(macOS 15.0, *)) {
+            opt.mathMode = MTLMathModeRelaxed;
+        } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            opt.fastMathEnabled = NO;               /* precise: keeps inf and NaN */
+#pragma clang diagnostic pop
+        }
+        err = nil;
+        lib = [s_dev newLibraryWithSource:source options:opt error:&err];
+        [opt release];
+        if (!lib) { fail("compiling the shaders", err); return nil; }
+        fprintf(stderr, "[METAL] shaders compiled from source in %.0f ms\n",
+                (double)(qpc() - t0) * 1000.0 / (double)QPC_FREQ);
+    }
     return lib;
 }
 
