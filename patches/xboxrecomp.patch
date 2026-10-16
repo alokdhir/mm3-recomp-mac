@@ -2331,10 +2331,10 @@ index 58a5053..ad6967c 100644
 +    LeaveCriticalSection(&g_mixer_cs);
 +}
 diff --git a/src/apu/apu_mmio_hook.c b/src/apu/apu_mmio_hook.c
-index 46cc2c5..007a572 100644
+index 46cc2c5..d093859 100644
 --- a/src/apu/apu_mmio_hook.c
 +++ b/src/apu/apu_mmio_hook.c
-@@ -1,282 +1,317 @@
+@@ -1,282 +1,347 @@
 -/*
 - * MCPX APU MMIO Hook - VEH instruction decoder for APU register access
 - *
@@ -2934,6 +2934,36 @@ index 46cc2c5..007a572 100644
 +}
 +
 +#endif /* _WIN32 */
++
++/* ============================================================
++ * Trap-free access (arm64 Darwin's ordered accessors)
++ * ============================================================
++ * The generated code's memory accessors (mm3_recomp_types.h) send an address
++ * in the APU's register window here instead of letting it fault: the same
++ * register model as the trap path, without a signal per access (several
++ * microseconds each -- DirectSound's voice updates touch these registers
++ * thousands of times a second). Fenced like the trap, which orders the access
++ * against everything around it. 0 when the APU is off: the caller then makes
++ * the plain access, which faults as before. */
++int xbox_ApuDirectRead(uint32_t va, unsigned size, uint64_t *out)
++{
++    if (!g_apu_state) return 0;
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
++    *out = mcpx_apu_mmio_read(g_apu_state, va - APU_MMIO_BASE, size);
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
++    g_apu_mmio_read_count++;
++    return 1;
++}
++
++int xbox_ApuDirectWrite(uint32_t va, uint64_t value, unsigned size)
++{
++    if (!g_apu_state) return 0;
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
++    mcpx_apu_mmio_write(g_apu_state, va - APU_MMIO_BASE, value, size);
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
++    g_apu_mmio_write_count++;
++    return 1;
++}
 diff --git a/src/apu/dsp/dsp.c b/src/apu/dsp/dsp.c
 index 5da7653..910829d 100644
 --- a/src/apu/dsp/dsp.c

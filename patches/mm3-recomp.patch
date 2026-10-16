@@ -444,7 +444,7 @@ index 91ec457..fa6bc9e 100644
  }
 +#endif /* _WIN32 */
 diff --git a/src/mm3_recomp_types.h b/src/mm3_recomp_types.h
-index 6cfdcf2..3895393 100644
+index 6cfdcf2..4195253 100644
 --- a/src/mm3_recomp_types.h
 +++ b/src/mm3_recomp_types.h
 @@ -159,13 +159,10 @@ extern uint32_t g_xbox_code_hi;
@@ -535,7 +535,7 @@ index 6cfdcf2..3895393 100644
  /* Translated rep movs calls memcpy. The CRT memcpy may use AVX-512 moves,
   * which the MMIO trap handlers (APU, NV2A, ...) cannot decode: copying GP DSP
   * memory at 0xFE8312E4 crashed with "MMIO decode fail ... 62 F1 7F 4A 6F".
-@@ -429,6 +449,85 @@ static __inline void *recomp_guest_memcpy(void *dst, const void *src, size_t n)
+@@ -429,6 +449,97 @@ static __inline void *recomp_guest_memcpy(void *dst, const void *src, size_t n)
  #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
  #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
  
@@ -549,16 +549,28 @@ index 6cfdcf2..3895393 100644
 + * (platform/mmio_decode.h). RECOMP_PLAIN_ORDER, or any other host, keeps the
 + * plain accesses. */
 +#if defined(__aarch64__) && !defined(RECOMP_PLAIN_ORDER)
++/* The APU's registers (0xFE800000, 512 KB) are answered by its model
++ * directly rather than through a fault (apu_mmio_hook.c); nonzero when done. */
++extern int xbox_ApuDirectRead(uint32_t va, unsigned size, uint64_t *out);
++extern int xbox_ApuDirectWrite(uint32_t va, uint64_t value, unsigned size);
++#define RECOMP_APU_WINDOW(a) ((uint32_t)((a) - 0xFE800000u) < 0x80000u)
 +#define RECOMP_ORDERED_LD(T, mask)                                                  \
 +    static inline __attribute__((always_inline)) T recomp_ld_##T(uint32_t a)                                     \
 +    {                                                                               \
 +        T *p = (T *)XBOX_PTR(a);                                                    \
++        if (__builtin_expect(RECOMP_APU_WINDOW(a), 0)) {                            \
++            uint64_t v;                                                             \
++            if (xbox_ApuDirectRead(a, sizeof(T), &v)) return (T)v;                  \
++        }                                                                           \
 +        if (__builtin_expect(!(a & (mask)), 1)) return __atomic_load_n(p, __ATOMIC_ACQUIRE); \
 +        return *(volatile T *)p;                                                    \
 +    }                                                                               \
 +    static inline __attribute__((always_inline)) void recomp_st_##T(uint32_t a, T v)                             \
 +    {                                                                               \
 +        T *p = (T *)XBOX_PTR(a);                                                    \
++        if (__builtin_expect(RECOMP_APU_WINDOW(a), 0) &&                            \
++            xbox_ApuDirectWrite(a, (uint64_t)v, sizeof(T)))                         \
++            return;                                                                 \
 +        if (__builtin_expect(!(a & (mask)), 1)) __atomic_store_n(p, v, __ATOMIC_RELEASE); \
 +        else *(volatile T *)p = v;                                                  \
 +    }
