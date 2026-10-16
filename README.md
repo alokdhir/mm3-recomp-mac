@@ -66,7 +66,6 @@ see its log in the terminal.
 - Saves live in `~/Library/Application Support/xboxrecomp/`.
 
 Xbox One, Series and PlayStation controllers work over Bluetooth or USB.
-(Xbox 360 controllers are not supported by macOS.)
 
 ## How it is put together
 
