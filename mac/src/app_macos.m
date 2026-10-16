@@ -169,22 +169,34 @@ static int saved_render_lines(void)
 @end
 
 /* The game data: Contents/Resources/game_files inside the app -- packaged
- * apps carry it, and the build tree's app links it there. Nothing may be
- * written into it (the bundle is signed), so the DSP programs the runtime
- * would save for the next build are not. MM3_GAME_ROOT names another folder
- * holding game_files/; the bare executable run from the repository finds the
- * one in the working directory. */
+ * apps carry it, and the build tree's app links it there. The runtime reads
+ * game_files/... relative to the working directory, and writes there too
+ * (xbox_kernel.log), but nothing may change inside a signed bundle: Finder
+ * then marks the app as unable to run. So the game runs in a folder of its
+ * own, ~/Library/Caches/<bundle id>/run, holding a game_files link to the
+ * bundle's data, renewed each launch (the app may have moved); and the DSP
+ * programs the runtime would save for the next build are not saved.
+ * MM3_GAME_ROOT names another folder holding game_files/; the bare
+ * executable run from the repository uses the working directory. */
 static int find_game_dir(void)
 {
-    char path[4096];
-    const char *env = getenv("MM3_GAME_ROOT");
+    char path[4096], run[4096], link_path[4200];
+    const char *env = getenv("MM3_GAME_ROOT"), *home = getenv("HOME");
     NSString *res = [[NSBundle mainBundle] resourcePath];
     if (env && chdir(env) == 0) return 1;
-    if (res) {
-        snprintf(path, sizeof path, "%s/game_files/default.xbe", [res fileSystemRepresentation]);
-        if (access(path, R_OK) == 0 && chdir([res fileSystemRepresentation]) == 0) {
-            setenv("RECOMP_DSP_PROGRAM_DIR", "", 0);
-            return 1;
+    if (res && home) {
+        snprintf(path, sizeof path, "%s/game_files", [res fileSystemRepresentation]);
+        snprintf(link_path, sizeof link_path, "%s/default.xbe", path);
+        if (access(link_path, R_OK) == 0) {
+            snprintf(run, sizeof run, "%s/Library/Caches/org.mm3-port.midtown-madness-3/run", home);
+            [[NSFileManager defaultManager] createDirectoryAtPath:[NSString stringWithUTF8String:run]
+                                      withIntermediateDirectories:YES attributes:nil error:nil];
+            snprintf(link_path, sizeof link_path, "%s/game_files", run);
+            unlink(link_path);
+            if (symlink(path, link_path) == 0 && chdir(run) == 0) {
+                setenv("RECOMP_DSP_PROGRAM_DIR", "", 0);
+                return 1;
+            }
         }
     }
     return access("game_files/default.xbe", R_OK) == 0;

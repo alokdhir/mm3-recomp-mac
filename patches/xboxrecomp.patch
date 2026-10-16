@@ -705,6 +705,27 @@ index 03f016f..a78ecc2 100644
  extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
  
  /* A guest backtrace, printed where the guest is standing.
+diff --git a/src/kernel/kernel_thunks.c b/src/kernel/kernel_thunks.c
+index 4fd7692..7a4f999 100644
+--- a/src/kernel/kernel_thunks.c
++++ b/src/kernel/kernel_thunks.c
+@@ -402,8 +402,15 @@ void xbox_kernel_init(void)
+     InitializeCriticalSection(&g_log_cs);
+     g_log_cs_init = TRUE;
+ 
+-    /* Try to open log file, fall back to stderr */
++    /* Try to open log file, fall back to stderr. On macOS the app keeps one
++     * log (stderr, ~/Library/Logs/Midtown Madness 3.log from Finder) and the
++     * working directory may be read-only: the messages go there unless
++     * XBOX_LOG_FILE names a file. */
++#if defined(__APPLE__)
++    g_log_file = getenv("XBOX_LOG_FILE") ? fopen(getenv("XBOX_LOG_FILE"), "w") : NULL;
++#else
+     g_log_file = fopen("xbox_kernel.log", "w");
++#endif
+ 
+     /* Set log level from environment variable if present */
+     const char* log_env = getenv("XBOX_LOG_LEVEL");
 diff --git a/src/kernel/recomp_thread_state.h b/src/kernel/recomp_thread_state.h
 new file mode 100644
 index 0000000..987e4ce
