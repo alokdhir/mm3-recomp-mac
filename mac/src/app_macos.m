@@ -9,6 +9,7 @@
  */
 #import <Cocoa/Cocoa.h>
 #import <IOKit/IOKitLib.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -152,6 +153,32 @@ static int saved_render_lines(void)
 
 @end
 
+/* Where the app really is. Opened for the first time after a download or
+ * AirDrop, macOS runs an app from a randomised read-only copy (App
+ * Translocation), from which the game_files/ beside the real one cannot be
+ * seen; Security's SecTranslocateCreateOriginalPathForURL gives the
+ * original. Looked up at run time, as the call is not in the public
+ * headers; without it, the path as given. */
+static NSString *untranslocated(NSString *path)
+{
+    typedef Boolean (*is_fn)(CFURLRef, bool *, CFErrorRef *);
+    typedef CFURLRef (*orig_fn)(CFURLRef, CFErrorRef *);
+    void *sec = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
+    is_fn is_translocated = sec ? (is_fn)dlsym(sec, "SecTranslocateIsTranslocatedURL") : NULL;
+    orig_fn original = sec ? (orig_fn)dlsym(sec, "SecTranslocateCreateOriginalPathForURL") : NULL;
+    bool translocated = false;
+    NSURL *url = [NSURL fileURLWithPath:path];
+    if (is_translocated && original && is_translocated((CFURLRef)url, &translocated, NULL) && translocated) {
+        CFURLRef o = original((CFURLRef)url, NULL);
+        if (o) {
+            NSString *p = [[(NSURL *)o path] copy];
+            CFRelease(o);
+            return [p autorelease];
+        }
+    }
+    return path;
+}
+
 /* Started from the build tree or a bundle: run where game_files/ is --
  * MM3_GAME_ROOT, the current directory, a directory above the executable,
  * or the tree the app was built from. Returns 0 when there is none. */
@@ -162,7 +189,7 @@ static int find_game_dir(void)
     if (env && chdir(env) == 0) return 1;
     if (access("game_files/default.xbe", R_OK) == 0) return 1;
     {
-        NSString *exe = [[NSBundle mainBundle] executablePath];
+        NSString *exe = untranslocated([[NSBundle mainBundle] executablePath]);
         NSString *dir = [exe stringByDeletingLastPathComponent];
         while ([dir length] > 1) {
             snprintf(path, sizeof path, "%s/game_files/default.xbe", [dir fileSystemRepresentation]);
@@ -246,9 +273,10 @@ static void no_game_alert(void)
     NSAlert *alert = [[NSAlert alloc] init];
     [alert setMessageText:@"Game files not found"];
     [alert setInformativeText:
-        @"Midtown Madness 3 needs the files from your own disc. Run "
-        @"scripts/setup.sh --iso <your disc image> in the mm3-port folder, "
-        @"or set MM3_GAME_ROOT to the folder that contains game_files/."];
+        @"Midtown Madness 3 needs the files from your own disc, in a folder "
+        @"named game_files next to the app. Keep the app and game_files "
+        @"together in one folder (move the whole folder, not just the app). "
+        @"Building from source: run scripts/setup.sh --iso <your disc image>."];
     [alert addButtonWithTitle:@"Quit"];
     if (@available(macOS 14.0, *)) [NSApp activate]; else [NSApp activateIgnoringOtherApps:YES];
     [alert runModal];

@@ -22,6 +22,11 @@ ditto "$ROOT/build/Midtown Madness 3.app" "$OUT/Midtown Madness 3.app"
 # The game's files as the disc has them, plus the DSP programs it saved.
 rsync -a --exclude 'default_analysis.json' "$ROOT/game_files/" "$OUT/game_files/"
 codesign --verify --deep "$OUT/Midtown Madness 3.app"
+# Only libraries every Mac has: anything else (Homebrew's, say) is missing on
+# the Mac this goes to and the game dies at launch.
+EXTRA=$(otool -L "$OUT/Midtown Madness 3.app/Contents/MacOS/mm3_recomp" | tail -n +2 |
+        awk '{print $1}' | grep -v -E '^(/System/Library/|/usr/lib/)' || true)
+[ -z "$EXTRA" ] || { echo "the game links libraries other Macs lack:" >&2; echo "$EXTRA" >&2; exit 1; }
 echo "minimum macOS: $(otool -l "$OUT/Midtown Madness 3.app/Contents/MacOS/mm3_recomp" |
     awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')"
 ( cd "$DIST" && ditto -c -k --keepParent "Midtown Madness 3" "Midtown Madness 3.zip" )
