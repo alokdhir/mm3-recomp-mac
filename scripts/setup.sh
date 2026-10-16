@@ -79,7 +79,8 @@ cmake -S "$ROOT" -B "$ROOT/build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 ninja -C "$ROOT/build" mm3_recomp mm3_app
 
 echo
-echo "built $ROOT/build/Midtown Madness 3.app"
+echo "built $ROOT/build/Midtown Madness 3.app (linked to game_files/ here)"
 echo "play:  open \"$ROOT/build/Midtown Madness 3.app\""
 echo "  or, with the log in this terminal, from $ROOT:"
 echo "       ./build/third_party/mm3-recomp/mm3_recomp"
+echo "a self-contained copy for /Applications or another Mac: scripts/package.sh"

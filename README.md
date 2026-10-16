@@ -44,7 +44,10 @@ The first run extracts the disc into `game_files/`, translates the game to C
 
 Then open **`build/Midtown Madness 3.app`**, or run
 `./build/third_party/mm3-recomp/mm3_recomp` from the repository folder to
-see its log in the terminal.
+see its log in the terminal. That app reads `game_files/` from the
+repository; for a self-contained copy, with the game data inside the app
+(`Contents/Resources/game_files`), run `scripts/package.sh` and drag
+`build/dist/Midtown Madness 3.app` to Applications.
 
 ## Playing
 
@@ -87,8 +90,8 @@ the GPU and audio chip are modelled and translated to Metal and Core Audio.
 
 ## Troubleshooting
 
-- **"The game files were not found"**: run `setup.sh --iso …` first, or keep
-  `game_files/` next to the app.
+- **"The game files were not found"**: run `setup.sh --iso …` first; a
+  packaged app (`scripts/package.sh`) carries its game files inside it.
 - **macOS won't open the app** (built on another Mac): System Settings →
   Privacy & Security → *Open Anyway*.
 - **Debug → Save Recent Frames** (⌘⇧S) writes the last 48 frames to

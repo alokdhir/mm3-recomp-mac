@@ -186,13 +186,15 @@ else()
     target_compile_definitions(mm3_recomp PRIVATE RECOMP_PLAIN_ORDER)
 endif()
 
-# Without game_files/ beside the app (or above it, as in this checkout), the
-# app looks here: the tree it was built from.
+# The source tree, for the bare executable's app icon (mac/bundle).
 set_property(SOURCE mac/src/app_macos.m DIRECTORY third_party/mm3-recomp APPEND PROPERTY
     COMPILE_DEFINITIONS "MM3_BUILD_ROOT=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
 
-# build/Midtown Madness 3.app: the same executable, the shaders in Resources
-# (when precompiled), ad-hoc signed. The game data stays outside it (game_files/).
+# build/Midtown Madness 3.app: the same executable, the shaders (when
+# precompiled) and icon in Resources, ad-hoc signed. The game data belongs in
+# Contents/Resources/game_files: here a link to the repository's, added after
+# signing (a link out of the bundle cannot be sealed), so a rebuild stays
+# quick; scripts/package.sh puts the real files there and signs over them.
 if(CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET_OR_DEFAULT "${CMAKE_OSX_DEPLOYMENT_TARGET}")
 else()
@@ -226,6 +228,7 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mm3_recomp.signed"
 add_custom_target(mm3_signed ALL DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/mm3_recomp.signed")
 add_custom_command(OUTPUT "${MM3_APP}/Contents/MacOS/mm3_recomp"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${MM3_APP}/Contents/MacOS" "${MM3_APP}/Contents/Resources"
+    COMMAND ${CMAKE_COMMAND} -E rm -f "${MM3_APP}/Contents/Resources/game_files"
     COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" "${MM3_APP}/Contents/Info.plist"
     ${MM3_APP_METALLIB_COPY}
     COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/mac/bundle/AppIcon.icns"
@@ -235,6 +238,7 @@ add_custom_command(OUTPUT "${MM3_APP}/Contents/MacOS/mm3_recomp"
     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:mm3_recomp>" "${MM3_APP}/Contents/MacOS/mm3_recomp.new"
     COMMAND ${CMAKE_COMMAND} -E rename "${MM3_APP}/Contents/MacOS/mm3_recomp.new" "${MM3_APP}/Contents/MacOS/mm3_recomp"
     COMMAND codesign --force --sign - "${MM3_APP}"
+    COMMAND ln -sfn "${CMAKE_CURRENT_SOURCE_DIR}/game_files" "${MM3_APP}/Contents/Resources/game_files"
     DEPENDS mm3_recomp "${CMAKE_CURRENT_BINARY_DIR}/mm3_recomp.signed" ${MM3_APP_METALLIB_DEP}
             "${CMAKE_CURRENT_SOURCE_DIR}/mac/bundle/AppIcon.icns"
             "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"

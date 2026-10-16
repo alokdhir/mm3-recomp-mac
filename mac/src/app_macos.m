@@ -9,7 +9,6 @@
  */
 #import <Cocoa/Cocoa.h>
 #import <IOKit/IOKitLib.h>
-#include <dlfcn.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -169,55 +168,26 @@ static int saved_render_lines(void)
 
 @end
 
-/* Where the app really is. Opened for the first time after a download or
- * AirDrop, macOS runs an app from a randomised read-only copy (App
- * Translocation), from which the game_files/ beside the real one cannot be
- * seen; Security's SecTranslocateCreateOriginalPathForURL gives the
- * original. Looked up at run time, as the call is not in the public
- * headers; without it, the path as given. */
-static NSString *untranslocated(NSString *path)
-{
-    typedef Boolean (*is_fn)(CFURLRef, bool *, CFErrorRef *);
-    typedef CFURLRef (*orig_fn)(CFURLRef, CFErrorRef *);
-    void *sec = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
-    is_fn is_translocated = sec ? (is_fn)dlsym(sec, "SecTranslocateIsTranslocatedURL") : NULL;
-    orig_fn original = sec ? (orig_fn)dlsym(sec, "SecTranslocateCreateOriginalPathForURL") : NULL;
-    bool translocated = false;
-    NSURL *url = [NSURL fileURLWithPath:path];
-    if (is_translocated && original && is_translocated((CFURLRef)url, &translocated, NULL) && translocated) {
-        CFURLRef o = original((CFURLRef)url, NULL);
-        if (o) {
-            NSString *p = [[(NSURL *)o path] copy];
-            CFRelease(o);
-            return [p autorelease];
-        }
-    }
-    return path;
-}
-
-/* Started from the build tree or a bundle: run where game_files/ is --
- * MM3_GAME_ROOT, the current directory, a directory above the executable,
- * or the tree the app was built from. Returns 0 when there is none. */
+/* The game data: Contents/Resources/game_files inside the app -- packaged
+ * apps carry it, and the build tree's app links it there. Nothing may be
+ * written into it (the bundle is signed), so the DSP programs the runtime
+ * would save for the next build are not. MM3_GAME_ROOT names another folder
+ * holding game_files/; the bare executable run from the repository finds the
+ * one in the working directory. */
 static int find_game_dir(void)
 {
     char path[4096];
     const char *env = getenv("MM3_GAME_ROOT");
+    NSString *res = [[NSBundle mainBundle] resourcePath];
     if (env && chdir(env) == 0) return 1;
-    if (access("game_files/default.xbe", R_OK) == 0) return 1;
-    {
-        NSString *exe = untranslocated([[NSBundle mainBundle] executablePath]);
-        NSString *dir = [exe stringByDeletingLastPathComponent];
-        while ([dir length] > 1) {
-            snprintf(path, sizeof path, "%s/game_files/default.xbe", [dir fileSystemRepresentation]);
-            if (access(path, R_OK) == 0) return chdir([dir fileSystemRepresentation]) == 0;
-            dir = [dir stringByDeletingLastPathComponent];
+    if (res) {
+        snprintf(path, sizeof path, "%s/game_files/default.xbe", [res fileSystemRepresentation]);
+        if (access(path, R_OK) == 0 && chdir([res fileSystemRepresentation]) == 0) {
+            setenv("RECOMP_DSP_PROGRAM_DIR", "", 0);
+            return 1;
         }
     }
-#ifdef MM3_BUILD_ROOT
-    snprintf(path, sizeof path, "%s/game_files/default.xbe", MM3_BUILD_ROOT);
-    if (access(path, R_OK) == 0) return chdir(MM3_BUILD_ROOT) == 0;
-#endif
-    return 0;
+    return access("game_files/default.xbe", R_OK) == 0;
 }
 
 /* Opened from Finder there is no terminal: keep the log where Console and a
@@ -331,10 +301,10 @@ static void no_game_alert(void)
     NSAlert *alert = [[NSAlert alloc] init];
     [alert setMessageText:@"Game files not found"];
     [alert setInformativeText:
-        @"Midtown Madness 3 needs the files from your own disc, in a folder "
-        @"named game_files next to the app. Keep the app and game_files "
-        @"together in one folder (move the whole folder, not just the app). "
-        @"Building from source: run scripts/setup.sh --iso <your disc image>."];
+        @"Midtown Madness 3 needs the files from your own disc, which a "
+        @"packaged app carries inside it; this copy has none. Building from "
+        @"source: run scripts/setup.sh --iso <your disc image>, then "
+        @"scripts/package.sh."];
     [alert addButtonWithTitle:@"Quit"];
     if (@available(macOS 14.0, *)) [NSApp activate]; else [NSApp activateIgnoringOtherApps:YES];
     [alert runModal];
