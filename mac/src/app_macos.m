@@ -38,13 +38,13 @@ static void *game_thread(void *unused)
 @interface MM3AppDelegate : NSObject <NSApplicationDelegate>
 @end
 
-/* The Graphics menu: render resolution (lines; 0 follows the window),
- * applied at the next frame and remembered in the user defaults; an explicit
- * RECOMP_RENDER_SCALE wins at launch. Anti-aliasing and texture filtering
- * are fixed at 4x MSAA and 16x anisotropic: on these GPUs neither costs a
- * measurable frame and lower settings looked no different, so they are not
- * worth a menu (RECOMP_MSAA / RECOMP_ANISO still choose). */
+/* The Graphics menu: render resolution (lines; 0 follows the window) and
+ * anti-aliasing (MSAA samples), applied at the next frame and remembered in
+ * the user defaults; an explicit RECOMP_RENDER_SCALE / RECOMP_MSAA wins at
+ * launch. Texture filtering is fixed at 16x anisotropic, which costs no
+ * measurable time (RECOMP_ANISO still chooses). */
 extern void nv2a_metal_request_render_lines(int lines);
+extern void nv2a_metal_request_msaa(int samples);
 extern void nv2a_metal_save_recent_frames(void);
 extern void nv2a_metal_toggle_texture_pack(void);
 
@@ -61,10 +61,16 @@ static const Choice s_resolutions[] = {
     { "720p", 720 }, { "1080p", 1080 }, { "1440p", 1440 }, { "2160p (4K)", 2160 },
     { "Match Window", 0 },
 };
+static const Choice s_antialiasing[] = {
+    { "Off", 1 }, { "2x", 2 }, { "4x", 4 },
+};
 #define DEFAULT_RENDER_LINES 1440
+#define DEFAULT_MSAA 4
 static const Setting s_settings[] = {
     { "Resolution", "RenderLines", "RECOMP_RENDER_SCALE", DEFAULT_RENDER_LINES,
       nv2a_metal_request_render_lines, s_resolutions, 5 },
+    { "Anti-aliasing", "MSAA", "RECOMP_MSAA", DEFAULT_MSAA,
+      nv2a_metal_request_msaa, s_antialiasing, 3 },
 };
 #define SETTING_COUNT ((int)(sizeof s_settings / sizeof s_settings[0]))
 
@@ -91,12 +97,21 @@ static int default_render_lines(void)
     return n && n < 16 ? 1080 : DEFAULT_RENDER_LINES;
 }
 
+/* 4x on the larger GPUs; BASE_CHIP_MSAA on the base chips. */
+#define BASE_CHIP_MSAA 2
+static int default_msaa(void)
+{
+    int n = gpu_cores();
+    return n && n < 16 ? BASE_CHIP_MSAA : DEFAULT_MSAA;
+}
+
 static int saved_setting(const Setting *st)
 {
     NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
     NSString *k = [NSString stringWithUTF8String:st->key];
     if ([u objectForKey:k]) return (int)[u integerForKey:k];
-    return st == &s_settings[0] ? default_render_lines() : st->def;
+    return st == &s_settings[0] ? default_render_lines() :
+           st == &s_settings[1] ? default_msaa() : st->def;
 }
 
 static int saved_render_lines(void)
@@ -238,7 +253,11 @@ static void mac_defaults(void)
         setenv("RECOMP_RENDER_SCALE", scale, 1);
         if (lines == 0) nv2a_metal_request_render_lines(0);
     }
-    if (!getenv("RECOMP_MSAA")) setenv("RECOMP_MSAA", "4", 1);
+    if (!getenv("RECOMP_MSAA")) {
+        char n[16];
+        snprintf(n, sizeof n, "%d", saved_setting(&s_settings[1]));
+        setenv("RECOMP_MSAA", n, 1);
+    }
     if (!getenv("RECOMP_ANISO")) setenv("RECOMP_ANISO", "16", 1);
 }
 
@@ -354,6 +373,18 @@ int main(int argc, char **argv)
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        {   /* The bundle's icon comes from its Info.plist; the bare build-tree
+             * binary has none, so it takes the same file from the source tree. */
+            NSString *icon = [[NSBundle mainBundle] pathForResource:@"AppIcon" ofType:@"icns"];
+            NSImage *img;
+#ifdef MM3_BUILD_ROOT
+            if (!icon) icon = [NSString stringWithUTF8String:MM3_BUILD_ROOT "/mac/bundle/AppIcon.icns"];
+#endif
+            if ((img = [[NSImage alloc] initWithContentsOfFile:icon])) {
+                [NSApp setApplicationIconImage:img];
+                [img release];
+            }
+        }
         [NSApp setDelegate:[[MM3AppDelegate alloc] init]];
         build_menu();
         redirect_log();

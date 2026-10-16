@@ -284,26 +284,29 @@ constant uint sp_tex_info3z [[function_constant(52)]];
 
 constant bool SPEC = is_function_constant_defined(sp_rc_control);
 #define SPV(n) (is_function_constant_defined(n) ? n : 0u)
-constant uint SP_C_ICW[8] = { SPV(sp_c_icw0), SPV(sp_c_icw1), SPV(sp_c_icw2), SPV(sp_c_icw3),
-                              SPV(sp_c_icw4), SPV(sp_c_icw5), SPV(sp_c_icw6), SPV(sp_c_icw7) };
-constant uint SP_A_ICW[8] = { SPV(sp_a_icw0), SPV(sp_a_icw1), SPV(sp_a_icw2), SPV(sp_a_icw3),
-                              SPV(sp_a_icw4), SPV(sp_a_icw5), SPV(sp_a_icw6), SPV(sp_a_icw7) };
-constant uint SP_C_OCW[8] = { SPV(sp_c_ocw0), SPV(sp_c_ocw1), SPV(sp_c_ocw2), SPV(sp_c_ocw3),
-                              SPV(sp_c_ocw4), SPV(sp_c_ocw5), SPV(sp_c_ocw6), SPV(sp_c_ocw7) };
-constant uint SP_A_OCW[8] = { SPV(sp_a_ocw0), SPV(sp_a_ocw1), SPV(sp_a_ocw2), SPV(sp_a_ocw3),
-                              SPV(sp_a_ocw4), SPV(sp_a_ocw5), SPV(sp_a_ocw6), SPV(sp_a_ocw7) };
-constant uint3 SP_TEX_INFO[4] = {
-    uint3(SPV(sp_tex_info0x), SPV(sp_tex_info0y), SPV(sp_tex_info0z)),
-    uint3(SPV(sp_tex_info1x), SPV(sp_tex_info1y), SPV(sp_tex_info1z)),
-    uint3(SPV(sp_tex_info2x), SPV(sp_tex_info2y), SPV(sp_tex_info2z)),
-    uint3(SPV(sp_tex_info3x), SPV(sp_tex_info3y), SPV(sp_tex_info3z)) };
+/* Looked up per stage by switch rather than from constant arrays, and the
+ * stage loops in shade() unrolled in full: together they let a specialised
+ * shader fold every control word and keep the combiner registers R[] in
+ * registers. Left to itself the compiler kept the loops, so R[] was indexed
+ * at run time from memory -- 2 to 50 times the cost per pixel, most of the
+ * GPU's time in a race (mac/tests/bench_ps.m measures it). */
+static inline uint SP_C_ICW(uint s) { switch (s) { case 0: return SPV(sp_c_icw0); case 1: return SPV(sp_c_icw1); case 2: return SPV(sp_c_icw2); case 3: return SPV(sp_c_icw3); case 4: return SPV(sp_c_icw4); case 5: return SPV(sp_c_icw5); case 6: return SPV(sp_c_icw6); case 7: return SPV(sp_c_icw7); default: return 0u; } }
+static inline uint SP_A_ICW(uint s) { switch (s) { case 0: return SPV(sp_a_icw0); case 1: return SPV(sp_a_icw1); case 2: return SPV(sp_a_icw2); case 3: return SPV(sp_a_icw3); case 4: return SPV(sp_a_icw4); case 5: return SPV(sp_a_icw5); case 6: return SPV(sp_a_icw6); case 7: return SPV(sp_a_icw7); default: return 0u; } }
+static inline uint SP_C_OCW(uint s) { switch (s) { case 0: return SPV(sp_c_ocw0); case 1: return SPV(sp_c_ocw1); case 2: return SPV(sp_c_ocw2); case 3: return SPV(sp_c_ocw3); case 4: return SPV(sp_c_ocw4); case 5: return SPV(sp_c_ocw5); case 6: return SPV(sp_c_ocw6); case 7: return SPV(sp_c_ocw7); default: return 0u; } }
+static inline uint SP_A_OCW(uint s) { switch (s) { case 0: return SPV(sp_a_ocw0); case 1: return SPV(sp_a_ocw1); case 2: return SPV(sp_a_ocw2); case 3: return SPV(sp_a_ocw3); case 4: return SPV(sp_a_ocw4); case 5: return SPV(sp_a_ocw5); case 6: return SPV(sp_a_ocw6); case 7: return SPV(sp_a_ocw7); default: return 0u; } }
+static inline uint3 SP_TEX_INFO(uint n) {
+    switch (n) {
+    case 0: return uint3(SPV(sp_tex_info0x), SPV(sp_tex_info0y), SPV(sp_tex_info0z));
+    case 1: return uint3(SPV(sp_tex_info1x), SPV(sp_tex_info1y), SPV(sp_tex_info1z));
+    case 2: return uint3(SPV(sp_tex_info2x), SPV(sp_tex_info2y), SPV(sp_tex_info2z));
+    default: return uint3(SPV(sp_tex_info3x), SPV(sp_tex_info3y), SPV(sp_tex_info3z)); } }
 
 static inline uint U8(constant uint4 *a, uint s) { return a[s >> 2][s & 3]; }
 
-#define K_C_ICW(s)      (SPEC ? SP_C_ICW[s] : U8(pc.c_icw, s))
-#define K_A_ICW(s)      (SPEC ? SP_A_ICW[s] : U8(pc.a_icw, s))
-#define K_C_OCW(s)      (SPEC ? SP_C_OCW[s] : U8(pc.c_ocw, s))
-#define K_A_OCW(s)      (SPEC ? SP_A_OCW[s] : U8(pc.a_ocw, s))
+#define K_C_ICW(s)      (SPEC ? SP_C_ICW(s) : U8(pc.c_icw, s))
+#define K_A_ICW(s)      (SPEC ? SP_A_ICW(s) : U8(pc.a_icw, s))
+#define K_C_OCW(s)      (SPEC ? SP_C_OCW(s) : U8(pc.c_ocw, s))
+#define K_A_OCW(s)      (SPEC ? SP_A_OCW(s) : U8(pc.a_ocw, s))
 #define K_FIN0          (SPEC ? SPV(sp_fin0) : pc.fin0)
 #define K_FIN1          (SPEC ? SPV(sp_fin1) : pc.fin1)
 #define K_RC_CONTROL    (SPEC ? SPV(sp_rc_control) : pc.rc_control)
@@ -313,7 +316,7 @@ static inline uint U8(constant uint4 *a, uint s) { return a[s >> 2][s & 3]; }
 #define K_CLIP_PLANE    (SPEC ? SPV(sp_clip_plane) : pc.clip_plane)
 #define K_OTHER_INPUT   (SPEC ? SPV(sp_other_input) : pc.other_input)
 #define K_DOT_MAP       (SPEC ? SPV(sp_dot_map) : pc.dot_map)
-#define K_TEX_INFO(n)   (SPEC ? SP_TEX_INFO[n] : pc.tex_info[n].xyz)
+#define K_TEX_INFO(n)   (SPEC ? SP_TEX_INFO(n) : pc.tex_info[n].xyz)
 
 /* What the stages read: four 2D textures, four cube maps, the frame drawn
  * so far (the horizon panorama) and four samplers. Passed explicitly. */
@@ -463,6 +466,7 @@ static float4 shade(TEXARGS, constant PSConsts &pc, float4 ipos, float4 id0, flo
     float dots[4] = { 0, 0, 0, 0 };
     uint stage_prog = K_STAGE_PROG, other_input = K_OTHER_INPUT, dot_map = K_DOT_MAP;
     uint clip_plane = K_CLIP_PLANE;
+    _Pragma("clang loop unroll(full)")
     for (uint n = 0; n < 4; n++) {
         uint mode = (stage_prog >> (n * 5)) & 31;
         uint inp = n == 2 ? (other_input >> 16) & 1 : (n == 3 ? (other_input >> 20) & 3 : 0);
@@ -511,6 +515,7 @@ static float4 shade(TEXARGS, constant PSConsts &pc, float4 ipos, float4 id0, flo
         T[n] = t;
     }
     float4 R[16];
+    _Pragma("clang loop unroll(full)")
     for (uint k = 0; k < 16; k++) R[k] = float4(0);
     R[3] = float4(pc.fog_color.rgb, ifog.x); R[4] = id0; R[5] = id1;
     R[8] = T[0]; R[9] = T[1]; R[10] = T[2]; R[11] = T[3];
@@ -523,6 +528,7 @@ static float4 shade(TEXARGS, constant PSConsts &pc, float4 ipos, float4 id0, flo
         R[12].a = (stage_prog & 31) ? T[0].a : 1.0;
         uint rc_control = K_RC_CONTROL;
         uint nst = min(rc_control & 0xFF, 8u); uint fl8 = rc_control >> 8;
+        _Pragma("clang loop unroll(full)")
         for (uint s = 0; s < nst; s++) {
             uint icw = K_C_ICW(s), ocw = K_C_OCW(s), aicw = K_A_ICW(s), aocw = K_A_OCW(s);
             if (((ocw | aocw) & 0xFFF) == 0) continue;
@@ -683,6 +689,24 @@ fragment PSOutNC ps_main_flat_nc(PSInFlat i [[stage_in]], PS_ARGS)
 {
     PSOutNC o; uint cov;
     o.c = SHADE(i, cov);
+    return o;
+}
+
+/* Measuring only (RECOMP_EXP_FILE): the diffuse colour alone, and that
+ * times texture 0, standing in for every draw's shader. */
+fragment PSOutNC ps_dbg(PSIn i [[stage_in]])
+{
+    PSOutNC o;
+    o.c = saturate(i.d0);
+    return o;
+}
+
+fragment PSOutNC ps_dbg_tex(PSIn i [[stage_in]], texture2d<float> T2D0 [[texture(0)]],
+                            sampler S0 [[sampler(0)]], constant PSConsts &pc [[buffer(0)]])
+{
+    PSOutNC o;
+    float q = i.t0.w != 0.0 ? i.t0.w : 1.0;
+    o.c = saturate(T2D0.sample(S0, i.t0.xy / q * pc.tex_scale[0].xy) * i.d0);
     return o;
 }
 

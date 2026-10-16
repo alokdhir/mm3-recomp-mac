@@ -8,6 +8,8 @@
     <string>Midtown Madness 3</string>
     <key>CFBundleName</key>
     <string>Midtown Madness 3</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleExecutable</key>
     <string>mm3_recomp</string>
     <key>CFBundleIdentifier</key>

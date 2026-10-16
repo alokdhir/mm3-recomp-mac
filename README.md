@@ -60,9 +60,10 @@ see its log in the terminal.
 | Back | Esc / Backspace | B / View |
 | Fullscreen | ⌘F | |
 
-- **Graphics → Resolution**: 720p to 4K, or match the window; changes
-  apply immediately and are remembered. The default is 1440p on Pro, Max
-  and Ultra chips and 1080p on the base chips.
+- **Graphics → Resolution**: 720p to 4K, or match the window; and
+  **Graphics → Anti-aliasing**: off, 2x or 4x. Changes apply immediately
+  and are remembered. The defaults are 1440p with 4x on Pro, Max and Ultra
+  chips, 1080p with 2x on the base chips.
 - The picture follows the window's shape (widescreen by default).
 - Saves live in `~/Library/Application Support/xboxrecomp/`.
 

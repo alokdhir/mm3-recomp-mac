@@ -120,6 +120,110 @@ static uint64_t s_prof_queries;           /* visibility reports read (each waits
 static uint64_t s_prof_dropped;           /* draws given up (no program, no ring space) */
 static int s_brk_cause = BRK_OTHER;
 
+/* RECOMP_PASS_LOG=1: every pass and blit of one frame in 300, with its
+ * targets and draws (finding passes that cost bandwidth). */
+static int s_pass_log = -1, s_pass_log_now;
+static uint64_t s_pass_log_draws0;
+static void pass_log_frame(void)
+{
+    static int n;
+    if (s_pass_log < 0) s_pass_log = getenv("RECOMP_PASS_LOG") != NULL;
+    if (!s_pass_log) return;
+    if (s_pass_log_now) {
+        extern void nv2a_metal_pass_log_flush(void);
+        nv2a_metal_pass_log_flush();
+        fprintf(stderr, "[PASS] ---- end of frame\n");
+    }
+    s_pass_log_now = (++n % 60) == 0;
+    if (s_pass_log_now) fprintf(stderr, "[PASS] ---- frame %d\n", n);
+}
+static void pass_log_tex(const char *what, id<MTLTexture> t)
+{
+    if (t) fprintf(stderr, " %s %lux%lu x%lu %s", what, (unsigned long)t.width, (unsigned long)t.height,
+                   (unsigned long)t.sampleCount, t.storageMode == MTLStorageModeMemoryless ? "mem" : "");
+}
+
+/* GPU time per pass of the logged frame: timestamps at the stage
+ * boundaries of each encoder (Apple GPUs sample there only). */
+#define PASS_STAMPS 160
+static id<MTLCounterSampleBuffer> s_stamp_buf;
+static int s_stamp_n, s_stamp_ok = -1;
+static char s_stamp_label[PASS_STAMPS][96];
+static int stamp_begin(const char *label)
+{
+    if (!s_pass_log_now) return -1;
+    if (s_stamp_ok < 0) {
+        s_stamp_ok = 0;
+        if ([s_dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+            for (id<MTLCounterSet> cs in [s_dev counterSets])
+                if ([[cs name] isEqualToString:MTLCommonCounterSetTimestamp]) {
+                    MTLCounterSampleBufferDescriptor *d = [[MTLCounterSampleBufferDescriptor alloc] init];
+                    NSError *err = nil;
+                    d.counterSet = cs;
+                    d.sampleCount = PASS_STAMPS * 4;
+                    d.storageMode = MTLStorageModeShared;
+                    s_stamp_buf = [s_dev newCounterSampleBufferWithDescriptor:d error:&err];
+                    [d release];
+                    s_stamp_ok = s_stamp_buf != nil;
+                }
+        }
+        if (!s_stamp_ok) fprintf(stderr, "[PASS] no GPU timestamps on this device\n");
+    }
+    if (!s_stamp_ok || s_stamp_n >= PASS_STAMPS) return -1;
+    snprintf(s_stamp_label[s_stamp_n], sizeof s_stamp_label[0], "%s", label);
+    return s_stamp_n++;
+}
+static void stamp_render(MTLRenderPassDescriptor *d, const char *label)
+{
+    int i = stamp_begin(label);
+    if (i < 0) return;
+    d.sampleBufferAttachments[0].sampleBuffer = s_stamp_buf;
+    d.sampleBufferAttachments[0].startOfVertexSampleIndex = 4 * i;
+    d.sampleBufferAttachments[0].endOfVertexSampleIndex = 4 * i + 1;
+    d.sampleBufferAttachments[0].startOfFragmentSampleIndex = 4 * i + 2;
+    d.sampleBufferAttachments[0].endOfFragmentSampleIndex = 4 * i + 3;
+}
+static void stamp_report(void)
+{
+    NSData *data;
+    const MTLCounterResultTimestamp *ts;
+    MTLTimestamp c0, g0, c1, g1;
+    double per_tick = 1.0, total = 0;
+    int i;
+    if (!s_stamp_n) return;
+    [s_dev sampleTimestamps:&c0 gpuTimestamp:&g0];
+    data = [s_stamp_buf resolveCounterRange:NSMakeRange(0, (NSUInteger)s_stamp_n * 4)];
+    usleep(20000);
+    [s_dev sampleTimestamps:&c1 gpuTimestamp:&g1];
+    if (g1 > g0) per_tick = (double)(c1 - c0) / (double)(g1 - g0);   /* ns per GPU tick */
+    ts = data ? (const MTLCounterResultTimestamp *)[data bytes] : NULL;
+    {
+        uint64_t lo = UINT64_MAX, hi = 0;
+#define STAMP_OK(v) ((v) && (v) != MTLCounterErrorValue)
+        for (i = 0; ts && i < s_stamp_n * 4; i++)
+            if (STAMP_OK(ts[i].timestamp) && ((i & 3) >= 2 || strncmp(s_stamp_label[i / 4], "blit", 4))) {
+                if (ts[i].timestamp < lo) lo = ts[i].timestamp;
+                if (ts[i].timestamp > hi) hi = ts[i].timestamp;
+            }
+        for (i = 0; ts && i < s_stamp_n; i++) {
+            uint64_t a = ts[4 * i].timestamp, b = ts[4 * i + 1].timestamp,
+                     c = ts[4 * i + 2].timestamp, e = ts[4 * i + 3].timestamp;
+            int blit = !strncmp(s_stamp_label[i], "blit", 4);
+            double vs = !blit && STAMP_OK(a) && STAMP_OK(b) && b >= a ? (b - a) * per_tick / 1e3 : 0;
+            double fs = STAMP_OK(c) && STAMP_OK(e) && e >= c ? (e - c) * per_tick / 1e3 : 0;
+            double at = !blit && STAMP_OK(a) ? (a - lo) * per_tick / 1e3 : STAMP_OK(c) ? (c - lo) * per_tick / 1e3 : -1;
+            double end = STAMP_OK(e) ? (e - lo) * per_tick / 1e3 : -1;
+            total += vs > fs ? vs : fs;
+            fprintf(stderr, "[GPU] %7.0f us frag %6.0f us vert  @%6.0f..%6.0f  %s\n", fs, vs, at, end,
+                    s_stamp_label[i]);
+        }
+        fprintf(stderr, "[GPU] total (max of stages, overlap ignored) %.2f ms over %d encoders, span %.2f ms\n",
+                total / 1e3, s_stamp_n, hi > lo ? (hi - lo) * per_tick / 1e6 : 0.0);
+#undef STAMP_OK
+    }
+    s_stamp_n = 0;
+}
+
 static void prof_report(void)
 {
     static int64_t last, frames, prev, worst;
@@ -324,8 +428,11 @@ static id<MTLCommandBuffer> cmd(void)
     return s_cmd;
 }
 
-static void end_encoders(void)
+static void end_encoders_at(int line)
 {
+    if (s_enc && s_pass_log_now)
+        fprintf(stderr, "[PASS]   %llu draws, ended at line %d\n",
+                (unsigned long long)(s_prof_draws - s_pass_log_draws0), line);
     if (s_enc) {
         [s_enc endEncoding];
         [s_enc release];
@@ -339,6 +446,7 @@ static void end_encoders(void)
     }
     s_pass_color = s_pass_resolve = s_pass_depth = nil;
 }
+#define end_encoders() end_encoders_at(__LINE__)
 
 /* Submit what has been recorded; wait: until the GPU has finished it. */
 /* ------------------------------------------------------------- staging rings
@@ -418,7 +526,22 @@ static id<MTLBlitCommandEncoder> blit_encoder_for(int cause)
     s_prof_blits++;
     if (s_enc) s_prof_brk[cause]++;
     end_encoders();
-    s_blit = [[cmd() blitCommandEncoder] retain];
+    if (s_pass_log_now) fprintf(stderr, "[PASS] blit (%s%s)\n", s_brk_name[cause], s_enc ? ", broke the pass" : "");
+    {
+        int i = stamp_begin(s_brk_name[cause]);
+        if (i >= 0) {
+            MTLBlitPassDescriptor *d = [MTLBlitPassDescriptor blitPassDescriptor];
+            char *l = s_stamp_label[i];
+            memmove(l + 5, l, strlen(l) + 1 < 90 ? strlen(l) + 1 : 90);
+            memcpy(l, "blit ", 5);
+            d.sampleBufferAttachments[0].sampleBuffer = s_stamp_buf;
+            d.sampleBufferAttachments[0].startOfEncoderSampleIndex = 4 * i + 2;
+            d.sampleBufferAttachments[0].endOfEncoderSampleIndex = 4 * i + 3;
+            s_blit = [[cmd() blitCommandEncoderWithDescriptor:d] retain];
+        } else {
+            s_blit = [[cmd() blitCommandEncoder] retain];
+        }
+    }
     return s_blit;
 }
 
@@ -462,9 +585,27 @@ static id<MTLRenderCommandEncoder> render_encoder(void)
         return s_enc;
     end_encoders();
     if (!s_want_color && !s_want_depth) return nil;
-    s_enc = [[cmd() renderCommandEncoderWithDescriptor:
-              pass_descriptor(s_want_color, s_want_resolve, s_want_depth)] retain];
+    {
+        MTLRenderPassDescriptor *d = pass_descriptor(s_want_color, s_want_resolve, s_want_depth);
+        if (s_pass_log_now) {
+            char l[96];
+            snprintf(l, sizeof l, "render %lux%lu x%lu%s (pass %llu)",
+                     (unsigned long)(s_want_color ? s_want_color.width : s_want_depth.width),
+                     (unsigned long)(s_want_color ? s_want_color.height : s_want_depth.height),
+                     (unsigned long)(s_want_color ? s_want_color.sampleCount : s_want_depth.sampleCount),
+                     s_want_depth ? "+depth" : "", (unsigned long long)s_prof_passes);
+            stamp_render(d, l);
+        }
+        s_enc = [[cmd() renderCommandEncoderWithDescriptor:d] retain];
+    }
     s_prof_passes++;
+    if (s_pass_log_now) {
+        fprintf(stderr, "[PASS] render");
+        pass_log_tex("color", s_want_color); pass_log_tex("resolve", s_want_resolve);
+        pass_log_tex("depth", s_want_depth);
+        fprintf(stderr, "\n");
+        s_pass_log_draws0 = s_prof_draws;
+    }
     s_pass_color = s_want_color;
     s_pass_resolve = s_want_resolve;
     s_pass_depth = s_want_depth;
@@ -493,6 +634,12 @@ static void clear_pass(id<MTLTexture> color, id<MTLTexture> resolve, id<MTLTextu
         d.depthAttachment.clearDepth = 1.0;
         d.stencilAttachment.loadAction = MTLLoadActionClear;
         d.stencilAttachment.clearStencil = 0;
+    }
+    stamp_render(d, "clear pass");
+    if (s_pass_log_now) {
+        fprintf(stderr, "[PASS] clear");
+        pass_log_tex("color", color); pass_log_tex("resolve", resolve); pass_log_tex("depth", depth);
+        fprintf(stderr, "\n");
     }
     e = [cmd() renderCommandEncoderWithDescriptor:d];
     [e endEncoding];
@@ -607,6 +754,27 @@ typedef struct {
 static id<MTLFunction> s_fn_ub_vs, s_fn_present_vs, s_fn_present_ps, s_fn_clear_vs, s_fn_clear_ps;
 static id<MTLFunction> s_fn_y16_vs, s_fn_y16_ps[2], s_fn_y16d_ps[2];
 static id<MTLFunction> s_fn_psv[6];          /* [variant], the ubershader */
+/* Measuring only: RECOMP_EXP_FILE names a file holding a bitmask, re-read
+ * every half second -- 1 no W-buffer depth, 2 diffuse-only shaders, 4
+ * diffuse x texture 0 shaders. */
+static int s_exp;
+static id<MTLFunction> s_fn_dbg, s_fn_dbg_tex;
+static void exp_poll(void)
+{
+    static const char *path;
+    static int n, init;
+    FILE *f;
+    if (!init) { init = 1; path = getenv("RECOMP_EXP_FILE"); }
+    if (!path || ++n % 30) return;
+    if ((f = fopen(path, "r"))) {
+        int v = 0;
+        if (fscanf(f, "%d", &v) == 1 && v != s_exp) {
+            s_exp = v;
+            fprintf(stderr, "[EXP] mode %d\n", s_exp);
+        }
+        fclose(f);
+    }
+}
 static id<MTLSamplerState> s_linear_clamp, s_point_clamp;
 static id<MTLDepthStencilState> s_ds_off;
 static id<MTLTexture> s_null_2d, s_null_cube;
@@ -844,6 +1012,7 @@ typedef struct {
     PsKey key;
     _Atomic int state;              /* 0 empty, 1 queued, 2 ready, 3 failed */
     id<MTLFunction> fn;             /* valid once state is 2 */
+    uint64_t draws, pixels_hint;    /* RECOMP_SPEC_DUMP: draws that used it */
 } PsSpec;
 
 #define PS_SPEC_SLOTS 4096          /* power of two */
@@ -852,6 +1021,7 @@ static int s_spec_enabled = -1;
 static dispatch_queue_t s_spec_queue;
 static _Atomic long s_spec_ready;
 
+static void spec_dump(void);
 static void spec_init(void)
 {
     const char *v;
@@ -859,6 +1029,7 @@ static void spec_init(void)
     v = getenv("RECOMP_PS_SPEC");
     s_spec_enabled = !(v && *v == '0');
     if (s_spec_enabled) s_spec = (PsSpec *)calloc(PS_SPEC_SLOTS, sizeof *s_spec);
+    if (s_spec && getenv("RECOMP_SPEC_DUMP")) atexit(spec_dump);
     if (!s_spec) { s_spec_enabled = 0; return; }
     s_spec_queue = dispatch_queue_create("nv2a.spec", dispatch_queue_attr_make_with_qos_class(
         DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_UTILITY, 0));
@@ -942,12 +1113,39 @@ static id<MTLFunction> spec_ps(const PSConsts *pc, uint32_t variant)
     e = spec_find(&k);
     if (!e) return nil;
     state = atomic_load(&e->state);
+    e->draws++;
     if (state == 2) return e->fn;
     if (state) return nil;
     e->key = k;
     atomic_store(&e->state, 1);
     dispatch_async(s_spec_queue, ^{ spec_build(e); });
     return nil;
+}
+
+/* RECOMP_SPEC_DUMP=file: at exit, every configuration with its draw count,
+ * one line each (variant, then the 53 constants in function-constant order),
+ * for mac/tests/bench_ps.m. */
+static void spec_dump(void)
+{
+    const char *path = getenv("RECOMP_SPEC_DUMP");
+    FILE *f;
+    int i, j;
+    if (!path || !s_spec || !(f = fopen(path, "w"))) return;
+    for (i = 0; i < PS_SPEC_SLOTS; i++) {
+        const PsSpec *e = &s_spec[i];
+        const PsKey *k = &e->key;
+        if (!e->draws) continue;
+        fprintf(f, "%llu %u", (unsigned long long)e->draws, k->variant);
+        for (j = 0; j < 8; j++) fprintf(f, " %x", k->c_icw[j]);
+        for (j = 0; j < 8; j++) fprintf(f, " %x", k->a_icw[j]);
+        for (j = 0; j < 8; j++) fprintf(f, " %x", k->c_ocw[j]);
+        for (j = 0; j < 8; j++) fprintf(f, " %x", k->a_ocw[j]);
+        fprintf(f, " %x %x %x %x %x %x %x %x %x", k->fin0, k->fin1, k->rc_control, k->stage_prog,
+                k->alpha_func, k->ps_flags, k->clip_plane, k->other_input, k->dot_map);
+        for (j = 0; j < 4; j++) fprintf(f, " %x %x %x", k->tex_info[j][0], k->tex_info[j][1], k->tex_info[j][2]);
+        fprintf(f, "\n");
+    }
+    fclose(f);
 }
 
 /* Specialised pipelines are built off the render thread as well: until one
@@ -1086,6 +1284,8 @@ int nv2a_d3d_init(void)
         if (!(s_lib = load_library())) return 0;
         for (v = 0; v < 6; v++)
             if (!(s_fn_psv[v] = function_unspecialised([NSString stringWithUTF8String:s_psv_names[v]]))) return 0;
+        s_fn_dbg = function_unspecialised(@"ps_dbg");
+        s_fn_dbg_tex = function_unspecialised(@"ps_dbg_tex");
         if (!(s_fn_ub_vs = function(@"ub_vs")) ||
             !(s_fn_present_vs = function(@"present_vs")) ||
             !(s_fn_present_ps = function(@"present_ps")) ||
@@ -1266,7 +1466,11 @@ static int blit_span(id<MTLTexture> src, id<MTLTexture> mask, id<MTLTexture> dst
     if (!pso) return 0;
     NOTE_OWN_PASS(BRK_SPAN);
     unbind_targets();
-    e = [cmd() renderCommandEncoderWithDescriptor:pass_descriptor(dst, dst_resolve, nil)];
+    {
+        MTLRenderPassDescriptor *d = pass_descriptor(dst, dst_resolve, nil);
+        stamp_render(d, "span blit pass");
+        e = [cmd() renderCommandEncoderWithDescriptor:d];
+    }
     [e setRenderPipelineState:pso];
     [e setViewport:(MTLViewport){ 0, 0, (double)dst_w, (double)dst_h, 0, 1 }];
     [e setScissorRect:(MTLScissorRect){ 0, 0, dst_w, dst_h }];
@@ -2851,7 +3055,11 @@ static void y16_pass(id<MTLTexture> dst, id<MTLFunction> fs, id<MTLTexture> src,
     if (!pso) return;
     NOTE_OWN_PASS(BRK_Y16);
     unbind_targets();
-    e = [cmd() renderCommandEncoderWithDescriptor:pass_descriptor(dst, nil, nil)];
+    {
+        MTLRenderPassDescriptor *d = pass_descriptor(dst, nil, nil);
+        stamp_render(d, "y16 pass");
+        e = [cmd() renderCommandEncoderWithDescriptor:d];
+    }
     [e setRenderPipelineState:pso];
     [e setViewport:(MTLViewport){ 0, 0, (double)[dst width], (double)[dst height], 0, 1 }];
     [e setDepthStencilState:s_ds_off];
@@ -3126,7 +3334,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     pc->fog_color[1] = ((st->fog_color >> 8) & 0xFF) / 255.0f;
     pc->fog_color[2] = ((st->fog_color >> 16) & 0xFF) / 255.0f;
     pc->fog_color[3] = (st->fog_color >> 24) / 255.0f;
-    int wbuf = st->z_perspective && d;
+    int wbuf = st->z_perspective && d && !(s_exp & 1);
     if (wbuf) {
         uint32_t zm = zf == 1 ? 0xFFFFu : 0xFFFFFFu;
         if (st->poly_offset_fill) {
@@ -3176,6 +3384,8 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         ds->variant |= 4u;
     ds->fs = spec_ps(pc, ds->variant);
     if (!ds->fs) ds->fs = s_fn_psv[ds->variant];
+    if ((s_exp & 2) && s_fn_dbg) ds->fs = s_fn_dbg;
+    else if ((s_exp & 4) && s_fn_dbg_tex) ds->fs = s_fn_dbg_tex;
     s_prof_vdraws[ds->fs == s_fn_psv[ds->variant] ? 1 : 0][ds->variant]++;
     /* The horizon panorama reads the frame drawn so far (see bspline0). */
     if (s_draw_bspline && s) {
@@ -3235,6 +3445,16 @@ static id<MTLRenderCommandEncoder> apply_draw_state(const DrawState *ds, id<MTLF
         [e setFragmentSamplerState:ds->smp[n] atIndex:(NSUInteger)n];
     }
     [e setFragmentTexture:ds->tex[8] ? ds->tex[8] : s_null_2d atIndex:8];
+    if (s_pass_log_now) {
+        fprintf(stderr, "[PASS]     draw fs %s v%u blend %d %x/%x scissor %lux%lu", [[ds->fs name] UTF8String],
+                ds->variant, ds->blend_enable, ds->sf, ds->df,
+                (unsigned long)ds->scissor.width, (unsigned long)ds->scissor.height);
+        for (n = 0; n < 9; n++)
+            if (ds->tex[n]) fprintf(stderr, " t%d %lux%lu%s", n, (unsigned long)ds->tex[n].width,
+                                    (unsigned long)ds->tex[n].height,
+                                    ds->tex[n].mipmapLevelCount > 1 ? "m" : "");
+        fprintf(stderr, "\n");
+    }
     return e;
 }
 
@@ -3411,6 +3631,9 @@ static void draw_ub_impl(const NvD3DState *st, int topology, const NvD3DAttrib a
     RECOMP_PROFILE_BEGIN("Metal draw");
     t_draw = s_prof_on > 0 ? qpc() : 0;
     s_prof_draws++;
+    if (s_pass_log_now)
+        fprintf(stderr, "[PASS]     %u indices, %u vertices, topology %d, %s\n", ni, count, topology,
+                program ? "program" : "fixed/pretransformed");
     if (!setup_pipeline(st, topology, &s, &gw, &gh, &zmax)) {
         RECOMP_PROFILE_END();
         return;
@@ -4490,10 +4713,19 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
         pace_flip(&pacing);
         RECOMP_PROFILE_FRAME();
         prof_report();
+        pass_log_frame();
+        exp_poll();
+        if (!(s_frame % 600) && getenv("RECOMP_SPEC_DUMP")) spec_dump();
         display_config(0);
         texpack_apply_toggle();
         s_frame++;
     }
+}
+
+void nv2a_metal_pass_log_flush(void)
+{
+    submit(1);
+    stamp_report();
 }
 
 /* The last flipped frame shown again, paced like a flip: for a title that

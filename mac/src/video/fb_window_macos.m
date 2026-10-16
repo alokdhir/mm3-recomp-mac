@@ -224,9 +224,29 @@ void xbox_FramebufferReleaseKeys(void)
 @interface MM3View : NSView
 @end
 
+/* The game takes no mouse input, so over the picture the pointer is
+ * invisible. A cursor rect: AppKit applies it only while the window is key
+ * and the pointer is inside the view, so the title bar, the menu bar (in
+ * full screen too) and other apps keep the normal pointer. */
+static NSCursor *blank_cursor(void)
+{
+    static NSCursor *c;
+    if (!c) {
+        NSImage *img = [[NSImage alloc] initWithSize:NSMakeSize(16, 16)];
+        c = [[NSCursor alloc] initWithImage:img hotSpot:NSZeroPoint];
+        [img release];
+    }
+    return c;
+}
+
 @implementation MM3View
 
 - (BOOL)acceptsFirstResponder { return YES; }
+
+- (void)resetCursorRects
+{
+    [self addCursorRect:[self bounds] cursor:blank_cursor()];
+}
 - (BOOL)wantsUpdateLayer { return YES; }
 
 - (CALayer *)makeBackingLayer
@@ -247,6 +267,7 @@ void xbox_FramebufferReleaseKeys(void)
 {
     [super setFrameSize:size];
     [self publishSize];
+    [[self window] invalidateCursorRectsForView:self];
 }
 
 - (void)viewDidChangeBackingProperties

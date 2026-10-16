@@ -174,12 +174,15 @@ add_custom_command(OUTPUT "${MM3_APP}/Contents/MacOS/mm3_recomp"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${MM3_APP}/Contents/MacOS" "${MM3_APP}/Contents/Resources"
     COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" "${MM3_APP}/Contents/Info.plist"
     ${MM3_APP_METALLIB_COPY}
+    COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/mac/bundle/AppIcon.icns"
+            "${MM3_APP}/Contents/Resources/"
     # Replaced by rename, so a copy of the game already running keeps its
     # executable (overwriting it in place kills that process).
     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:mm3_recomp>" "${MM3_APP}/Contents/MacOS/mm3_recomp.new"
     COMMAND ${CMAKE_COMMAND} -E rename "${MM3_APP}/Contents/MacOS/mm3_recomp.new" "${MM3_APP}/Contents/MacOS/mm3_recomp"
     COMMAND codesign --force --sign - "${MM3_APP}"
     DEPENDS mm3_recomp "${CMAKE_CURRENT_BINARY_DIR}/mm3_recomp.signed" ${MM3_APP_METALLIB_DEP}
+            "${CMAKE_CURRENT_SOURCE_DIR}/mac/bundle/AppIcon.icns"
             "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
     COMMENT "Packaging Midtown Madness 3.app")
 add_custom_target(mm3_app ALL DEPENDS "${MM3_APP}/Contents/MacOS/mm3_recomp")
@@ -206,6 +209,12 @@ if(MM3_PRECOMPILE_SHADERS)
     add_custom_command(TARGET test_metal_render POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NV2A_METALLIB}" "$<TARGET_FILE_DIR:test_metal_render>/")
 endif()
+
+# GPU cost of the pixel shaders, without the game: bench_ps nv2a.metal keys.txt
+# (keys from RECOMP_SPEC_DUMP).
+add_executable(bench_ps EXCLUDE_FROM_ALL mac/tests/bench_ps.m)
+target_compile_options(bench_ps PRIVATE -fobjc-arc)
+target_link_libraries(bench_ps PRIVATE "-framework Metal" "-framework Foundation")
 
 # The Xbox memory model and trapped MMIO on this host, on a synthetic XBE.
 add_executable(test_memory_layout EXCLUDE_FROM_ALL mac/tests/test_memory_layout.c)
