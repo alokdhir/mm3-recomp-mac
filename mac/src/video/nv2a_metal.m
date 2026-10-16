@@ -933,6 +933,93 @@ static uint64_t pipe_hash(const PipeKey *k)
     return hash_mem((const uint8_t *)k, sizeof *k);
 }
 
+/* ------------------------------------------------ the pipeline binary archive
+ * Building a pipeline for the ubershader -- what a draw uses until its
+ * specialised shader is ready -- takes the GPU compiler 100 ms or more, on the
+ * render thread: a hitch whenever a race shows a new combination. Every
+ * pipeline built is added (in the background) to a Metal binary archive in
+ * the app's Caches folder, saved now and then, and loaded at the next launch,
+ * where building a pipeline it holds is a lookup. The file is named for the
+ * shaders' hash, so a changed shader starts a new one. RECOMP_PSO_ARCHIVE=0
+ * leaves it out. */
+static id<MTLBinaryArchive> s_archive;
+static NSURL *s_archive_url;
+static dispatch_queue_t s_archive_queue;
+static _Atomic int s_archive_dirty;
+static pthread_mutex_t s_archive_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void archive_init(uint64_t shader_hash)
+{
+    const char *e = getenv("RECOMP_PSO_ARCHIVE");
+    NSString *dir;
+    MTLBinaryArchiveDescriptor *d;
+    NSError *err = nil;
+    if (e && !strcmp(e, "0")) return;
+    dir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+    if (!dir) return;
+    dir = [dir stringByAppendingPathComponent:@"org.mm3-port.midtown-madness-3"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES
+                                               attributes:nil error:nil];
+    s_archive_url = [[NSURL fileURLWithPath:[dir stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"nv2a-pipelines-%016llx.binarchive", (unsigned long long)shader_hash]]] retain];
+    d = [[MTLBinaryArchiveDescriptor alloc] init];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:[s_archive_url path]]) d.url = s_archive_url;
+    s_archive = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
+    if (!s_archive && d.url) {                   /* unreadable: start afresh */
+        [[NSFileManager defaultManager] removeItemAtURL:s_archive_url error:nil];
+        d.url = nil;
+        s_archive = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
+    }
+    fprintf(stderr, "[METAL] pipeline archive: %s (%s)\n", s_archive ? [[s_archive_url path] UTF8String] : "off",
+            d.url ? "loaded" : "new");
+    [d release];
+    s_archive_queue = dispatch_queue_create("nv2a.archive", dispatch_queue_attr_make_with_qos_class(
+        DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+}
+
+/* Build d's pipeline, from the archive when it holds it; a new one joins the
+ * archive in the background. Any thread. */
+static id<MTLRenderPipelineState> build_pso(MTLRenderPipelineDescriptor *d, NSError **err)
+{
+    id<MTLRenderPipelineState> pso;
+    int64_t t0 = qpc();
+    double ms;
+    if (s_archive) d.binaryArchives = @[ s_archive ];
+    pso = [s_dev newRenderPipelineStateWithDescriptor:d error:err];
+    ms = (double)(qpc() - t0) * 1000.0 / (double)QPC_FREQ;
+    if (ms > 10.0)
+        fprintf(stderr, "[METAL] pipeline %s built in %.0f ms%s\n", [[d.fragmentFunction name] UTF8String], ms,
+                [NSThread isMainThread] ? " (main thread)" : "");
+    if (pso && s_archive && ms > 2.0) {          /* a quick one came from the archive */
+        MTLRenderPipelineDescriptor *copy = [d copy];
+        dispatch_async(s_archive_queue, ^{
+            NSError *e2 = nil;
+            pthread_mutex_lock(&s_archive_lock);
+            if ([s_archive addRenderPipelineFunctionsWithDescriptor:copy error:&e2])
+                atomic_store(&s_archive_dirty, 1);
+            pthread_mutex_unlock(&s_archive_lock);
+            [copy release];
+        });
+    }
+    return pso;
+}
+
+/* Saved every so often (from the frame loop) while new pipelines arrive. */
+static void archive_save_maybe(void)
+{
+    static int64_t last;
+    int64_t now = qpc();
+    if (!s_archive || now - last < 20 * QPC_FREQ || !atomic_exchange(&s_archive_dirty, 0)) return;
+    last = now;
+    dispatch_async(s_archive_queue, ^{
+        NSError *e = nil;
+        pthread_mutex_lock(&s_archive_lock);
+        if (![s_archive serializeToURL:s_archive_url error:&e])
+            fprintf(stderr, "[METAL] pipeline archive not saved: %s\n", [[e description] UTF8String]);
+        pthread_mutex_unlock(&s_archive_lock);
+    });
+}
+
 /* The pipeline for these shaders, targets and blend; nil if it cannot be
  * built. blend: enable | write mask << 1. */
 static id<MTLRenderPipelineState> pipeline(id<MTLFunction> vs, id<MTLFunction> fs,
@@ -984,7 +1071,7 @@ static id<MTLRenderPipelineState> pipeline(id<MTLFunction> vs, id<MTLFunction> f
             d.depthAttachmentPixelFormat = depth;
             d.stencilAttachmentPixelFormat = depth;
         }
-        slot->pso = [s_dev newRenderPipelineStateWithDescriptor:d error:&err];
+        slot->pso = build_pso(d, &err);
         if (!slot->pso) fail([[NSString stringWithFormat:@"pipeline %@/%@", vs.name, fs.name] UTF8String], err);
         [d release];
     }
@@ -1210,7 +1297,7 @@ static id<MTLRenderPipelineState> spec_pipeline(id<MTLFunction> vs, id<MTLFuncti
                 d.depthAttachmentPixelFormat = depth;
                 d.stencilAttachmentPixelFormat = depth;
             }
-            e->pso = [s_dev newRenderPipelineStateWithDescriptor:d error:&err];
+            e->pso = build_pso(d, &err);
             [d release];
             atomic_store(&e->state, e->pso ? 2 : 3);
         }
@@ -1282,6 +1369,7 @@ int nv2a_d3d_init(void)
         fprintf(stderr, "[METAL] device: %s\n", [[s_dev name] UTF8String]);
         s_queue = [s_dev newCommandQueue];
         if (!(s_lib = load_library())) return 0;
+        archive_init(hash_mem(nv2a_metal_source, sizeof nv2a_metal_source));
         for (v = 0; v < 6; v++)
             if (!(s_fn_psv[v] = function_unspecialised([NSString stringWithUTF8String:s_psv_names[v]]))) return 0;
         s_fn_dbg = function_unspecialised(@"ps_dbg");
@@ -4715,6 +4803,7 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
         prof_report();
         pass_log_frame();
         exp_poll();
+        archive_save_maybe();
         if (!(s_frame % 600) && getenv("RECOMP_SPEC_DUMP")) spec_dump();
         display_config(0);
         texpack_apply_toggle();

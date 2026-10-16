@@ -181,6 +181,153 @@ index 2f88cd8..6937500 100644
      return out
  
  
+diff --git a/scripts/tso_accessors.py b/scripts/tso_accessors.py
+new file mode 100644
+index 0000000..5ee8a05
+--- /dev/null
++++ b/scripts/tso_accessors.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/env python3
++"""Route the generated code's guest memory accesses through ordered accessors.
++
++    python scripts/tso_accessors.py <in.c> <out.c>     (one file; the build runs it
++                                                        on every generated source,
++                                                        after the seams)
++    python scripts/tso_accessors.py <gen dir>          (every recomp_*.c, in place)
++
++x86 keeps every load and store in program order as other cores see them
++(TSO: only a store followed by a load may pass). arm64 does not, so guest
++threads that hand data over through plain memory -- a flag written after the
++data it guards, a ring index after its slot -- can see each other's writes out
++of order once they run on separate host cores. The lifter emits each access as
++MEMn(addr), a store as `MEMn(addr) = value;`. This rewrites stores to
++STn(addr, value) and every other access to LDn(addr) (SLDn for the signed
++SMEMn forms); mm3_recomp_types.h makes those load-acquire / store-release on
++arm64 hosts, which is TSO, and the plain accesses elsewhere. Accesses to the
++thread's own stack frame -- esp-based, or ebp with a negative offset (a local;
++with frame-pointer omission ebp is often an ordinary pointer, so nothing else
++ebp-based is assumed private) -- stay plain MEMn: no other thread reads a
++frame while it is live. Idempotent: running it again changes nothing.
++"""
++import re
++import sys
++from pathlib import Path
++
++NAMES = {'MEM8': ('LD8', 'ST8'), 'MEM16': ('LD16', 'ST16'), 'MEM32': ('LD32', 'ST32'),
++         'MEMF': ('LDF', 'STF'), 'MEMD': ('LDD', 'STD'),
++         'SMEM8': ('SLD8', 'ST8'), 'SMEM16': ('SLD16', 'ST16'), 'SMEM32': ('SLD32', 'ST32'),
++         'SMEM64': ('SLD64', 'ST64')}     # a signed store writes the same bits
++TOKEN = re.compile(r'\b(SMEM8|SMEM16|SMEM32|SMEM64|MEM8|MEM16|MEM32|MEMF|MEMD)\(')
++FRAME = re.compile(r'\s*\(?\s*(esp\b|ebp \+ -(0x[0-9A-Fa-f]+|\d+)\s*\)?\s*$)')
++
++
++def close_paren(s, i):
++    """Index of the ')' matching the '(' at s[i - 1]."""
++    depth = 1
++    while i < len(s):
++        c = s[i]
++        if c == '(':
++            depth += 1
++        elif c == ')':
++            depth -= 1
++            if depth == 0:
++                return i
++        elif c in '"\'':
++            q = c
++            i += 1
++            while i < len(s) and s[i] != q:
++                i += 2 if s[i] == '\\' else 1
++        elif s.startswith('/*', i):
++            i = s.index('*/', i + 2) + 1
++        i += 1
++    raise ValueError('unbalanced parentheses')
++
++
++def statement_end(s, i):
++    """Index of the ';' ending the expression that starts at s[i]."""
++    depth = 0
++    while i < len(s):
++        c = s[i]
++        if c in '([':
++            depth += 1
++        elif c in ')]':
++            if depth == 0:
++                return i                     # e.g. the end of a for(...) clause
++            depth -= 1
++        elif c == ';' and depth == 0:
++            return i
++        elif c in '"\'':
++            q = c
++            i += 1
++            while i < len(s) and s[i] != q:
++                i += 2 if s[i] == '\\' else 1
++        elif s.startswith('/*', i):
++            i = s.index('*/', i + 2) + 1
++        i += 1
++    raise ValueError('statement without an end')
++
++
++def rewrite(s, counts):
++    out, pos = [], 0
++    while True:
++        m = TOKEN.search(s, pos)
++        if not m:
++            out.append(s[pos:])
++            return ''.join(out)
++        out.append(s[pos:m.start()])
++        name = m.group(1)
++        end = close_paren(s, m.end())
++        addr = rewrite(s[m.end():end], counts)
++        j = end + 1
++        while j < len(s) and s[j] in ' \t':
++            j += 1
++        load, store = NAMES[name]
++        if FRAME.match(addr):
++            out.append(f'{name}({addr})')       # stack frame: thread-private
++            counts['frame'] += 1
++            pos = end + 1
++            continue
++        if store and j < len(s) and s[j] == '=' and s[j + 1:j + 2] != '=':
++            k = statement_end(s, j + 1)
++            value = rewrite(s[j + 1:k], counts).strip()
++            out.append(f'{store}({addr}, {value})')
++            counts['store'] += 1
++            pos = k                          # keeps the ';'
++        else:
++            out.append(f'{load}({addr})')
++            counts['load'] += 1
++            pos = end + 1
++
++
++def main(gen):
++    counts = {'load': 0, 'store': 0, 'frame': 0}
++    files = sorted(Path(gen).glob('recomp_*.c'))
++    for path in files:
++        text = path.read_text()
++        new = rewrite(text, counts)
++        if new != text:
++            path.write_text(new)
++    print(f'ordered accessors: {counts["load"]} loads, {counts["store"]} stores '
++          f'({counts["frame"]} stack-frame accesses left plain) in {len(files)} files')
++
++
++def one(src, dst):
++    counts = {'load': 0, 'store': 0, 'frame': 0}
++    text = Path(src).read_text()
++    new = rewrite(text, counts)
++    out = Path(dst)
++    if not out.exists() or out.read_text() != new:   # keep the timestamp when unchanged
++        out.parent.mkdir(parents=True, exist_ok=True)
++        out.write_text(new)
++
++
++if __name__ == '__main__':
++    if len(sys.argv) == 3:
++        one(sys.argv[1], sys.argv[2])
++    elif len(sys.argv) == 2:
++        main(sys.argv[1])
++    else:
++        sys.exit(__doc__)
 diff --git a/src/main.c b/src/main.c
 index 1b249b9..5537062 100644
 --- a/src/main.c
@@ -297,10 +444,61 @@ index 91ec457..fa6bc9e 100644
  }
 +#endif /* _WIN32 */
 diff --git a/src/mm3_recomp_types.h b/src/mm3_recomp_types.h
-index 6cfdcf2..38f3dbc 100644
+index 6cfdcf2..3895393 100644
 --- a/src/mm3_recomp_types.h
 +++ b/src/mm3_recomp_types.h
-@@ -402,6 +402,36 @@ void recomp_trace_esp(const char *name, const char *tag);
+@@ -159,13 +159,10 @@ extern uint32_t g_xbox_code_hi;
+ #  define RECOMP_TLS _Thread_local
+ #endif
+ 
+-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+-extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
++#include "recomp_thread_state.h"   /* g_eax..g_edi, g_esp, g_ebp, x87, g_df, g_fs_base */
+ 
+ /* x87 stack. Per-thread for the same reason the integer registers are:
+  * arguments are passed in st(0)/st(1) across call boundaries. */
+-extern RECOMP_TLS double g_fp_stack[8];
+-extern RECOMP_TLS int g_fp_top;
+ 
+ /**
+  * SEH frame pointer bridge.
+@@ -183,10 +180,8 @@ extern RECOMP_TLS int g_fp_top;
+  * Per-thread, because a TIB is. fs:[0] is the SEH chain head and fs:[4]
+  * reaches the CRT's per-thread data, so a single shared base makes every
+  * guest thread the same thread as far as the CRT is concerned. */
+-extern RECOMP_TLS uint32_t g_fs_base;
+ #define XBOX_FS_BASE g_fs_base
+ 
+-extern RECOMP_TLS uint32_t g_seh_ebp;
+ 
+ /* ---- non-local jumps (setjmp / longjmp) --------------------------------
+  *
+@@ -228,7 +223,6 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
+ #include <setjmp.h>
+ jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
+ int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
+-extern RECOMP_TLS uint32_t g_ebp;
+ 
+ /* EFLAGS.DF, and the signed step the string instructions take because of it.
+  *
+@@ -242,16 +236,12 @@ extern RECOMP_TLS uint32_t g_ebp;
+  * be found by name, and the dashboard rebooted rather than showing a UI.
+  * memmove's overlapping case is the same instruction and the same bug.
+  */
+-extern RECOMP_TLS int g_df;
+ #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
+ 
+ /* x87 control and status. Thread-local for the same reason the x87 stack
+    above is: one guest routine can lift to several C functions, so a compare
+    and the FNSTSW that reads it can land in different bodies, and the control
+    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
+-extern RECOMP_TLS uint16_t g_fp_control_word;
+-extern RECOMP_TLS int g_fp_cmp;
+-extern RECOMP_TLS uint16_t g_fp_cc;
+ #define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
+ /* Values in the existing double-backed stack are all representable as normal
+  * x87 extended values, including binary64 subnormals. Empty stack tags and
+@@ -402,6 +392,36 @@ void recomp_trace_esp(const char *name, const char *tag);
  #define SMEM32(addr) (*(volatile int32_t  *)XBOX_PTR(addr))
  #define SMEM64(addr) (*(volatile int64_t  *)XBOX_PTR(addr))
  
@@ -337,6 +535,92 @@ index 6cfdcf2..38f3dbc 100644
  /* Translated rep movs calls memcpy. The CRT memcpy may use AVX-512 moves,
   * which the MMIO trap handlers (APU, NV2A, ...) cannot decode: copying GP DSP
   * memory at 0xFE8312E4 crashed with "MMIO decode fail ... 62 F1 7F 4A 6F".
+@@ -429,6 +449,85 @@ static __inline void *recomp_guest_memcpy(void *dst, const void *src, size_t n)
+ #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
+ #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
+ 
++/* Ordered accessors for the generated code (scripts/tso_accessors.py routes
++ * every access outside the thread's own stack frame through them). x86 keeps
++ * loads and stores in program order as other cores see them (TSO); arm64
++ * does not, and guest threads run on separate host cores. Load-acquire and
++ * store-release (LDAPR / STLR) restore exactly that order. Those need a
++ * naturally aligned address -- an unaligned access stays plain, as no
++ * lock-free x86 code relies on one -- and the trapped-MMIO decoder knows them
++ * (platform/mmio_decode.h). RECOMP_PLAIN_ORDER, or any other host, keeps the
++ * plain accesses. */
++#if defined(__aarch64__) && !defined(RECOMP_PLAIN_ORDER)
++#define RECOMP_ORDERED_LD(T, mask)                                                  \
++    static inline __attribute__((always_inline)) T recomp_ld_##T(uint32_t a)                                     \
++    {                                                                               \
++        T *p = (T *)XBOX_PTR(a);                                                    \
++        if (__builtin_expect(!(a & (mask)), 1)) return __atomic_load_n(p, __ATOMIC_ACQUIRE); \
++        return *(volatile T *)p;                                                    \
++    }                                                                               \
++    static inline __attribute__((always_inline)) void recomp_st_##T(uint32_t a, T v)                             \
++    {                                                                               \
++        T *p = (T *)XBOX_PTR(a);                                                    \
++        if (__builtin_expect(!(a & (mask)), 1)) __atomic_store_n(p, v, __ATOMIC_RELEASE); \
++        else *(volatile T *)p = v;                                                  \
++    }
++RECOMP_ORDERED_LD(uint8_t, 0u)
++RECOMP_ORDERED_LD(uint16_t, 1u)
++RECOMP_ORDERED_LD(uint32_t, 3u)
++RECOMP_ORDERED_LD(uint64_t, 7u)
++#undef RECOMP_ORDERED_LD
++static inline float recomp_ld_float(uint32_t a)
++{
++    uint32_t u = recomp_ld_uint32_t(a); float f;
++    __builtin_memcpy(&f, &u, 4); return f;
++}
++static inline void recomp_st_float(uint32_t a, float f)
++{
++    uint32_t u; __builtin_memcpy(&u, &f, 4); recomp_st_uint32_t(a, u);
++}
++static inline double recomp_ld_double(uint32_t a)
++{
++    uint64_t u = recomp_ld_uint64_t(a); double d;
++    __builtin_memcpy(&d, &u, 8); return d;
++}
++static inline void recomp_st_double(uint32_t a, double d)
++{
++    uint64_t u; __builtin_memcpy(&u, &d, 8); recomp_st_uint64_t(a, u);
++}
++#define LD8(a)      recomp_ld_uint8_t((uint32_t)(a))
++#define LD16(a)     recomp_ld_uint16_t((uint32_t)(a))
++#define LD32(a)     recomp_ld_uint32_t((uint32_t)(a))
++#define LDF(a)      recomp_ld_float((uint32_t)(a))
++#define LDD(a)      recomp_ld_double((uint32_t)(a))
++#define SLD8(a)     ((int8_t)LD8(a))
++#define SLD16(a)    ((int16_t)LD16(a))
++#define SLD32(a)    ((int32_t)LD32(a))
++#define SLD64(a)    ((int64_t)recomp_ld_uint64_t((uint32_t)(a)))
++#define ST8(a, v)   recomp_st_uint8_t((uint32_t)(a), (uint8_t)(v))
++#define ST16(a, v)  recomp_st_uint16_t((uint32_t)(a), (uint16_t)(v))
++#define ST32(a, v)  recomp_st_uint32_t((uint32_t)(a), (uint32_t)(v))
++#define ST64(a, v)  recomp_st_uint64_t((uint32_t)(a), (uint64_t)(v))
++#define STF(a, v)   recomp_st_float((uint32_t)(a), (float)(v))
++#define STD(a, v)   recomp_st_double((uint32_t)(a), (double)(v))
++#else
++#define LD8(a)      MEM8(a)
++#define LD16(a)     MEM16(a)
++#define LD32(a)     MEM32(a)
++#define LDF(a)      MEMF(a)
++#define LDD(a)      MEMD(a)
++#define SLD8(a)     SMEM8(a)
++#define SLD16(a)    SMEM16(a)
++#define SLD32(a)    SMEM32(a)
++#define SLD64(a)    SMEM64(a)
++#define ST8(a, v)   ((void)(MEM8(a) = (v)))
++#define ST16(a, v)  ((void)(MEM16(a) = (v)))
++#define ST32(a, v)  ((void)(MEM32(a) = (v)))
++#define ST64(a, v)  ((void)(SMEM64(a) = (v)))
++#define STF(a, v)   ((void)(MEMF(a) = (v)))
++#define STD(a, v)   ((void)(MEMD(a) = (v)))
++#endif
++
+ /* fld tbyte: a whole little-endian x87 80-bit extended operand. The x87
+  * stack is held as double, so this keeps a double's precision; reading it as
+  * MEMF took the low four bytes of the significand as a float. */
 diff --git a/src/mods/teleport.c b/src/mods/teleport.c
 index 10408ff..af7f86e 100644
 --- a/src/mods/teleport.c

@@ -11,7 +11,9 @@
  *     design: the XBE image occupies low RAM)
  *   - the host hardware traps: an OHCI register read through the guest
  *     address faults, is decoded (mmio_decode.h, arm64) and answered by the
- *     controller model, and the thread carries on
+ *     controller model, and the thread carries on -- through plain loads and
+ *     stores and through the ordered forms the generated code's accessors
+ *     use (LDAR, LDAPR, LDAPUR, STLR, STLUR)
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -111,6 +113,33 @@ int main(void)
     v = *VA(0xFED00000);                /* HcRevision */
     fprintf(stderr, "OHCI HcRevision %08X\n", v);
     CHECK(v == 0x10 || v == 0x110, "HcRevision %08X", v);
+
+#if defined(__aarch64__)
+    {   /* The same register through each ordered load, and a writable one
+         * (HcPeriodicStart, 0x40) through the ordered stores. */
+        volatile uint32_t *rev = VA(0xFED00000), *ps = VA(0xFED00040);
+        uint32_t a = 0, b = 0, c = 0, plain;
+        __asm__ volatile("ldar %w0, [%1]" : "=r"(a) : "r"(rev) : "memory");
+        __asm__ volatile(".arch_extension rcpc\n ldapr %w0, [%1]" : "=r"(b) : "r"(rev) : "memory");
+        /* ldapur w0, [x1, #-4]: no mnemonic in this assembler */
+        __asm__ volatile("mov x1, %1\n .inst 0x995FC020\n mov %w0, w0"
+                         : "=r"(c) : "r"(rev + 1) : "x0", "x1", "memory");
+        CHECK(a == v && b == v && c == v, "ordered loads read %08X %08X %08X, plain %08X", a, b, c, v);
+        *ps = 0x1234;
+        plain = *ps;
+        if (plain == 0x1234) {
+            __asm__ volatile("stlr %w0, [%1]" : : "r"(0x2345u), "r"(ps) : "memory");
+            CHECK(*ps == 0x2345, "STLR wrote %08X", *ps);
+            /* stlur w0, [x1, #8] */
+            __asm__ volatile("mov w0, %w0\n mov x1, %1\n .inst 0x99008020"
+                             : : "r"(0x3456u), "r"(ps - 2) : "x0", "x1", "memory");
+            CHECK(*ps == 0x3456, "STLUR wrote %08X", *ps);
+        } else {
+            fprintf(stderr, "HcPeriodicStart does not read back (%08X); ordered stores only decoded\n", plain);
+            __asm__ volatile("stlr %w0, [%1]" : : "r"(0x2345u), "r"(ps) : "memory");
+        }
+    }
+#endif
 
     fprintf(stderr, g_failures ? "memory layout: %d failures\n" : "memory layout: ok\n", g_failures);
     return g_failures ? 1 : 0;

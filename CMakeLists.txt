@@ -53,6 +53,11 @@ set(XBOX_VIDEO_BACKEND_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/mac/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/video"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mm3-recomp/tools/xboxrecomp/src/platform")
+# Guest memory accesses in x86 order (TSO): the generated code's loads and
+# stores are load-acquire / store-release (scripts/tso_accessors.py,
+# mm3_recomp_types.h). OFF compiles them as plain accesses, for comparison.
+option(MM3_TSO "Order guest memory accesses as x86 does" ON)
+
 # The shader source, embedded in the renderer (nv2a_metal_source.inc): with
 # no precompiled library the renderer compiles it at launch (about half a
 # second), so a build needs only the Command Line Tools, not Xcode's Metal
@@ -132,9 +137,58 @@ add_custom_target(nv2a_metallib ALL DEPENDS "${NV2A_METALLIB}")
 add_dependencies(mm3_recomp nv2a_metallib)
 endif()
 
+# Each generated source -- as the seams left it, in hooked_chunks/ when it
+# has one -- is compiled from a copy with ordered accessors (ordered/), made
+# at build time, so the generated code and the seams' text stay untouched.
+if(MM3_TSO)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(mm3_tso_script "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mm3-recomp/scripts/tso_accessors.py")
+    set(mm3_hooked_dir "${CMAKE_CURRENT_BINARY_DIR}/third_party/mm3-recomp/hooked_chunks")
+    get_target_property(mm3_sources mm3_recomp SOURCES)
+    set(mm3_sources_out "")
+    set(mm3_ordered "")
+    foreach(src IN LISTS mm3_sources)
+        cmake_path(ABSOLUTE_PATH src BASE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mm3-recomp"
+                   NORMALIZE OUTPUT_VARIABLE abs)
+        cmake_path(GET abs FILENAME name)
+        cmake_path(GET abs PARENT_PATH dir)
+        set(kind "")
+        if(name MATCHES "^recomp_.*\\.c$")
+            if(dir STREQUAL RECOMP_GEN_DIR)
+                set(kind gen)
+            elseif(dir STREQUAL mm3_hooked_dir)
+                set(kind hooked)
+            endif()
+        endif()
+        if(kind)
+            set(out "${CMAKE_CURRENT_BINARY_DIR}/ordered/${kind}/${name}")
+            add_custom_command(OUTPUT "${out}"
+                COMMAND Python3::Interpreter "${mm3_tso_script}" "${abs}" "${out}"
+                DEPENDS "${abs}" "${mm3_tso_script}" VERBATIM)
+            foreach(prop COMPILE_DEFINITIONS COMPILE_OPTIONS INCLUDE_DIRECTORIES)
+                get_source_file_property(value "${abs}" DIRECTORY third_party/mm3-recomp ${prop})
+                if(value)
+                    set_property(SOURCE "${out}" DIRECTORY third_party/mm3-recomp PROPERTY ${prop} "${value}")
+                endif()
+            endforeach()
+            list(APPEND mm3_sources_out "${out}")
+            list(APPEND mm3_ordered "${out}")
+        else()
+            list(APPEND mm3_sources_out "${src}")
+        endif()
+    endforeach()
+    set_property(TARGET mm3_recomp PROPERTY SOURCES ${mm3_sources_out})
+    add_custom_target(mm3_ordered_sources DEPENDS ${mm3_ordered})
+    add_dependencies(mm3_recomp mm3_ordered_sources)
+    list(LENGTH mm3_ordered mm3_ordered_n)
+    message(STATUS "Guest memory ordered as x86 (MM3_TSO): ${mm3_ordered_n} generated sources")
+else()
+    target_compile_definitions(mm3_recomp PRIVATE RECOMP_PLAIN_ORDER)
+endif()
+
 # Without game_files/ beside the app (or above it, as in this checkout), the
 # app looks here: the tree it was built from.
-set_property(SOURCE mac/src/app_macos.m APPEND PROPERTY
+set_property(SOURCE mac/src/app_macos.m DIRECTORY third_party/mm3-recomp APPEND PROPERTY
     COMPILE_DEFINITIONS "MM3_BUILD_ROOT=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
 
 # build/Midtown Madness 3.app: the same executable, the shaders in Resources
