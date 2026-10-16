@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/adhir/src/mm3-port/build-dsptests/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

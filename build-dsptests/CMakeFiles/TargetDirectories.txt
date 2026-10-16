@@ -1,0 +1,12 @@
+/Users/adhir/src/mm3-port/build-dsptests/CMakeFiles/dsp_runtime.dir
+/Users/adhir/src/mm3-port/build-dsptests/CMakeFiles/dsp_cpu_test.dir
+/Users/adhir/src/mm3-port/build-dsptests/CMakeFiles/dsp_disasm_test.dir
+/Users/adhir/src/mm3-port/build-dsptests/CMakeFiles/dsp_interrupt_fastpath_test.dir
+/Users/adhir/src/mm3-port/build-dsptests/CMakeFiles/dsp_frame_replay.dir
+/Users/adhir/src/mm3-port/build-dsptests/CMakeFiles/dsp_clipped_capture_test.dir
+/Users/adhir/src/mm3-port/build-dsptests/CMakeFiles/dsp_capture_program.dir
+/Users/adhir/src/mm3-port/build-dsptests/CMakeFiles/dsp_recomp_gen.dir
+/Users/adhir/src/mm3-port/build-dsptests/CMakeFiles/dsp_recomp_frame_replay.dir
+/Users/adhir/src/mm3-port/build-dsptests/CMakeFiles/test.dir
+/Users/adhir/src/mm3-port/build-dsptests/CMakeFiles/edit_cache.dir
+/Users/adhir/src/mm3-port/build-dsptests/CMakeFiles/rebuild_cache.dir

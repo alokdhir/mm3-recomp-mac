@@ -1,0 +1,7 @@
+dsp_cpu 1 0.140166
+dsp_disasm 1 0.0423413
+dsp_interrupt_fastpath 1 0.0703409
+dsp_clipped_capture 1 0.00915521
+dsp_clipped_replay 1 0.0502329
+dsp_recomp_replay 1 0.0492917
+---

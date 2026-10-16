@@ -270,6 +270,20 @@ add_executable(bench_ps EXCLUDE_FROM_ALL mac/tests/bench_ps.m)
 target_compile_options(bench_ps PRIVATE -fobjc-arc)
 target_link_libraries(bench_ps PRIVATE "-framework Metal" "-framework Foundation")
 
+# DSP56300 core speed on a recorded frame, verified bit for bit:
+# dsp_bench <capture.frame.bin> [replays] (see mac/tests/dsp_bench.c).
+set(MM3_DSP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mm3-recomp/tools/xboxrecomp/src/apu/dsp")
+add_executable(dsp_bench EXCLUDE_FROM_ALL mac/tests/dsp_bench.c
+    ${MM3_DSP_DIR}/interp/dsp_cpu.c ${MM3_DSP_DIR}/dsp.c ${MM3_DSP_DIR}/dsp_dma.c)
+target_include_directories(dsp_bench PRIVATE ${MM3_DSP_DIR} ${MM3_DSP_DIR}/interp
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mm3-recomp/tools/xboxrecomp/src/apu"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mm3-recomp/tools/xboxrecomp/src")
+target_compile_definitions(dsp_bench PRIVATE
+    DSP_RECOMP_INC="${CMAKE_CURRENT_BINARY_DIR}/xboxrecomp/src/apu/dsp_recomp_programs.inc")
+set_property(SOURCE ${MM3_DSP_DIR}/interp/dsp_cpu.c TARGET_DIRECTORY dsp_bench APPEND PROPERTY
+    COMPILE_OPTIONS -mllvm -inline-threshold=1000)
+add_dependencies(dsp_bench dsp_recomp_programs)
+
 # The Xbox memory model and trapped MMIO on this host, on a synthetic XBE.
 add_executable(test_memory_layout EXCLUDE_FROM_ALL mac/tests/test_memory_layout.c)
 target_link_libraries(test_memory_layout PRIVATE xboxrecomp "-Wl,-undefined,dynamic_lookup")
