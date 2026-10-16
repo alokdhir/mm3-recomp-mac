@@ -1,0 +1,13 @@
+/build/
+/game_files/
+*.iso
+*.xiso
+*.xbe
+.DS_Store
+/.venv/
+*.log
+/texpack/
+/texdump/
+/.venv-upscale/
+/texpack.off/
+/.trekker/

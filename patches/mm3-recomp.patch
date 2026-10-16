@@ -1,0 +1,397 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4353ace..00e082c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -25,7 +25,9 @@ endif()
+ 
+ # The audio DSP programs MM3 runs, saved there by the game (src/main.c) and
+ # recompiled to C by each build; derived from the user's game like src/recomp/gen.
+-set(XBOXRECOMP_DSP_PROGRAM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/game_files/dsp")
++if(NOT DEFINED XBOXRECOMP_DSP_PROGRAM_DIR)
++    set(XBOXRECOMP_DSP_PROGRAM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/game_files/dsp")
++endif()
+ add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
+ if(MSVC AND MM3_DSP_AUTO_INLINE)
+     # RelWithDebInfo defaults to /Ob1, which leaves small non-inline interpreter
+@@ -37,6 +39,14 @@ if(MSVC AND MM3_DSP_AUTO_INLINE)
+ endif()
+ 
+ 
++# Platform-specific sources and libraries. A non-Windows host (the macOS port)
++# supplies its launcher, overlay and window through MM3_PLATFORM_SOURCES and
++# MM3_PLATFORM_LIBRARIES from the including project.
++set(MM3_PLATFORM_SOURCES "" CACHE STRING "Host sources replacing the Win32 launcher and overlay")
++set(MM3_PLATFORM_LIBRARIES "" CACHE STRING "Host libraries for MM3_PLATFORM_SOURCES")
++set(MM3_PLATFORM_INCLUDE_DIRS "" CACHE STRING "Host include directories (a windows.h shim)")
++
++if(WIN32)
+ # Settings launcher (src/mm3_launcher.cpp): RmlUi on its Win32/D3D11 backend,
+ # FreeType for its fonts. Static, fetched once at configure time.
+ include(FetchContent)
+@@ -71,6 +81,7 @@ add_library(mm3_imgui STATIC
+     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp)
+ target_include_directories(mm3_imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+ target_link_libraries(mm3_imgui PUBLIC d3d11 d3dcompiler dwmapi)
++endif()
+ if(MM3_TRACY)
+     foreach(profile_target xbox_kernel xbox_video)
+         target_link_libraries(${profile_target} PRIVATE Tracy::TracyClient)
+@@ -281,16 +292,24 @@ foreach(distance_input IN LISTS distance_owners)
+     list(APPEND RECOMP_GEN_SOURCES "${distance_output}")
+ endforeach()
+ 
++if(WIN32)
++    set(MM3_HOST_SOURCES
++        src/mm3_launcher.cpp
++        src/mm3.rc
++        ${rmlui_SOURCE_DIR}/Backends/RmlUi_Platform_Win32.cpp
++        ${rmlui_SOURCE_DIR}/Backends/RmlUi_Renderer_DX11.cpp
++        ${rmlui_SOURCE_DIR}/Backends/RmlUi_Backend_Win32_DX11.cpp
++        src/mods/debug_overlay.cpp
++        src/recomp_trace_probe.c)
++else()
++    set(MM3_HOST_SOURCES ${MM3_PLATFORM_SOURCES})
++endif()
++
+ add_executable(${PROJECT_NAME}
+     src/main.c
+     src/mm3_asset_cache.c
+-    src/mm3_launcher.cpp
+-    src/mm3.rc
+-    ${rmlui_SOURCE_DIR}/Backends/RmlUi_Platform_Win32.cpp
+-    ${rmlui_SOURCE_DIR}/Backends/RmlUi_Renderer_DX11.cpp
+-    ${rmlui_SOURCE_DIR}/Backends/RmlUi_Backend_Win32_DX11.cpp
++    ${MM3_HOST_SOURCES}
+     src/mods/mods.c
+-    src/mods/debug_overlay.cpp
+     src/mods/dev_tools.c
+     src/mods/menu_mouse.c
+     src/mods/collision_fix.c
+@@ -317,7 +336,6 @@ add_executable(${PROJECT_NAME}
+  src/mods/widescreen.c
+  src/mods/draw_distance.c
+  src/mods/teleport.c
+- src/recomp_trace_probe.c
+  ${RECOMP_GEN_SOURCES})
+ 
+ set_property(SOURCE src/recomp_manual.c APPEND PROPERTY COMPILE_DEFINITIONS
+@@ -343,9 +361,15 @@ target_include_directories(${PROJECT_NAME} PRIVATE
+     ${XBOXRECOMP_DIR}/include
+     ${XBOXRECOMP_DIR}/src/video)
+ 
+-target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp mm3_imgui RmlUi::RmlUi d3d11 dxgi d3dcompiler dwmapi xinput)
+-target_include_directories(${PROJECT_NAME} PRIVATE ${rmlui_SOURCE_DIR}/Backends)
++if(WIN32)
++    target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp mm3_imgui RmlUi::RmlUi d3d11 dxgi d3dcompiler dwmapi xinput)
++    target_include_directories(${PROJECT_NAME} PRIVATE ${rmlui_SOURCE_DIR}/Backends)
++else()
++    target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp ${MM3_PLATFORM_LIBRARIES})
++    target_include_directories(${PROJECT_NAME} BEFORE PRIVATE ${MM3_PLATFORM_INCLUDE_DIRS})
++endif()
+ 
++if(WIN32)
+ # Focused offline checks; explicitly built, never part of the game build.
+ foreach(check teleport dev_tools overlay input_capture)
+     if(check STREQUAL "overlay")
+@@ -362,11 +386,13 @@ foreach(check teleport dev_tools overlay input_capture)
+     endif()
+ endforeach()
+ target_link_libraries(mm3_overlay_contract PRIVATE mm3_imgui xinput)
++endif()
+ 
+ # MM3's CRT uses NtAllocateVirtualMemory reserve requests as heap-backed
+ # buffers.  Keep the vendor runtime untouched: redirect its public reserve
+ # seam to the existing Xbox heap on the ELF build used by this checkout.
+-if(NOT MSVC)
++if(NOT MSVC AND NOT APPLE)
++ target_sources(${PROJECT_NAME} PRIVATE src/recomp_trace_probe.c)
+  target_link_options(${PROJECT_NAME} PRIVATE
+   "-Wl,--wrap=xbox_ReserveAlloc"
+   "-Wl,--wrap=recomp_trace_esp")
+@@ -381,6 +407,7 @@ if(MSVC)
+     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
+ endif()
+ 
++if(WIN32)
+ target_link_libraries(mm3_input_capture_contract PRIVATE xinput)
+ target_include_directories(mm3_input_capture_contract PRIVATE ${XBOXRECOMP_DIR}/src)
+ 
+@@ -395,3 +422,4 @@ target_link_libraries(mm3_launcher_settings_contract PRIVATE RmlUi::RmlUi d3d11
+ if(MSVC)
+     target_compile_options(mm3_launcher_settings_contract PRIVATE /UNDEBUG)
+ endif()
++endif()
+diff --git a/scripts/generate_mm3.py b/scripts/generate_mm3.py
+index 2f88cd8..6937500 100644
+--- a/scripts/generate_mm3.py
++++ b/scripts/generate_mm3.py
+@@ -34,7 +34,7 @@ GENERATOR_COMMIT = '967ec30f362dee229183b4e112e928cd41830484'
+ def generator_dir():
+     if os.environ.get('MM3_GENERATOR_DIR'):
+         return Path(os.environ['MM3_GENERATOR_DIR']).resolve()
+-    out = REPO / 'tools/.generator' / (GENERATOR_COMMIT[:12] + '-fp80')
++    out = REPO / 'tools/.generator' / (GENERATOR_COMMIT[:12] + '-fp80-xchg-cvt')
+     if not (out / 'tools/recomp/__main__.py').exists():
+         tar = subprocess.run(['git', '-C', str(REPO / 'tools/xboxrecomp'), 'archive', '--format=tar',
+                               GENERATOR_COMMIT, 'tools'], check=True, capture_output=True).stdout
+@@ -52,7 +52,45 @@ def generator_dir():
+         text = lifter.read_text()
+         if text.count(old) != 1:
+             sys.exit('pinned lifter changed: fld tbyte patch does not apply')
+-        lifter.write_text(text.replace(old, new))
++        text = text.replace(old, new)
++        # xchg with memory is implicitly locked on x86; lift the 32-bit form
++        # to an atomic swap (recomp_xchg32) so it stays one on weakly ordered
++        # hosts. Register-register and narrow forms are unchanged.
++        old_xchg = """        a = _fmt_operand_read(ops[0])
++        b = _fmt_operand_read(ops[1])
++        return [
++            f"{{ uint32_t _tmp = {a};",
++            _fmt_operand_write(ops[0], b),
++            _fmt_operand_write(ops[1], "_tmp") + " }",
++        ]"""
++        new_xchg = """        mem = [o for o in ops[:2] if o.type == "mem"]
++        if len(mem) == 1 and getattr(mem[0], "mem_size", 4) == 4:
++            other = ops[1] if ops[0] is mem[0] else ops[0]
++            if other.type == "reg" and other.reg not in _REG_WIDTH:
++                return [
++                    f"{{ uint32_t _tmp = recomp_xchg32({_fmt_mem(mem[0])}, {_fmt_operand_read(other)});",
++                    _fmt_operand_write(other, "_tmp") + " }",
++                ]
++""" + old_xchg
++        if text.count(old_xchg) != 1:
++            sys.exit('pinned lifter changed: xchg patch does not apply')
++        text = text.replace(old_xchg, new_xchg)
++        # SSE float-to-int conversions: x86's results (integer indefinite out
++        # of range or for NaN; nearest-even for the non-truncating forms)
++        # through recomp_sse_cvt_i32, not a C cast.
++        for width in ('ss', 'sd'):
++            head = ('        if m in ("cvt%s2si", "cvtt%s2si"):\n'
++                    '            if nops >= 2:\n' % (width, width))
++            old_cvt = head + ('                return [_fmt_operand_write(ops[0], '
++                              'f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]')
++            new_cvt = head + ('                trunc = 1 if m.startswith("cvtt") else 0\n'
++                              '                return [_fmt_operand_write(ops[0], '
++                              'f"recomp_sse_cvt_i32((double){_sse_read(ops[1])}, {trunc})") '
++                              '+ f" /* {m} */"]')
++            if text.count(old_cvt) != 1:
++                sys.exit('pinned lifter changed: cvt%s2si patch does not apply' % width)
++            text = text.replace(old_cvt, new_cvt)
++        lifter.write_text(text)
+     return out
+ 
+ 
+diff --git a/src/main.c b/src/main.c
+index 1b249b9..5537062 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -3,6 +3,11 @@
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <windows.h>
++#if !defined(_WIN32)
++#include <execinfo.h>
++#include <signal.h>
++#include <mach/arm/thread_status.h>
++#endif
+ 
+ #include <xbox/xboxrecomp.h>
+ 
+@@ -40,6 +45,7 @@ static void mm3_close_game(void)
+     ExitProcess(0);
+ }
+ 
++#if defined(_WIN32)
+ static BOOL WINAPI mm3_console_control(DWORD event)
+ {
+     if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT &&
+@@ -48,6 +54,13 @@ static BOOL WINAPI mm3_console_control(DWORD event)
+     mm3_close_game();
+     return TRUE;
+ }
++#else
++static void mm3_console_signal(int sig)
++{
++    (void)sig;
++    mm3_close_game();
++}
++#endif
+ int mm3_launcher(void);
+ 
+ /* Register the first XAPI worker before it can create background workers.
+@@ -77,6 +90,40 @@ void sub_00083A6C(void)
+     sub_00083A6C_original();
+ }
+ 
++#if !defined(_WIN32)
++/* arm64 Darwin: the same guest state as the Win32 report, with the host's
++ * PC/SP/LR from the signal frame and a native backtrace. */
++static LONG mm3_crash_report(EXCEPTION_POINTERS *info)
++{
++    const EXCEPTION_RECORD *record = info ? info->ExceptionRecord : NULL;
++    const CONTEXT *context = info ? info->ContextRecord : NULL;
++    ULONG_PTR fault = record && record->NumberParameters > 1
++        ? record->ExceptionInformation[1] : 0;
++    void *frames[32];
++    int count;
++
++    fprintf(stderr, "[CRASH] code=0x%08X fault=%p write=%d guest_esp=0x%08X eax=0x%08X\n",
++            record ? (unsigned)record->ExceptionCode : 0u, (void *)fault,
++            record ? (int)record->ExceptionInformation[0] : 0, g_esp, g_eax);
++    if (context && context->ss)
++        fprintf(stderr, "[CRASH] pc=%p sp=%p lr=%p esr=0x%08X\n",
++                (void *)arm_thread_state64_get_pc(*context->ss),
++                (void *)arm_thread_state64_get_sp(*context->ss),
++                (void *)arm_thread_state64_get_lr(*context->ss), context->esr);
++    fprintf(stderr, "[CRASH] xbox_mem_offset=%lld memory_base=%p guest_fault=0x%08llX\n",
++            (long long)g_xbox_mem_offset, xbox_GetMemoryBase(),
++            (unsigned long long)(fault - (uintptr_t)g_xbox_mem_offset));
++    fprintf(stderr, "[CRASH] guest fs=0x%08X ebp=0x%08X seh_ebp=0x%08X ecx=0x%08X ebx=0x%08X esi=0x%08X edi=0x%08X\n",
++            g_fs_base, g_ebp, g_seh_ebp, g_ecx, g_ebx, g_esi, g_edi);
++    if (g_ebp >= 0x10000u && g_ebp < MM3_MEMORY_MAP_SIZE - 8u)
++        fprintf(stderr, "[CRASH_CALLER] frame=%08X parent=%08X return=%08X\n",
++                g_ebp, MEM32(g_ebp), MEM32(g_ebp + 4u));
++    count = backtrace(frames, 32);
++    fflush(stderr);
++    backtrace_symbols_fd(frames, count, 2);
++    return EXCEPTION_CONTINUE_SEARCH;
++}
++#else
+ static LONG WINAPI mm3_crash_report(EXCEPTION_POINTERS *info)
+ {
+     const EXCEPTION_RECORD *record = info ? info->ExceptionRecord : NULL;
+@@ -132,6 +179,7 @@ static LONG WINAPI mm3_crash_report(EXCEPTION_POINTERS *info)
+     fflush(stderr);
+     return EXCEPTION_CONTINUE_SEARCH;
+ }
++#endif
+ 
+ static int load_file(const char *path, void **data, size_t *size)
+ {
+@@ -181,7 +229,12 @@ int main(void)
+     SetUnhandledExceptionFilter(mm3_crash_report);
+     xbox_FramebufferSetCloseHandler(mm3_close_game);
+     nv2a_d3d_set_flare_depth_test(1);
++#if defined(_WIN32)
+     SetConsoleCtrlHandler(mm3_console_control, TRUE);
++#else
++    signal(SIGINT, mm3_console_signal);
++    signal(SIGTERM, mm3_console_signal);
++#endif
+     puts("MM3 static recompilation");
+     /* Profiles seed settings before the launcher; saved choices, including
+      * Auto resolution and window aspect, take precedence when Play exports them. */
+diff --git a/src/mm3_asset_cache.c b/src/mm3_asset_cache.c
+index 91ec457..fa6bc9e 100644
+--- a/src/mm3_asset_cache.c
++++ b/src/mm3_asset_cache.c
+@@ -1,3 +1,5 @@
++#if defined(_WIN32)
++/* POSIX hosts: mac/src/mm3_asset_cache_posix.c in the macOS port. */
+ #include <stdio.h>
+ #include <string.h>
+ #include <wchar.h>
+@@ -199,3 +201,4 @@ close_files:
+             cache_error("cannot invalidate stale cached archive");
+     }
+ }
++#endif /* _WIN32 */
+diff --git a/src/mm3_recomp_types.h b/src/mm3_recomp_types.h
+index 6cfdcf2..38f3dbc 100644
+--- a/src/mm3_recomp_types.h
++++ b/src/mm3_recomp_types.h
+@@ -402,6 +402,36 @@ void recomp_trace_esp(const char *name, const char *tag);
+ #define SMEM32(addr) (*(volatile int32_t  *)XBOX_PTR(addr))
+ #define SMEM64(addr) (*(volatile int64_t  *)XBOX_PTR(addr))
+ 
++/* xchg with memory is implicitly locked on x86: an atomic swap and a full
++ * barrier, and how InterlockedExchange compiles. A weakly ordered host needs
++ * it to be both (generate_mm3.py routes 32-bit memory xchg here). Exclusive
++ * access needs an aligned word, so an unaligned one keeps the plain swap. */
++static inline uint32_t recomp_xchg32(uint32_t addr, uint32_t value)
++{
++    volatile uint32_t *p = (volatile uint32_t *)XBOX_PTR(addr);
++    if (!(addr & 3u))
++        return __atomic_exchange_n((uint32_t *)p, value, __ATOMIC_SEQ_CST);
++    {
++        uint32_t old = *p;
++        *p = value;
++        return old;
++    }
++}
++
++/* CVTSS2SI/CVTSD2SI (round by MXCSR: nearest-even, which no title here
++ * changes) and their truncating CVTT forms, as x86 computes them: a value
++ * out of int32 range, or NaN, is the integer indefinite 0x80000000. A C cast
++ * is undefined there and saturates on arm64 (NaN becomes 0), and as the
++ * lifter wrote it the rounding forms truncated (generate_mm3.py routes the
++ * conversions here). */
++static inline uint32_t recomp_sse_cvt_i32(double value, int truncate)
++{
++    double r = truncate ? trunc(value) : nearbyint(value);
++    if (!(r >= -2147483648.0 && r <= 2147483647.0))
++        return 0x80000000u;
++    return (uint32_t)(int32_t)r;
++}
++
+ /* Translated rep movs calls memcpy. The CRT memcpy may use AVX-512 moves,
+  * which the MMIO trap handlers (APU, NV2A, ...) cannot decode: copying GP DSP
+  * memory at 0xFE8312E4 crashed with "MMIO decode fail ... 62 F1 7F 4A 6F".
+diff --git a/src/mods/teleport.c b/src/mods/teleport.c
+index 10408ff..af7f86e 100644
+--- a/src/mods/teleport.c
++++ b/src/mods/teleport.c
+@@ -297,6 +297,8 @@ int mm3_teleport_queue(float x, float z, float heading)
+     return accepted;
+ }
+ 
++#if defined(_WIN32)
++/* The debug teleport pipe and panel are Win32 tools. */
+ static DWORD WINAPI pipe_thread(void *unused)
+ {
+     char name[80];
+@@ -464,6 +466,8 @@ static DWORD WINAPI panel_thread(void *unused)
+     return 0;
+ }
+ 
++#endif /* _WIN32 */
++
+ void mm3_debug_teleport_init(void)
+ {
+     const char *opt = getenv("MM3_DEBUG_TELEPORT");
+@@ -471,6 +475,11 @@ void mm3_debug_teleport_init(void)
+     HANDLE thread;
+     int with_overlay = overlay && *overlay && strcmp(overlay, "0") != 0;   /* as mm3_mod_on */
+     if ((!opt || strcmp(opt, "1") != 0) && !with_overlay) return;
++#if !defined(_WIN32)
++    (void)thread;
++    fprintf(stderr, "[MM3_TELEPORT] debug teleport tool is Windows-only\n");
++    return;
++#else
+     finished = CreateEventA(NULL, TRUE, FALSE, NULL);
+     if (!finished) return;
+     enabled = 1;
+@@ -480,4 +489,5 @@ void mm3_debug_teleport_init(void)
+     if (with_overlay) return;
+     thread = CreateThread(NULL, 0, panel_thread, NULL, 0, NULL);
+     if (thread) CloseHandle(thread);
++#endif
+ }
+diff --git a/src/recomp_manual.c b/src/recomp_manual.c
+index acdb9f0..faef753 100644
+--- a/src/recomp_manual.c
++++ b/src/recomp_manual.c
+@@ -2,8 +2,13 @@
+ #include <stddef.h>
+ #include <stdlib.h>
+ #include <stdio.h>
++#if defined(_M_X64) || defined(__x86_64__)
+ #include <xmmintrin.h>
+ #include <emmintrin.h>
++#else
++#define _mm_mfence() __atomic_thread_fence(__ATOMIC_SEQ_CST)
++#define _mm_sfence() __atomic_thread_fence(__ATOMIC_RELEASE)
++#endif
+ #include <string.h>
+ #include <windows.h>
+ 

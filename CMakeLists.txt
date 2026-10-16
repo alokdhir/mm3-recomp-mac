@@ -1,0 +1,170 @@
+cmake_minimum_required(VERSION 3.20)
+# Any Apple Silicon Mac on Sonoma or later: the floor of the Metal 3.1
+# shaders. Without it the build would require the macOS it was built on.
+if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum macOS" FORCE)
+endif()
+project(mm3_port C CXX OBJC)
+
+# Midtown Madness 3 (Xbox), native on Apple Silicon.
+#
+# The game is the upstream static recompilation (third_party/mm3-recomp, with
+# the xboxrecomp runtime under it), built for arm64-apple-macos. This project
+# supplies what replaces the Win32 host: mac/include (a windows.h over the
+# runtime's Win32 vocabulary) and mac/src (launcher, file and CRT shims).
+#
+# Game data is never part of the tree: scripts/setup.sh extracts your disc to
+# game_files/ and generates the translated C into build/gen.
+
+if(NOT APPLE OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    message(FATAL_ERROR "mm3-port targets arm64 macOS")
+endif()
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+
+set(MM3_GAME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/game_files" CACHE PATH
+    "Extracted game files (default.xbe, Data/...)")
+set(RECOMP_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/gen" CACHE PATH
+    "Generated recompilation C sources")
+set(XBOXRECOMP_DSP_PROGRAM_DIR "${MM3_GAME_DIR}/dsp")
+
+set(MM3_PLATFORM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/mac/include" CACHE STRING "" FORCE)
+set(MM3_PLATFORM_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/app_macos.m"
+    "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/mac_win32_extras.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/mm3_asset_cache_posix.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/mm3_launcher_macos.c"
+    CACHE STRING "" FORCE)
+set(MM3_PLATFORM_LIBRARIES "-framework Cocoa" "-framework IOKit" CACHE STRING "" FORCE)
+
+# Audio out through Core Audio, pads through the GameController framework.
+set(XBOX_AUDIO_BACKEND_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/audio/apu_coreaudio.c")
+set(XBOX_AUDIO_BACKEND_LIBRARIES "-framework AudioToolbox" "-framework CoreAudio")
+set(XBOX_INPUT_BACKEND_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/input/gc_xinput.m")
+set(XBOX_INPUT_BACKEND_INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/mac/include")
+set(XBOX_INPUT_BACKEND_LIBRARIES "-framework GameController" "-framework CoreHaptics" "-framework Foundation")
+
+# The renderer: Metal in place of D3D11, and the AppKit window it draws into.
+set(XBOX_VIDEO_BACKEND_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/video/nv2a_metal.m"
+    "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/video/fb_window_macos.m")
+set(XBOX_VIDEO_BACKEND_INCLUDES
+    "${CMAKE_CURRENT_SOURCE_DIR}/mac/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/video"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mm3-recomp/tools/xboxrecomp/src/platform")
+set(XBOX_VIDEO_BACKEND_LIBRARIES
+    "-framework Metal" "-framework QuartzCore" "-framework Cocoa" "-framework Carbon"
+    "-framework ImageIO" "-framework CoreGraphics")
+
+add_subdirectory(third_party/mm3-recomp)
+
+# The game's arithmetic as x86 rounds it: clang on arm64 fuses a*b+c into
+# one FMA (one rounding instead of two), which x86 code never did. Physics
+# and the CPU-built shadow geometry are sensitive to that at their edges.
+target_compile_options(mm3_recomp PRIVATE -ffp-contract=off)
+
+# Upstream's main() runs on a worker thread; AppKit owns the real one
+# (mac/src/app_macos.m).
+set_property(SOURCE third_party/mm3-recomp/src/main.c
+    DIRECTORY third_party/mm3-recomp APPEND PROPERTY COMPILE_DEFINITIONS main=mm3_main)
+
+# The translated code as clang sees it. MSVC accepts a call to an undeclared
+# function; the generator relies on that for tail jumps it emits into dead
+# code (after a return, under labels nothing branches to), which optimisation
+# then removes. Keep those a warning in the generated sources only, and quiet
+# the lifter's double-parenthesised conditions. recomp_types.h replaces
+# memcpy with the guest-aware copy, so the SDK's fortified macro stays out.
+file(GLOB MM3_GEN_SOURCES CONFIGURE_DEPENDS "${RECOMP_GEN_DIR}/*.c")
+set_property(SOURCE ${MM3_GEN_SOURCES} DIRECTORY third_party/mm3-recomp APPEND PROPERTY
+    COMPILE_OPTIONS -Wno-error=implicit-function-declaration -Wno-parentheses-equality
+    -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0)
+
+# The renderer's shaders, compiled ahead of time beside the executable.
+set(NV2A_METAL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/video/nv2a.metal")
+set(NV2A_METALLIB "${CMAKE_CURRENT_BINARY_DIR}/third_party/mm3-recomp/nv2a.metallib")
+# TOOLCHAINS=Metal: newer Xcodes ship the Metal compiler as a separate
+# download (xcodebuild -downloadComponent MetalToolchain), which plain xcrun
+# does not always find; naming it works either way.
+add_custom_command(OUTPUT "${NV2A_METALLIB}"
+    COMMAND ${CMAKE_COMMAND} -E env TOOLCHAINS=Metal
+            xcrun -sdk macosx metal -std=metal3.1 -fmetal-math-mode=relaxed
+            -mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}
+            -c "${NV2A_METAL_SRC}" -o "${CMAKE_CURRENT_BINARY_DIR}/nv2a.air"
+    COMMAND ${CMAKE_COMMAND} -E env TOOLCHAINS=Metal
+            xcrun -sdk macosx metallib "${CMAKE_CURRENT_BINARY_DIR}/nv2a.air" -o "${NV2A_METALLIB}"
+    DEPENDS "${NV2A_METAL_SRC}"
+    COMMENT "Compiling the NV2A Metal shaders")
+add_custom_target(nv2a_metallib ALL DEPENDS "${NV2A_METALLIB}")
+add_dependencies(mm3_recomp nv2a_metallib)
+
+# Without game_files/ beside the app (or above it, as in this checkout), the
+# app looks here: the tree it was built from.
+set_property(SOURCE mac/src/app_macos.m APPEND PROPERTY
+    COMPILE_DEFINITIONS "MM3_BUILD_ROOT=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
+
+# build/Midtown Madness 3.app: the same executable, the shaders in Resources,
+# ad-hoc signed. The game data stays outside it (game_files/).
+if(CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET_OR_DEFAULT "${CMAKE_OSX_DEPLOYMENT_TARGET}")
+else()
+    set(CMAKE_OSX_DEPLOYMENT_TARGET_OR_DEFAULT "13.0")
+endif()
+set(MM3_APP "${CMAKE_CURRENT_BINARY_DIR}/Midtown Madness 3.app")
+configure_file(mac/bundle/Info.plist.in "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)
+# The same Info.plist inside the executable, so the bare build-tree binary
+# carries the app's identity too: system services such as controller haptics
+# refuse a process without one ("Couldn't communicate with a helper
+# application").
+target_link_options(mm3_recomp PRIVATE
+    "LINKER:-sectcreate,__TEXT,__info_plist,${CMAKE_CURRENT_BINARY_DIR}/Info.plist")
+set_property(TARGET mm3_recomp APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/Info.plist")
+# Signed again with the app's identifier, which binds that Info.plist (the
+# linker's ad-hoc signature does not). A step of its own: a POST_BUILD rule
+# cannot be attached from this directory.
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mm3_recomp.signed"
+    COMMAND codesign --force --sign - --identifier org.mm3-port.midtown-madness-3
+            "$<TARGET_FILE:mm3_recomp>"
+    COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_CURRENT_BINARY_DIR}/mm3_recomp.signed"
+    DEPENDS mm3_recomp "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
+    COMMENT "Signing mm3_recomp with its Info.plist")
+add_custom_target(mm3_signed ALL DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/mm3_recomp.signed")
+add_custom_command(OUTPUT "${MM3_APP}/Contents/MacOS/mm3_recomp"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${MM3_APP}/Contents/MacOS" "${MM3_APP}/Contents/Resources"
+    COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" "${MM3_APP}/Contents/Info.plist"
+    COMMAND ${CMAKE_COMMAND} -E copy "${NV2A_METALLIB}" "${MM3_APP}/Contents/Resources/"
+    # Replaced by rename, so a copy of the game already running keeps its
+    # executable (overwriting it in place kills that process).
+    COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:mm3_recomp>" "${MM3_APP}/Contents/MacOS/mm3_recomp.new"
+    COMMAND ${CMAKE_COMMAND} -E rename "${MM3_APP}/Contents/MacOS/mm3_recomp.new" "${MM3_APP}/Contents/MacOS/mm3_recomp"
+    COMMAND codesign --force --sign - "${MM3_APP}"
+    DEPENDS mm3_recomp "${CMAKE_CURRENT_BINARY_DIR}/mm3_recomp.signed" "${NV2A_METALLIB}"
+            "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
+    COMMENT "Packaging Midtown Madness 3.app")
+add_custom_target(mm3_app ALL DEPENDS "${MM3_APP}/Contents/MacOS/mm3_recomp")
+
+# Host checks that need no game data.
+enable_testing()
+add_executable(test_mmio_arm64 mac/tests/test_mmio_arm64.c)
+target_link_libraries(test_mmio_arm64 PRIVATE platform)
+target_include_directories(test_mmio_arm64 PRIVATE
+    third_party/mm3-recomp/tools/xboxrecomp/src/platform)
+add_test(NAME mmio_arm64 COMMAND test_mmio_arm64)
+
+# The Metal renderer end to end, without game data: clear, an ubershader and
+# a combiner draw, present, capture and write-back.
+add_executable(test_metal_render EXCLUDE_FROM_ALL mac/tests/test_metal_render.m
+    mac/src/video/nv2a_metal.m mac/src/video/fb_window_macos.m)
+target_include_directories(test_metal_render PRIVATE ${XBOX_VIDEO_BACKEND_INCLUDES}
+    third_party/mm3-recomp/tools/xboxrecomp/src
+    third_party/mm3-recomp/tools/xboxrecomp/src/video
+    third_party/mm3-recomp/tools/xboxrecomp/src/kernel)
+target_link_libraries(test_metal_render PRIVATE platform ${XBOX_VIDEO_BACKEND_LIBRARIES})
+add_dependencies(test_metal_render nv2a_metallib)
+add_custom_command(TARGET test_metal_render POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NV2A_METALLIB}" "$<TARGET_FILE_DIR:test_metal_render>/")
+
+# The Xbox memory model and trapped MMIO on this host, on a synthetic XBE.
+add_executable(test_memory_layout EXCLUDE_FROM_ALL mac/tests/test_memory_layout.c)
+target_link_libraries(test_memory_layout PRIVATE xboxrecomp "-Wl,-undefined,dynamic_lookup")
+add_test(NAME memory_layout COMMAND test_memory_layout)

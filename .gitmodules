@@ -1,0 +1,3 @@
+[submodule "third_party/mm3-recomp"]
+	path = third_party/mm3-recomp
+	url = https://github.com/MattSG/mm3-recomp.git
