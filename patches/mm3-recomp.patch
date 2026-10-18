@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 4353ace..00e082c 100644
+index 4353ace..3d1d544 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -25,7 +25,9 @@ endif()
@@ -36,7 +36,17 @@ index 4353ace..00e082c 100644
  if(MM3_TRACY)
      foreach(profile_target xbox_kernel xbox_video)
          target_link_libraries(${profile_target} PRIVATE Tracy::TracyClient)
-@@ -281,16 +292,24 @@ foreach(distance_input IN LISTS distance_owners)
+@@ -98,7 +109,8 @@ if(MM3_MOVIE_INPUT_TRACE)
+     list(APPEND MM3_RENAMED_FUNCTIONS sub_0035BDC0)
+ endif()
+ if(MM3_OFFLINE_XNET)
+-    list(APPEND MM3_RENAMED_FUNCTIONS sub_0019531D)
++    list(APPEND MM3_RENAMED_FUNCTIONS sub_0019531D
++         sub_00296E94)          # offline: Xbox Live's hand-over to the dashboard
+ endif()
+ if(MM3_FRONTEND_WATCH)
+     list(APPEND MM3_RENAMED_FUNCTIONS sub_000FA37E sub_0011935B sub_001253F4 sub_0008E420 sub_0008E3C0)
+@@ -281,16 +293,24 @@ foreach(distance_input IN LISTS distance_owners)
      list(APPEND RECOMP_GEN_SOURCES "${distance_output}")
  endforeach()
  
@@ -67,7 +77,7 @@ index 4353ace..00e082c 100644
      src/mods/dev_tools.c
      src/mods/menu_mouse.c
      src/mods/collision_fix.c
-@@ -317,7 +336,6 @@ add_executable(${PROJECT_NAME}
+@@ -317,7 +337,6 @@ add_executable(${PROJECT_NAME}
   src/mods/widescreen.c
   src/mods/draw_distance.c
   src/mods/teleport.c
@@ -75,7 +85,7 @@ index 4353ace..00e082c 100644
   ${RECOMP_GEN_SOURCES})
  
  set_property(SOURCE src/recomp_manual.c APPEND PROPERTY COMPILE_DEFINITIONS
-@@ -343,9 +361,15 @@ target_include_directories(${PROJECT_NAME} PRIVATE
+@@ -343,9 +362,15 @@ target_include_directories(${PROJECT_NAME} PRIVATE
      ${XBOXRECOMP_DIR}/include
      ${XBOXRECOMP_DIR}/src/video)
  
@@ -93,7 +103,7 @@ index 4353ace..00e082c 100644
  # Focused offline checks; explicitly built, never part of the game build.
  foreach(check teleport dev_tools overlay input_capture)
      if(check STREQUAL "overlay")
-@@ -362,11 +386,13 @@ foreach(check teleport dev_tools overlay input_capture)
+@@ -362,11 +387,13 @@ foreach(check teleport dev_tools overlay input_capture)
      endif()
  endforeach()
  target_link_libraries(mm3_overlay_contract PRIVATE mm3_imgui xinput)
@@ -108,7 +118,7 @@ index 4353ace..00e082c 100644
   target_link_options(${PROJECT_NAME} PRIVATE
    "-Wl,--wrap=xbox_ReserveAlloc"
    "-Wl,--wrap=recomp_trace_esp")
-@@ -381,6 +407,7 @@ if(MSVC)
+@@ -381,6 +408,7 @@ if(MSVC)
      target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
  endif()
  
@@ -116,7 +126,7 @@ index 4353ace..00e082c 100644
  target_link_libraries(mm3_input_capture_contract PRIVATE xinput)
  target_include_directories(mm3_input_capture_contract PRIVATE ${XBOXRECOMP_DIR}/src)
  
-@@ -395,3 +422,4 @@ target_link_libraries(mm3_launcher_settings_contract PRIVATE RmlUi::RmlUi d3d11
+@@ -395,3 +423,4 @@ target_link_libraries(mm3_launcher_settings_contract PRIVATE RmlUi::RmlUi d3d11
  if(MSVC)
      target_compile_options(mm3_launcher_settings_contract PRIVATE /UNDEBUG)
  endif()
@@ -634,7 +644,7 @@ index 6cfdcf2..4195253 100644
   * stack is held as double, so this keeps a double's precision; reading it as
   * MEMF took the low four bytes of the significand as a float. */
 diff --git a/src/mods/framerate.c b/src/mods/framerate.c
-index 2d2bfc1..0ff8143 100644
+index 2d2bfc1..d1b1582 100644
 --- a/src/mods/framerate.c
 +++ b/src/mods/framerate.c
 @@ -133,7 +133,8 @@ static int smooth(void)
@@ -647,9 +657,19 @@ index 2d2bfc1..0ff8143 100644
  static int s_ticks = -1;
  
  /* The world update (edi the game, one argument, ret 4), with the console's
-@@ -358,9 +359,15 @@ static void render_again(void)
+@@ -169,6 +170,7 @@ void sub_001E7590(void)
+  * Restoring more of the globals (1600 words change per race render) put
+  * list counts out of step with their lists and crashed. */
+ extern void sub_001EC8E6_original(void);
++volatile unsigned mm3_game_progress;
+ #define KEEP_LO 0x003C5680u   /* the render's queue counters only */
+ #define KEEP_HI 0x003C57B0u
+ static uint32_t s_keep_pre[(KEEP_HI - KEEP_LO) / 4], *s_keep_post;
+@@ -357,10 +359,17 @@ static void render_again(void)
+ 
  void sub_001EC8E6(void)
  {
++    mm3_game_progress++;
      if (MEM32(g_esp) == 0x001E78AAu && mm3_mod_on(MM3_MOD_FRAMERATE)) {
 +        /* The ticks of the world update since the last render, used once. A
 +         * frame with none (the post-race and briefing screens, which skip it)
@@ -664,7 +684,7 @@ index 2d2bfc1..0ff8143 100644
              blend_undo();
              return;
          }
-@@ -370,10 +377,10 @@ void sub_001EC8E6(void)
+@@ -370,10 +379,10 @@ void sub_001EC8E6(void)
          static int every = -1;
          if (every < 0) every = getenv("MM3_RENDER_EVERY_FRAME") && atoi(getenv("MM3_RENDER_EVERY_FRAME")) == 1;
          if (every) {
@@ -677,6 +697,60 @@ index 2d2bfc1..0ff8143 100644
              g_esp += 12;
              nv2a_d3d_repeat_frame();
              return;
+diff --git a/src/mods/mods.h b/src/mods/mods.h
+index 08f2b7d..f6076b9 100644
+--- a/src/mods/mods.h
++++ b/src/mods/mods.h
+@@ -32,6 +32,10 @@ int mm3_mod_on(int mod);
+ void mm3_mods_init(void);
+ /* Every player update (gameplay only): mods that act during a race. */
+ void mm3_mods_player_update(void);
++/* Bumped by the game thread every frame and through its wait-for-a-button
++ * loops (the render, the button query): a host watchdog that sees it stand
++ * still knows the game thread is stuck, not just showing a still screen. */
++extern volatile unsigned mm3_game_progress;
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/src/mods/offline.c b/src/mods/offline.c
+index 8950239..62fdf22 100644
+--- a/src/mods/offline.c
++++ b/src/mods/offline.c
+@@ -35,3 +35,22 @@ void sub_0019531D(void)
+     g_eax = 1;
+     g_esp += 4; /* original cdecl ret, no arguments */
+ }
++
++/* Xbox Live's hand-over to the dashboard (0x296E94, stdcall, 4 arguments).
++ * Sign In with no account sets one up there: it launches d:\dashupdate.xbe
++ * (XLaunchNewImage, 0x296BED) and, failing that, reboots to the dashboard
++ * outright. With no dashboard either way quit the game. Offline, report the
++ * hand-over as failed and stay in the game. */
++#define XONLINE_E_FAIL 0x80004005u
++extern void sub_00296E94_original(void);
++void sub_00296E94(void)
++{
++    if (!mm3_mod_on(MM3_MOD_OFFLINE)) {
++        sub_00296E94_original();
++        return;
++    }
++    fprintf(stderr, "[MM3_OFFLINE] Xbox Live dashboard hand-over refused: no dashboard offline\n");
++    fflush(stderr);
++    g_eax = XONLINE_E_FAIL;
++    g_esp += 20; /* ret 16 */
++}
+diff --git a/src/mods/skip_intro.c b/src/mods/skip_intro.c
+index 82db81a..9422c73 100644
+--- a/src/mods/skip_intro.c
++++ b/src/mods/skip_intro.c
+@@ -94,6 +94,7 @@ void sub_001F2A71(void)
+ void sub_001F443D(void)
+ {
+     uint32_t caller = MEM32(g_esp);
++    mm3_game_progress++;
+ #ifdef MM3_MOVIE_INPUT_TRACE
+     uint32_t action = g_eax, controller = g_ebx;
+ #endif
 diff --git a/src/mods/teleport.c b/src/mods/teleport.c
 index 10408ff..af7f86e 100644
 --- a/src/mods/teleport.c

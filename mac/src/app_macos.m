@@ -18,6 +18,9 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <time.h>
 
 int mm3_main(void);
 
@@ -230,6 +233,77 @@ static void redirect_log(void)
         setvbuf(stderr, NULL, _IOLBF, 0);
         dup2(STDERR_FILENO, STDOUT_FILENO);
     }
+}
+
+/* With Debug > Keep a Log on, stalls sample themselves: when the game thread
+ * makes no progress (mm3_game_progress: every frame, and through its
+ * wait-for-a-button loops) for 2 s while the game is in front, `sample`
+ * records every thread for 3 s into ~/Library/Logs/Midtown Madness 3
+ * Samples -- once a stall, at most 10 a session -- so a hitch nobody could
+ * catch by hand arrives with its stacks. */
+extern volatile unsigned mm3_game_progress;
+extern int xbox_FramebufferPaused(void);
+extern char **environ;
+
+static double mono_seconds(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static void sample_self(double stalled)
+{
+    char dir[2048], path[2304], pid[16];
+    const char *home = getenv("HOME");
+    time_t now = time(NULL);
+    struct tm tm;
+    pid_t child;
+    if (!home) return;
+    snprintf(dir, sizeof dir, "%s/Library/Logs/Midtown Madness 3 Samples", home);
+    mkdir(dir, 0755);
+    localtime_r(&now, &tm);
+    snprintf(path, sizeof path, "%s/%04d%02d%02d-%02d%02d%02d-stall.txt", dir, tm.tm_year + 1900,
+             tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    snprintf(pid, sizeof pid, "%d", (int)getpid());
+    fprintf(stderr, "[WATCHDOG] game thread stalled %.1f s: sampling to %s\n", stalled, path);
+    char *argv[] = { "sample", pid, "3", "-file", path, NULL };
+    if (posix_spawn(&child, "/usr/bin/sample", NULL, NULL, argv, environ) == 0)
+        waitpid(child, NULL, 0);
+}
+
+static void *stall_watch(void *arg)
+{
+    unsigned last = 0, taken = 0;
+    double since = mono_seconds();
+    int sampled = 0;
+    (void)arg;
+    for (;;) {
+        unsigned p = mm3_game_progress;
+        double now;
+        usleep(250000);
+        now = mono_seconds();
+        if (p != last || !p || xbox_FramebufferPaused()) {
+            last = p;
+            since = now;
+            sampled = 0;
+            continue;
+        }
+        if (!sampled && taken < 10 && now - since >= 2.0) {
+            sampled = 1;
+            taken++;
+            sample_self(now - since);
+        }
+    }
+    return NULL;
+}
+
+static void start_stall_watch(void)
+{
+    pthread_t t;
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:@"KeepLog"]) return;
+    if (pthread_create(&t, NULL, stall_watch, NULL) == 0)
+        pthread_detach(t);
 }
 
 /* Mac defaults, each overridable from the environment: the picture takes
@@ -454,6 +528,7 @@ int main(int argc, char **argv)
             return 1;
         }
         pthread_attr_destroy(&attr);
+        start_stall_watch();
         [NSApp run];
     }
     return 0;
