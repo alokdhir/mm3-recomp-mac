@@ -74,10 +74,18 @@ index 209c578..f91f43f 100644
      # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
      find_package(SDL2 REQUIRED)
 diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
-index 58a5053..62a66b3 100644
+index 58a5053..46f2cf5 100644
 --- a/src/apu/apu_core.c
 +++ b/src/apu/apu_core.c
-@@ -137,8 +137,7 @@ extern void xbox_IrqlLeaveInterrupt(int saved);
+@@ -101,6 +101,7 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
+  * pci_irq_assert, which is an empty stub here, so DirectSound's service
+  * routine never ran and no voice completion ever reached it. */
+ static volatile LONG s_irq_line;
++static unsigned s_irqs_delivered;     /* for mcpx_apu_vp_report */
+ 
+ static void update_irq(MCPXAPUState *d)
+ {
+@@ -137,8 +138,7 @@ extern void xbox_IrqlLeaveInterrupt(int saved);
  #else
  #  define APU_TLS __thread
  #endif
@@ -87,6 +95,32 @@ index 58a5053..62a66b3 100644
  
  /* Call the connected service routine while the line is up, from the frame
   * thread, the way the OHCI model delivers USB interrupts (ohci_call_isr):
+@@ -185,6 +185,7 @@ static void apu_deliver_irq(MCPXAPUState *d)
+     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+     xbox_worker_stack_free(slot);
+     qemu_mutex_lock(&d->lock);
++    s_irqs_delivered++;
+ 
+     {
+         static unsigned n;
+@@ -270,6 +271,8 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
+                                 " (SECTL=%08X FECTL=%08X)\n", sectl, fectl);
+             }
+         }
++        if (addr == NV_PAPU_FECTL)
++            mcpx_apu_fe_resume(d);      /* methods that waited for it */
+         qemu_cond_broadcast(&d->cond);
+         break;
+     case NV_PAPU_FEMEMDATA:
+@@ -681,6 +684,8 @@ static void *mcpx_apu_frame_thread(void *arg)
+             d->set_irq = false;
+         }
+         apu_deliver_irq(d);
++        if (apu_active && mcpx_apu_vp_report(d, s_irqs_delivered))
++            s_irqs_delivered = 0;
+ 
+         /* Let the guest in once per frame.
+          *
 diff --git a/src/apu/apu_mmio_hook.c b/src/apu/apu_mmio_hook.c
 index 46cc2c5..97bfa45 100644
 --- a/src/apu/apu_mmio_hook.c
@@ -183,6 +217,198 @@ index 46cc2c5..97bfa45 100644
 +    g_apu_mmio_write_count++;
 +    return 1;
 +}
+diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
+index a647924..73fdb7f 100644
+--- a/src/apu/apu_state.h
++++ b/src/apu/apu_state.h
+@@ -447,6 +447,8 @@ void mcpx_apu_vp_init(MCPXAPUState *d);
+ void mcpx_apu_vp_finalize(MCPXAPUState *d);
+ void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+ void mcpx_apu_vp_reset(MCPXAPUState *d);
++void mcpx_apu_fe_resume(MCPXAPUState *d);
++bool mcpx_apu_vp_report(MCPXAPUState *d, unsigned irqs);
+ 
+ /* DSP functions */
+ void mcpx_apu_dsp_init(MCPXAPUState *d);
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index d3c5a7a..cfb9aeb 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -48,6 +48,66 @@ static const struct {
+     { NV_PAPU_TVLMP, NV_PAPU_CVLMP, NV_PAPU_NVLMP }, /* MP */
+ };
+ 
++/* ============================================================
++ * Front-end method queue
++ *
++ * The hardware feeds the title's methods to the front end through a FIFO,
++ * and a halted or trapped front end takes none. DirectSound relies on that:
++ * when a voice goes idle the voice processor traps the front end with
++ * SE2FE_IDLE_VOICE, and the service routine reads FEDECMETH/FEDECPARAM and
++ * unlinks the voice from its list before letting the front end run again.
++ * Methods used to run at once on the title's thread, beside that routine on
++ * the frame thread: one could overwrite FEDECPARAM before the routine read
++ * it, or link a new voice next to the one being unlinked and drop it from
++ * the list. A dropped voice never plays and never goes idle, so DirectSound
++ * never gets it back; enough of them and the title can start no sound at all
++ * (sound effects die mid-race while music plays on; a mission waiting on
++ * speech never ends). Methods written while the front end is stopped now
++ * wait here, and run when the title sets it running again.
++ * ============================================================ */
++
++#define FE_QUEUE_LEN 4096
++
++static QemuMutex s_fe_lock;
++static struct { uint32_t method, argument; } s_fe_queue[FE_QUEUE_LEN];
++static unsigned s_fe_queued;
++
++/* Counters for the periodic [APU_VOICES] line (mcpx_apu_vp_report). */
++static struct {
++    unsigned on, off, release, idle_traps, deferred, overflow;
++} s_fe_count;
++
++static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument);
++
++static bool fe_running(MCPXAPUState *d)
++{
++    return (qatomic_read(&d->regs[NV_PAPU_FECTL]) & NV_PAPU_FECTL_FEMETHMODE)
++           == NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING;
++}
++
++/* With s_fe_lock held: run what waited, in order, while the front end runs. */
++static void fe_drain(MCPXAPUState *d)
++{
++    unsigned i = 0;
++    while (i < s_fe_queued && fe_running(d)) {
++        fe_method(d, s_fe_queue[i].method, s_fe_queue[i].argument);
++        i++;
++    }
++    if (i) {
++        memmove(s_fe_queue, s_fe_queue + i,
++                (s_fe_queued - i) * sizeof s_fe_queue[0]);
++        s_fe_queued -= i;
++    }
++}
++
++/* FECTL was written: if the front end runs again, catch up. */
++void mcpx_apu_fe_resume(MCPXAPUState *d)
++{
++    qemu_mutex_lock(&s_fe_lock);
++    fe_drain(d);
++    qemu_mutex_unlock(&s_fe_lock);
++}
++
+ /* ============================================================
+  * Notify status helper
+  * ============================================================ */
+@@ -250,6 +310,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+ 
+     case NV1BA0_PIO_VOICE_ON: {
+         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
++        s_fe_count.on++;
+ 
+         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
+         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
+@@ -340,6 +401,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+ 
+     case NV1BA0_PIO_VOICE_RELEASE: {
+         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
++        s_fe_count.release++;
+ 
+         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
+         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
+@@ -366,6 +428,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+     }
+ 
+     case NV1BA0_PIO_VOICE_OFF:
++        s_fe_count.off++;
+         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
+         break;
+ 
+@@ -551,6 +614,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FETRAPREASON;
+             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
+             d->set_irq = true;
++            s_fe_count.idle_traps++;
+         }
+         break;
+ 
+@@ -625,8 +689,52 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
+     MCPXAPUState *d = (MCPXAPUState *)opaque;
+     (void)size;
+ 
+-    /* Dispatch known methods through fe_method */
+-    fe_method(d, (uint32_t)addr, (uint32_t)val);
++    /* Dispatch known methods through fe_method, in order, or keep them for
++     * when a stopped front end runs again (see fe_drain). */
++    qemu_mutex_lock(&s_fe_lock);
++    fe_drain(d);
++    if (fe_running(d) && !s_fe_queued) {
++        fe_method(d, (uint32_t)addr, (uint32_t)val);
++    } else if (s_fe_queued < FE_QUEUE_LEN) {
++        s_fe_queue[s_fe_queued].method = (uint32_t)addr;
++        s_fe_queue[s_fe_queued].argument = (uint32_t)val;
++        s_fe_queued++;
++        s_fe_count.deferred++;
++    } else {
++        /* A front end left stopped this long is not coming back: run it. */
++        fe_drain(d);
++        fe_method(d, (uint32_t)addr, (uint32_t)val);
++        s_fe_count.overflow++;
++    }
++    qemu_mutex_unlock(&s_fe_lock);
++}
++
++/* Every ~5 s of audio: what the front end did since the last report and how
++ * many voices each list holds, so a leak shows as starts with no stops.
++ * Returns whether it reported (irqs, the caller's count, then starts over). */
++bool mcpx_apu_vp_report(MCPXAPUState *d, unsigned irqs)
++{
++    static int next = 48000 / NUM_SAMPLES_PER_FRAME * 5;
++    unsigned len[3] = { 0, 0, 0 };
++    if (--next > 0) return false;
++    next = 48000 / NUM_SAMPLES_PER_FRAME * 5;
++    for (int list = 0; list < 3; list++) {
++        uint32_t v = d->regs[voice_list_regs[list].top];
++        while (v != 0xFFFF && len[list] < MCPX_HW_MAX_VOICES) {
++            len[list]++;
++            v = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_TAR_PITCH_LINK,
++                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
++        }
++    }
++    qemu_mutex_lock(&s_fe_lock);
++    fprintf(stderr, "[APU_VOICES] lists 2D %u 3D %u MP %u | on %u off %u release %u"
++            " idle-traps %u irqs %u | waited %u overflow %u queued %u\n",
++            len[0], len[1], len[2], s_fe_count.on, s_fe_count.off,
++            s_fe_count.release, s_fe_count.idle_traps, irqs,
++            s_fe_count.deferred, s_fe_count.overflow, s_fe_queued);
++    memset(&s_fe_count, 0, sizeof s_fe_count);
++    qemu_mutex_unlock(&s_fe_lock);
++    return true;
+ }
+ 
+ /* ============================================================
+@@ -1320,7 +1428,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+ 
+             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+-                fe_method(d, SE2FE_IDLE_VOICE, v);
++                /* One trap at a time, as the hardware's front end takes
++                 * them: a stopped one hears of this voice next frame. */
++                qemu_mutex_lock(&s_fe_lock);
++                if (fe_running(d)) fe_method(d, SE2FE_IDLE_VOICE, v);
++                qemu_mutex_unlock(&s_fe_lock);
+             } else {
+                 /* Process voice directly (single-threaded) */
+                 voice_spin_lock(d, v);
+@@ -1359,6 +1471,7 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
+      * Keeping the table in the APU avoids lazy-init races and shared state. */
+     d->vp.attenuation_rounding = -2;
+     prepare_attenuation(d);
++    qemu_mutex_init(&s_fe_lock);
+ }
+ 
+ void mcpx_apu_vp_finalize(MCPXAPUState *d)
 diff --git a/src/apu/dsp/dsp.c b/src/apu/dsp/dsp.c
 index 5da7653..474aa3b 100644
 --- a/src/apu/dsp/dsp.c
