@@ -1465,6 +1465,7 @@ typedef struct {
     uint8_t *shadow;                /* guest bytes as of the last sync */
     int gpu_dirty;                  /* drawn since guest memory was updated */
     int cpu_present_pending;        /* idle CPU update not yet shown successfully */
+    uint32_t drawn, shown_drawn;    /* GPU writes; how many the last present showed */
     uint32_t synced_frame, used_frame;
     uint32_t seq;                   /* bind order; see surface_find */
 } Surface;
@@ -3286,7 +3287,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     if (!bind_targets(st, st->depth_test || st->stencil_test || flare_depth, &s, &d, &gw, &gh))
         return 0;
     zf = (st->surface_format >> 4) & 0xF;
-    if (s && write_mask(st, s)) s->gpu_dirty = 1;
+    if (s && write_mask(st, s)) { s->gpu_dirty = 1; s->drawn++; }
 
     /* Textures first: a surface sampled here may need a copy. */
     memset(ds, 0, sizeof *ds);
@@ -3924,7 +3925,7 @@ void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color,
     if (!d) { zclear = sclear = 0; }
     if (!mask && !zclear && !sclear)
         return;
-    if (s && mask) s->gpu_dirty = 1;
+    if (s && mask) { s->gpu_dirty = 1; s->drawn++; }
     zf = (st->surface_format >> 4) & 0xF;
     unpack4(color, cc);
     if (s && (s->color_fmt & 0xF) == 0x3) {
@@ -4571,6 +4572,7 @@ static void present_surface(Surface *s, FlipPacing *pacing)
             [cmd() presentDrawable:dr];
             submit(0);
             s->cpu_present_pending = 0;
+            s->shown_drawn = s->drawn;
             history_save();
         }
     } else {
@@ -4868,8 +4870,23 @@ void nv2a_d3d_tick(void)
             s_frame++;
             return;
         }
+        /* No flip for a while: say once what the display is left showing. */
+        {
+            static DWORD noted;
+            if (s_last_flip && now - s_last_flip > 1000 && noted != s_last_flip) {
+                noted = s_last_flip;
+                uint32_t sva = 0, spitch = 0;
+                xbox_FramebufferScanSource(&sva, &spitch);
+                fprintf(stderr, "[METAL] no flip for 1 s: shown %08X drawn %u/%u scan %08X loading %.2f\n",
+                        s_shown ? s_shown->va : 0, s_shown ? s_shown->drawn : 0,
+                        s_shown ? s_shown->shown_drawn : 0, sva, s_loading);
+                fflush(stderr);
+            }
+        }
         /* A title can keep drawing the displayed buffer with the CPU after its
-         * last GPU flip, without another AvSetDisplayMode. */
+         * last GPU flip, without another AvSetDisplayMode -- or with the GPU:
+         * the CRTC scans the front buffer out, so what is drawn into it shows
+         * (MM3 draws its briefing that way and waits for A without a flip). */
         if (s_shown && now - s_last_flip > 50) {
             uint32_t generation = s_shown->gen;
             /* Do not commit a new shadow while an older GPU readback is pending:
@@ -4878,6 +4895,14 @@ void nv2a_d3d_tick(void)
                 surface_sync(s_shown, 1);
             if (s_shown->gen != generation)
                 s_shown->cpu_present_pending = 1;
+            if (s_shown->drawn != s_shown->shown_drawn) {
+                static int told;
+                if (!told++) {
+                    fprintf(stderr, "[METAL] showing GPU drawing into the displayed buffer (no flip)\n");
+                    fflush(stderr);
+                }
+                s_shown->cpu_present_pending = 1;
+            }
             if (s_shown->cpu_present_pending || movie ||
                 (s_loading > 0.0f && now - s_last_present >= 33))
                 present_surface(s_shown, NULL);
