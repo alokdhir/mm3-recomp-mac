@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 4353ace..3d1d544 100644
+index 4353ace..b5cf75c 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -25,7 +25,9 @@ endif()
@@ -36,7 +36,13 @@ index 4353ace..3d1d544 100644
  if(MM3_TRACY)
      foreach(profile_target xbox_kernel xbox_video)
          target_link_libraries(${profile_target} PRIVATE Tracy::TracyClient)
-@@ -98,7 +109,8 @@ if(MM3_MOVIE_INPUT_TRACE)
+@@ -93,12 +104,14 @@ set(MM3_RENAMED_FUNCTIONS
+     sub_00170E5D sub_000145DC sub_001F02AD
+     sub_0025968E                 # widescreen: wraps the projection-matrix builder
+     sub_001DB6E8 sub_001F2A71 sub_001F443D  # skip intro: movie play, frame, skip check
++    sub_000CF2DA                 # car lamps: no headlights by day
+ )
+ if(MM3_MOVIE_INPUT_TRACE)
      list(APPEND MM3_RENAMED_FUNCTIONS sub_0035BDC0)
  endif()
  if(MM3_OFFLINE_XNET)
@@ -46,7 +52,7 @@ index 4353ace..3d1d544 100644
  endif()
  if(MM3_FRONTEND_WATCH)
      list(APPEND MM3_RENAMED_FUNCTIONS sub_000FA37E sub_0011935B sub_001253F4 sub_0008E420 sub_0008E3C0)
-@@ -281,16 +293,24 @@ foreach(distance_input IN LISTS distance_owners)
+@@ -281,21 +294,30 @@ foreach(distance_input IN LISTS distance_owners)
      list(APPEND RECOMP_GEN_SOURCES "${distance_output}")
  endforeach()
  
@@ -77,7 +83,13 @@ index 4353ace..3d1d544 100644
      src/mods/dev_tools.c
      src/mods/menu_mouse.c
      src/mods/collision_fix.c
-@@ -317,7 +337,6 @@ add_executable(${PROJECT_NAME}
+     src/mods/widescreen_hud.c
+     src/mods/skip_intro.c
++    src/mods/car_lamps.c
+     src/mods/framerate.c
+     src/mm3_unresolved_stubs.c
+  src/mm3_memory_compat.c
+@@ -317,7 +339,6 @@ add_executable(${PROJECT_NAME}
   src/mods/widescreen.c
   src/mods/draw_distance.c
   src/mods/teleport.c
@@ -85,7 +97,7 @@ index 4353ace..3d1d544 100644
   ${RECOMP_GEN_SOURCES})
  
  set_property(SOURCE src/recomp_manual.c APPEND PROPERTY COMPILE_DEFINITIONS
-@@ -343,9 +362,15 @@ target_include_directories(${PROJECT_NAME} PRIVATE
+@@ -343,9 +364,15 @@ target_include_directories(${PROJECT_NAME} PRIVATE
      ${XBOXRECOMP_DIR}/include
      ${XBOXRECOMP_DIR}/src/video)
  
@@ -103,7 +115,7 @@ index 4353ace..3d1d544 100644
  # Focused offline checks; explicitly built, never part of the game build.
  foreach(check teleport dev_tools overlay input_capture)
      if(check STREQUAL "overlay")
-@@ -362,11 +387,13 @@ foreach(check teleport dev_tools overlay input_capture)
+@@ -362,11 +389,13 @@ foreach(check teleport dev_tools overlay input_capture)
      endif()
  endforeach()
  target_link_libraries(mm3_overlay_contract PRIVATE mm3_imgui xinput)
@@ -118,7 +130,7 @@ index 4353ace..3d1d544 100644
   target_link_options(${PROJECT_NAME} PRIVATE
    "-Wl,--wrap=xbox_ReserveAlloc"
    "-Wl,--wrap=recomp_trace_esp")
-@@ -381,6 +408,7 @@ if(MSVC)
+@@ -381,6 +410,7 @@ if(MSVC)
      target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
  endif()
  
@@ -126,7 +138,7 @@ index 4353ace..3d1d544 100644
  target_link_libraries(mm3_input_capture_contract PRIVATE xinput)
  target_include_directories(mm3_input_capture_contract PRIVATE ${XBOXRECOMP_DIR}/src)
  
-@@ -395,3 +423,4 @@ target_link_libraries(mm3_launcher_settings_contract PRIVATE RmlUi::RmlUi d3d11
+@@ -395,3 +425,4 @@ target_link_libraries(mm3_launcher_settings_contract PRIVATE RmlUi::RmlUi d3d11
  if(MSVC)
      target_compile_options(mm3_launcher_settings_contract PRIVATE /UNDEBUG)
  endif()
@@ -454,22 +466,28 @@ index 91ec457..fa6bc9e 100644
  }
 +#endif /* _WIN32 */
 diff --git a/src/mm3_custom_car_names.c b/src/mm3_custom_car_names.c
-index e950122..9c6fb06 100644
+index e950122..6946da0 100644
 --- a/src/mm3_custom_car_names.c
 +++ b/src/mm3_custom_car_names.c
-@@ -24,9 +24,9 @@ static const struct {
+@@ -24,12 +24,12 @@ static const struct {
      { "SID_CAR_MF_9006", "Formula" },
      { "SID_CAR_MODEL_9006", "1" },
      { "SID_CAR_SHORT_9006", "Formula 1" },
 -    { "SID_CAR_MF_9009", "Ford" },
 -    { "SID_CAR_MODEL_9009", "GT" },
 -    { "SID_CAR_SHORT_9009", "Ford GT" },
+-    { "SID_CAR_MF_9010", "McLaren" },
+-    { "SID_CAR_MODEL_9010", "Senna" },
+-    { "SID_CAR_SHORT_9010", "McLaren Senna" },
 +    { "SID_CAR_MF_9009", "Porsche" },
 +    { "SID_CAR_MODEL_9009", "930 Turbo" },
 +    { "SID_CAR_SHORT_9009", "Porsche 930 Turbo" },
-     { "SID_CAR_MF_9010", "McLaren" },
-     { "SID_CAR_MODEL_9010", "Senna" },
-     { "SID_CAR_SHORT_9010", "McLaren Senna" },
++    { "SID_CAR_MF_9010", "Aston Martin" },
++    { "SID_CAR_MODEL_9010", "DBS" },
++    { "SID_CAR_SHORT_9010", "Aston Martin DBS" },
+     { "SID_CAR_MF_9011", "McLaren" },
+     { "SID_CAR_MODEL_9011", "Senna GTR" },
+     { "SID_CAR_SHORT_9011", "McLaren Senna GTR" },
 diff --git a/src/mm3_recomp_types.h b/src/mm3_recomp_types.h
 index 6cfdcf2..4195253 100644
 --- a/src/mm3_recomp_types.h
@@ -660,6 +678,40 @@ index 6cfdcf2..4195253 100644
  /* fld tbyte: a whole little-endian x87 80-bit extended operand. The x87
   * stack is held as double, so this keeps a double's precision; reading it as
   * MEMF took the low four bytes of the significand as a float. */
+diff --git a/src/mods/car_lamps.c b/src/mods/car_lamps.c
+new file mode 100644
+index 0000000..520204c
+--- /dev/null
++++ b/src/mods/car_lamps.c
+@@ -0,0 +1,28 @@
++#include <stdlib.h>
++#include "recomp_types.h"
++#include "mods.h"
++
++/* Daylight headlights. The car-lamp node render (0x0CF2DA: ecx = lamp node,
++ * [esp+12] the caller's effect mask, one bit per lamp kind at node +0x34)
++ * draws the player's front lenses (kind 0) and road beam (kind 8) whatever
++ * the time of day, so headlights glow at noon. In the morning and at noon
++ * (time-of-day enum at 0x407C30: 0 morning, 1 noon, 2 evening, 3 night)
++ * their bits are cleared for the call; tail, brake and indicator lamps are
++ * unchanged. The same rule as lakshya16157's MM3 port. MM3_DAY_HEADLIGHTS=1
++ * keeps them. */
++void sub_000CF2DA_original(void);
++
++void sub_000CF2DA(void)
++{
++    static int keep = -1;
++    uint32_t at = g_esp + 12, mask = MEM32(at);
++    if (keep < 0)
++        keep = getenv("MM3_DAY_HEADLIGHTS") && atoi(getenv("MM3_DAY_HEADLIGHTS")) != 0;
++    if (keep || MEM32(0x00407C30u) >= 2u) {
++        sub_000CF2DA_original();
++        return;
++    }
++    MEM32(at) = mask & ~0x101u;
++    sub_000CF2DA_original();
++    MEM32(at) = mask;
++}
 diff --git a/src/mods/framerate.c b/src/mods/framerate.c
 index 2d2bfc1..d1b1582 100644
 --- a/src/mods/framerate.c
@@ -827,7 +879,7 @@ index acdb9f0..faef753 100644
  #include <windows.h>
  
 diff --git a/tools/car-mods/cars.imported.json b/tools/car-mods/cars.imported.json
-index ecb589b..b267481 100644
+index ecb589b..65863cc 100644
 --- a/tools/car-mods/cars.imported.json
 +++ b/tools/car-mods/cars.imported.json
 @@ -100,7 +100,7 @@
@@ -839,8 +891,17 @@ index ecb589b..b267481 100644
        "ratings": {
          "TOPSPEED": 8,
          "ACCELERATION": 8,
+@@ -127,7 +127,7 @@
+       "id": 9010,
+       "alias": "Senna_Road",
+       "donor": "Koenigsegg",
+-      "display_name": "McLaren Senna",
++      "display_name": "Aston Martin DBS",
+       "ratings": {
+         "TOPSPEED": 8,
+         "ACCELERATION": 9,
 diff --git a/tools/car-mods/cars.json b/tools/car-mods/cars.json
-index b9526f6..88627d9 100644
+index b9526f6..8ce6dfe 100644
 --- a/tools/car-mods/cars.json
 +++ b/tools/car-mods/cars.json
 @@ -97,7 +97,7 @@
@@ -852,19 +913,30 @@ index b9526f6..88627d9 100644
        "ratings": {
          "TOPSPEED": 8,
          "ACCELERATION": 8,
+@@ -123,7 +123,7 @@
+       "id": 9010,
+       "alias": "Senna_Road",
+       "donor": "Koenigsegg",
+-      "display_name": "McLaren Senna",
++      "display_name": "Aston Martin DBS",
+       "ratings": {
+         "TOPSPEED": 8,
+         "ACCELERATION": 9,
 diff --git a/tools/car-mods/prepare.py b/tools/car-mods/prepare.py
-index d3208b1..7a1f0d4 100644
+index d3208b1..6de4d05 100644
 --- a/tools/car-mods/prepare.py
 +++ b/tools/car-mods/prepare.py
-@@ -75,7 +75,7 @@ IDENTITIES = {
+@@ -75,8 +75,8 @@ IDENTITIES = {
      9004: ("Panoz", "Viper", "Panoz GTR-1"),
      9005: ("McLaren_F1", "Koenigsegg", "McLaren F1"),
      9006: ("Form1", "Lotus", "Formula 1"),
 -    9009: ("Ford_GTcar", "Koenigsegg", "Ford GT"),
+-    9010: ("Senna_Road", "Koenigsegg", "McLaren Senna"),
 +    9009: ("Ford_GTcar", "Koenigsegg", "Porsche 930 Turbo"),
-     9010: ("Senna_Road", "Koenigsegg", "McLaren Senna"),
++    9010: ("Senna_Road", "Koenigsegg", "Aston Martin DBS"),
      9011: ("Senna_GTR1", "Koenigsegg", "McLaren Senna GTR"),
      9012: ("FXXK_Racer", "Koenigsegg", "Ferrari FXX K"),
+     9013: ("Regera_GT1", "Koenigsegg", "Koenigsegg Regera"),
 @@ -108,7 +108,9 @@ def load_config(path: Path) -> dict:
      seen_ids, seen_aliases = set(), set()
      for car in config["cars"]:
