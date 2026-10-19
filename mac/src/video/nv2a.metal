@@ -218,7 +218,8 @@ struct PSConsts {
     uint fin0; uint fin1; uint rc_control; uint stage_prog;
     uint alpha_func; uint alpha_ref; uint ps_flags; uint clip_plane;
     uint other_input; uint dot_map; uint pad0; uint pad1;
-    uint4 tex_info[4];      /* x: bit0 alphakill, y: signed mask (filter>>28), z: tapbox */
+    uint4 tex_info[4];      /* x: bit0 alphakill, y: signed mask (filter>>28), z: tapbox,
+                             * w: a volume (3D) texture is bound */
     float4 tex_scale[4];    /* xy multiply the coordinate (1/size for linear) */
     float4 fog_color;
     float4 bump_mat[4]; float4 bump_lum[4];
@@ -319,12 +320,15 @@ static inline uint U8(constant uint4 *a, uint s) { return a[s >> 2][s & 3]; }
 #define K_TEX_INFO(n)   (SPEC ? SP_TEX_INFO(n) : pc.tex_info[n].xyz)
 
 /* What the stages read: four 2D textures, four cube maps, the frame drawn
- * so far (the horizon panorama) and four samplers. Passed explicitly. */
+ * so far (the horizon panorama), four 3D textures and four samplers. Passed
+ * explicitly. */
 #define TEXARGS texture2d<float> T2D0, texture2d<float> T2D1, texture2d<float> T2D2, \
                 texture2d<float> T2D3, texturecube<float> TC0, texturecube<float> TC1, \
                 texturecube<float> TC2, texturecube<float> TC3, texture2d<float> FBK, \
-                sampler S0, sampler S1, sampler S2, sampler S3
-#define TEXPASS T2D0, T2D1, T2D2, T2D3, TC0, TC1, TC2, TC3, FBK, S0, S1, S2, S3
+                texture3d<float> TV0, texture3d<float> TV1, texture3d<float> TV2, \
+                texture3d<float> TV3, sampler S0, sampler S1, sampler S2, sampler S3
+#define TEXPASS T2D0, T2D1, T2D2, T2D3, TC0, TC1, TC2, TC3, FBK, TV0, TV1, TV2, TV3, \
+                S0, S1, S2, S3
 
 static float map_in(float x, uint b)
 {
@@ -420,6 +424,16 @@ static float4 tapbox(TEXARGS, uint n, float2 g, float2 inv)
     return acc / max(cnt, 1.0);
 }
 
+/* A volume (3D) texture: MM3's night light pools, sampled in place of the
+ * 2D one by PROJECT3D and DOT_STR_3D stages (tex_info.w). */
+static float4 sampv(TEXARGS, constant PSConsts &pc, uint n, float3 p)
+{
+    if (n == 0) return TV0.sample(S0, p, bias(pc.lod_bias[0]));
+    if (n == 1) return TV1.sample(S1, p, bias(pc.lod_bias[1]));
+    if (n == 2) return TV2.sample(S2, p, bias(pc.lod_bias[2]));
+    return TV3.sample(S3, p, bias(pc.lod_bias[3]));
+}
+
 static float4 sampc(TEXARGS, constant PSConsts &pc, uint n, float3 d)
 {
     if (n == 0) return TC0.sample(S0, d, bias(pc.lod_bias[0]));
@@ -474,7 +488,8 @@ static float4 shade(TEXARGS, constant PSConsts &pc, float4 ipos, float4 id0, flo
         uint3 ti = K_TEX_INFO(n);
         float4 c = tc[n]; float4 t = float4(0, 0, 0, 1);
         float q = c.w != 0.0 ? c.w : 1.0;
-        if (mode == 1 || mode == 2) {
+        if (mode == 2 && pc.tex_info[n].w != 0u) t = sampv(TEXPASS, pc, n, c.xyz / q);
+        else if (mode == 1 || mode == 2) {
             float2 g = c.xy / q, d = abs(dfdx(g)) + abs(dfdy(g));
             if (ti.z != 0u && max(d.x, d.y) < 1e-4) t = tapbox(TEXPASS, n, g, pc.tex_scale[n].xy);
             else t = samp2(TEXPASS, pc, g_pos, n, g * pc.tex_scale[n].xy);
@@ -504,7 +519,8 @@ static float4 shade(TEXARGS, constant PSConsts &pc, float4 ipos, float4 id0, flo
                 float3 E = mode == 12 ? float3(tc[1].w, tc[2].w, tc[3].w) : float3(0, 0, 1);
                 N = 2.0 * N * dot(N, E) / max(dot(N, N), 1e-20) - E;
             }
-            if (mode == 13) t = samp2(TEXPASS, pc, g_pos, n, N.xy * pc.tex_scale[n].xy);
+            if (mode == 13 && pc.tex_info[n].w != 0u) t = sampv(TEXPASS, pc, n, N);
+            else if (mode == 13) t = samp2(TEXPASS, pc, g_pos, n, N.xy * pc.tex_scale[n].xy);
             else t = sampc(TEXPASS, pc, n, N);
         } else if (mode == 15) t = samp2(TEXPASS, pc, g_pos, n, T[inp].ar);
         else if (mode == 16) t = samp2(TEXPASS, pc, g_pos, n, T[inp].gb);
@@ -650,6 +666,8 @@ static float wdepth(constant PSConsts &pc, float4 ipos, float z, thread uint &co
     texturecube<float> TC0 [[texture(4)]], texturecube<float> TC1 [[texture(5)]], \
     texturecube<float> TC2 [[texture(6)]], texturecube<float> TC3 [[texture(7)]], \
     texture2d<float> FBK [[texture(8)]], \
+    texture3d<float> TV0 [[texture(9)]], texture3d<float> TV1 [[texture(10)]], \
+    texture3d<float> TV2 [[texture(11)]], texture3d<float> TV3 [[texture(12)]], \
     sampler S0 [[sampler(0)]], sampler S1 [[sampler(1)]], \
     sampler S2 [[sampler(2)]], sampler S3 [[sampler(3)]]
 
@@ -834,7 +852,16 @@ static float4 y16d_of(float d, constant ClearConsts &cc)
     float s = cc.ccol.x, k = cc.ccol.y;
     d = saturate(d);
     if (s > 1.0 && d < 1.0) { float x = d * s; d = x <= k ? x : k + (1.0 - k) * (1.0 - exp((k - x) / (1.0 - k))); }
-    float y = (float)((uint)rint(saturate(d) * 16777215.0) >> 8) / 65535.0;
+    uint w16 = (uint)rint(saturate(d) * 16777215.0) >> 8;
+    /* ccol.w: MM3's LightDraw view. Its texm3x3 rows are (a, 255/256 s,
+     * 255/65536 s), a the camera in the light's volume space and s the
+     * far-plane ray: only RGB = (1, high byte, low byte) makes the dot
+     * a + s * w16/65536. Luminance gives y * (a + s), which places a light
+     * right only at the far plane -- the road and cars near the player got
+     * no headlight or street lamp. (From lakshya16157's PC Native port.) */
+    if (cc.ccol.w > 0.5)
+        return float4(1.0, (float)(w16 >> 8) / 255.0, (float)(w16 & 255u) / 255.0, 1.0);
+    float y = (float)w16 / 65535.0;
     return float4(y, y, y, 1);
 }
 

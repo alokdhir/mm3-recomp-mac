@@ -777,7 +777,7 @@ static void exp_poll(void)
 }
 static id<MTLSamplerState> s_linear_clamp, s_point_clamp;
 static id<MTLDepthStencilState> s_ds_off;
-static id<MTLTexture> s_null_2d, s_null_cube;
+static id<MTLTexture> s_null_2d, s_null_cube, s_null_vol;
 
 #define PIX_BGRA   MTLPixelFormatBGRA8Unorm
 #define PIX_Y16    MTLPixelFormatRGBA16Unorm
@@ -1341,6 +1341,24 @@ static id<MTLTexture> make_texture_storage(UINT w, UINT h, UINT levels, MTLPixel
     return t;
 }
 
+/* A BGRA volume (3D) texture the CPU fills with replaceRegion. */
+static id<MTLTexture> make_volume(UINT w, UINT h, UINT depth, UINT levels)
+{
+    MTLTextureDescriptor *d = [[MTLTextureDescriptor alloc] init];
+    id<MTLTexture> t;
+    d.textureType = MTLTextureType3D;
+    d.width = w ? w : 1;
+    d.height = h ? h : 1;
+    d.depth = depth ? depth : 1;
+    d.pixelFormat = PIX_BGRA;
+    d.mipmapLevelCount = levels ? levels : 1;
+    d.usage = MTLTextureUsageShaderRead;
+    d.storageMode = MTLStorageModeShared;
+    t = [s_dev newTextureWithDescriptor:d];
+    [d release];
+    return t;
+}
+
 static id<MTLTexture> make_texture(UINT w, UINT h, UINT levels, UINT array, MTLPixelFormat f,
                                    MTLTextureUsage usage, int cube)
 {
@@ -1420,6 +1438,10 @@ int nv2a_d3d_init(void)
             upload_region(s_null_2d, 0, 0, 0, 0, 1, 1, zero, 4, 1);
             for (f = 0; f < 6; f++)
                 upload_region(s_null_cube, (NSUInteger)f, 0, 0, 0, 1, 1, zero, 4, 1);
+            s_null_vol = make_volume(1, 1, 1, 1);
+            if (s_null_vol)
+                [s_null_vol replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:0
+                                withBytes:zero bytesPerRow:4 bytesPerImage:4];
         }
     }
     display_config(1);
@@ -1474,6 +1496,8 @@ typedef struct {
     uint32_t phys, iw, ih, samples;
     id<MTLTexture> tex;             /* depth/stencil, sampled for y16 too */
     id<MTLTexture> y16;             /* LU_IMAGE_Y16 view (see y16d_ps) */
+    int y16_light;                  /* y16 holds the local-light view */
+    float y16_scale, y16_knee;      /* the remap y16 was built with */
     uint32_t zf, w, h;              /* zeta format code, guest size last bound with */
     uint32_t gen, y16_gen, seq;     /* as Surface */
     uint32_t used_frame;
@@ -2092,6 +2116,7 @@ static void yuv_pair(const uint8_t *g, int uyvy, uint32_t out[2])
 
 typedef struct TexEntry {
     uint32_t phys, format, pitch, w, h, palette, palette_len, used;
+    uint32_t depth;                 /* > 1: a volume (volume_get) */
     uint64_t hash, pal_hash;
     uint32_t checked_epoch;
     size_t bytes;
@@ -2106,37 +2131,51 @@ static size_t s_tex_bytes, s_tex_count;
 
 /* Where each level/face lives, and the span to hash. */
 typedef struct {
-    int kind, bpp, levels, faces;
-    uint32_t level_off[16], level_w[16], level_h[16];
+    int kind, bpp, levels, faces, volume;
+    uint32_t level_off[16], level_w[16], level_h[16], level_d[16];
     size_t face_stride, total;
 } TexLayout;
 
+/* DIMENSIONALITY 3 in SET_TEXTURE_FORMAT: a volume, depth BASE_SIZE_P. */
+static int texture_is_volume(const NvD3DTexture *t)
+{
+    return !t->cube && (t->depth > 1 || ((t->format >> 4) & 15u) == 3u);
+}
+
 static int tex_layout(const NvD3DTexture *t, TexLayout *L)
 {
-    uint32_t w = t->width, h = t->height, lv, maxlv = 1, m;
+    uint32_t w = t->width, h = t->height, d = 1, lv, maxlv = 1, m;
     size_t off = 0;
     memset(L, 0, sizeof *L);
     L->bpp = tex_format(t->color, &L->kind);
     if (!L->bpp || !w || !h || w > 4096 || h > 4096)
         return 0;
     L->faces = t->cube ? 6 : 1;
+    L->volume = texture_is_volume(t);
+    if (L->volume) {
+        d = t->depth ? t->depth : 1;
+        if (d > 2048 || L->kind == K_LIN) return 0;
+    }
     if (L->kind == K_LIN) {
         if (!t->pitch) return 0;
         L->levels = 1;
-        L->level_w[0] = w; L->level_h[0] = h;
+        L->level_w[0] = w; L->level_h[0] = h; L->level_d[0] = 1;
         L->total = L->face_stride = (size_t)t->pitch * h;
         L->faces = 1;
         return 1;
     }
-    for (m = w > h ? w : h; m > 1; m >>= 1) maxlv++;
+    m = w > h ? w : h;
+    if (d > m) m = d;
+    for (; m > 1; m >>= 1) maxlv++;
     L->levels = t->levels ? (int)t->levels : 1;
     if (L->levels > (int)maxlv) L->levels = (int)maxlv;
     for (lv = 0; lv < (uint32_t)L->levels; lv++) {
         uint32_t lw = w >> lv ? w >> lv : 1, lh = h >> lv ? h >> lv : 1;
+        uint32_t ld = d >> lv ? d >> lv : 1;
         L->level_off[lv] = (uint32_t)off;
-        L->level_w[lv] = lw; L->level_h[lv] = lh;
-        off += L->kind == K_DXT ? (size_t)((lw + 3) / 4) * ((lh + 3) / 4) * L->bpp
-                                : (size_t)lw * lh * L->bpp;
+        L->level_w[lv] = lw; L->level_h[lv] = lh; L->level_d[lv] = ld;
+        off += (L->kind == K_DXT ? (size_t)((lw + 3) / 4) * ((lh + 3) / 4) * L->bpp
+                                 : (size_t)lw * lh * L->bpp) * ld;
     }
     L->face_stride = L->faces > 1 ? (off + 127) & ~(size_t)127 : off;
     L->total = L->face_stride * (L->faces - 1) + off;
@@ -2587,6 +2626,136 @@ static id<MTLTexture> texpack_get(uint64_t key)
     return tex;
 }
 
+/* The bits of v spread over the set bits of mask, low first (PDEP). */
+static uint32_t bits_deposit(uint32_t v, uint32_t mask)
+{
+    uint32_t r = 0, bit;
+    for (bit = 1; mask; bit <<= 1) {
+        uint32_t low = mask & (0u - mask);
+        if (v & bit) r |= low;
+        mask &= mask - 1;
+    }
+    return r;
+}
+
+/* One level of a volume as BGRA z-planes. A compressed volume keeps four
+ * consecutive z slices together inside each 4x4 block position -- neither
+ * plain 2D slices nor a 3D Morton order; an uncompressed one is swizzled
+ * x, y, z interleaved while each axis lasts. (Layouts as worked out in
+ * lakshya16157's midtown-madness-3-PC-Native.) */
+static void decode_volume_level(const NvD3DTexture *t, const TexLayout *L, const uint8_t *src,
+                                int lv, const uint32_t *pal, uint32_t *out)
+{
+    uint32_t w = L->level_w[lv], h = L->level_h[lv], d = L->level_d[lv], x, y, z;
+    if (L->kind == K_DXT) {
+        uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4, zs = d < 4 ? d : 4, bx, by, px[16];
+        for (z = 0; z < d; z++)
+            for (by = 0; by < bh; by++)
+                for (bx = 0; bx < bw; bx++) {
+                    size_t block = (((size_t)(z / 4) * bh + by) * bw + bx) * zs + z % 4;
+                    d3d8_dxt_decode_block(src + block * L->bpp, t->color, px);
+                    for (y = 0; y < 4 && by * 4 + y < h; y++)
+                        for (x = 0; x < 4 && bx * 4 + x < w; x++)
+                            out[((size_t)z * h + by * 4 + y) * w + bx * 4 + x] = px[y * 4 + x];
+                }
+        return;
+    }
+    {
+        uint32_t mx = 0, my = 0, mz = 0, bit = 1, dest = 1;
+        while (bit < w || bit < h || bit < d) {
+            if (bit < w) { mx |= dest; dest <<= 1; }
+            if (bit < h) { my |= dest; dest <<= 1; }
+            if (bit < d) { mz |= dest; dest <<= 1; }
+            bit <<= 1;
+        }
+        for (z = 0; z < d; z++)
+            for (y = 0; y < h; y++)
+                for (x = 0; x < w; x++) {
+                    uint32_t a = bits_deposit(x, mx) | bits_deposit(y, my) | bits_deposit(z, mz);
+                    out[((size_t)z * h + y) * w + x] = texel(t->color, src + (size_t)a * L->bpp, pal);
+                }
+    }
+}
+
+/* A volume texture, cached like the 2D ones (texture_get_impl) and decoded
+ * to BGRA: Metal has no BC-compressed 3D textures. New contents go into a
+ * new texture, as draws already encoded sampled the old one. */
+static id<MTLTexture> volume_get(const NvD3DTexture *t, int *guest_levels)
+{
+    TexLayout L;
+    uint32_t p = phys(t->addr), depth = t->depth ? t->depth : 1;
+    uint32_t key = (p >> 7) ^ (t->format * 2654435761u) ^ (t->pitch << 3) ^ t->width;
+    TexEntry *e, **head = &s_tex_bucket[key & (TEX_BUCKETS - 1)];
+    uint32_t *px, *pal = NULL;
+    uint64_t h, ph = 0;
+    id<MTLTexture> tex;
+    int lv, is_new;
+    size_t bytes = 0;
+    if (guest_levels) *guest_levels = 1;
+    if (!tex_layout(t, &L) || !L.volume || !guest_ok(t->addr, L.total)) return nil;
+    if (guest_levels) *guest_levels = L.levels;
+    for (e = *head; e; e = e->next)
+        if (e->depth == depth && e->phys == p && e->format == t->format && e->pitch == t->pitch &&
+            e->w == t->width && e->h == t->height && e->palette == t->palette &&
+            e->palette_len == t->palette_len)
+            break;
+    if (e && e->checked_epoch == s_epoch) { e->used = s_frame; return e->tex; }
+    h = hash_mem(guest(t->addr), L.total);
+    if (t->color == 0x0B && t->palette && guest_ok(t->palette, t->palette_len * 4)) {
+        pal = (uint32_t *)guest(t->palette);
+        ph = hash_mem((const uint8_t *)pal, t->palette_len * 4);
+    }
+    if (e && e->hash == h && e->pal_hash == ph) {
+        e->checked_epoch = s_epoch;
+        e->used = s_frame;
+        return e->tex;
+    }
+    px = scratch_pixels((size_t)t->width * t->height * depth);
+    if (!px) return e ? e->tex : nil;
+    tex = make_volume(t->width, t->height, depth, (UINT)L.levels);
+    if (!tex) { fail("volume texture", nil); return e ? e->tex : nil; }
+    for (lv = 0; lv < L.levels; lv++) {
+        uint32_t w = L.level_w[lv], ht = L.level_h[lv], d = L.level_d[lv];
+        decode_volume_level(t, &L, guest(t->addr) + L.level_off[lv], lv, pal, px);
+        [tex replaceRegion:MTLRegionMake3D(0, 0, 0, w, ht, d) mipmapLevel:(NSUInteger)lv slice:0
+                 withBytes:px bytesPerRow:(NSUInteger)w * 4 bytesPerImage:(NSUInteger)w * ht * 4];
+        bytes += (size_t)w * ht * d * 4;
+    }
+    is_new = !e;
+    if (!e) {
+        e = (TexEntry *)calloc(1, sizeof *e);
+        if (!e) { [tex release]; return nil; }
+        e->phys = p; e->format = t->format; e->pitch = t->pitch;
+        e->w = t->width; e->h = t->height; e->depth = depth;
+        e->palette = t->palette; e->palette_len = t->palette_len;
+    } else {
+        [e->tex release];
+        s_tex_bytes -= e->bytes;
+    }
+    e->tex = tex;
+    e->bytes = bytes;
+    s_tex_bytes += bytes;
+    e->hash = h;
+    e->pal_hash = ph;
+    e->checked_epoch = s_epoch;
+    e->used = s_frame;
+    if (is_new) {
+        e->next = *head;
+        *head = e;
+        s_tex_count++;
+    }
+    {
+        static int told;
+        if (!told++) {
+            fprintf(stderr, "[METAL] volume texture %ux%ux%u format %08X (%s)\n",
+                    t->width, t->height, depth, t->format, L.kind == K_DXT ? "DXT" : "swizzled");
+            fflush(stderr);
+        }
+    }
+    tex_evict();
+    return e->tex;
+}
+
 static id<MTLTexture> texture_get_impl(const NvD3DTexture *t, int *guest_levels)
 {
     TexLayout L;
@@ -2600,6 +2769,7 @@ static id<MTLTexture> texture_get_impl(const NvD3DTexture *t, int *guest_levels)
 
     if (guest_levels) *guest_levels = 1;
     s_tex_replaced = 0;
+    if (texture_is_volume(t)) return volume_get(t, guest_levels);
     if (!tex_layout(t, &L)) return nil;
     if (guest_levels) *guest_levels = L.levels;
     if (!guest_ok(t->addr, L.total)) return nil;
@@ -3179,25 +3349,43 @@ static id<MTLTexture> surface_y16(Surface *s)
     return s->y16;
 }
 
-/* The same for a depth buffer the title reads as LU_IMAGE_Y16 (see y16d_ps). */
-static id<MTLTexture> depth_y16(Depth *d)
+/* The same for a depth buffer the title reads as LU_IMAGE_Y16 (see y16d_ps).
+ * light 0: fog's view, luminance through the haze remap. light 1: the view
+ * MM3's Light/LightDraw.psh decodes to place each lamp and headlight volume
+ * -- the stored depth, unremapped, as (1, high byte, low byte); see y16d_of.
+ * (From lakshya16157's midtown-madness-3-PC-Native.) */
+static id<MTLTexture> depth_y16(Depth *d, int light)
 {
+    float scale = light ? 1.0f : s_zview_remap[0], knee = light ? 1.0f : s_zview_remap[1];
     if (!d->tex) return nil;
-    s_depth_hazed = 1;
+    if (!light) s_depth_hazed = 1;
     if (!d->y16) {
         d->y16 = make_texture(2 * d->iw, d->ih, 1, 1, PIX_Y16, USAGE_RT, 0);
         if (!d->y16) return nil;
         d->y16_gen = d->gen - 1;
     }
-    if (d->y16_gen != d->gen) {
+    if (d->y16_gen != d->gen || d->y16_light != light ||
+        d->y16_scale != scale || d->y16_knee != knee) {
         float cc[8] = { 0 };
-        memcpy(cc, s_zview_remap, sizeof s_zview_remap);
+        cc[0] = scale;
+        cc[1] = knee;
         cc[2] = d->w ? 0.25f * (float)d->iw / (float)d->w : 0.0f;
+        cc[3] = light ? 1.0f : 0.0f;
         if (s_pass_depth == d->tex) end_encoders();
         y16_pass(d->y16, s_fn_y16d_ps[d->samples > 1 ? 1 : 0], d->tex, cc, sizeof cc);
         d->y16_gen = d->gen;
+        d->y16_light = light;
+        d->y16_scale = scale;
+        d->y16_knee = knee;
     }
     return d->y16;
+}
+
+/* MM3's Light/LightDraw.psh: the pass that adds each light volume into the
+ * night light buffer, reading scene depth through texm3x3pad/texm3x3tex. */
+static int light_draw(const NvD3DState *st)
+{
+    return st->rc_seen && st->rc.stage_program == 0x6C621u;
 }
 
 /* Everything a draw sets on the encoder, gathered by setup_pipeline and
@@ -3205,7 +3393,7 @@ static id<MTLTexture> depth_y16(Depth *d)
  * the encoder). */
 typedef struct {
     PSConsts pc;
-    id<MTLTexture> tex[9];          /* 2D 0-3, cube 4-7, the frame (FBK) 8 */
+    id<MTLTexture> tex[13];         /* 2D 0-3, cube 4-7, the frame (FBK) 8, 3D 9-12 */
     id<MTLSamplerState> smp[4];
     id<MTLFunction> fs;
     uint32_t variant;
@@ -3280,7 +3468,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         if (t->color != 0x35 || t->cube || !t->addr) continue;
         /* A depth buffer wins over a colour surface at the same address:
          * titles bind one there for colour-masked stencil passes. */
-        if ((zt = depth_find(phys(t->addr))) != NULL) { depth_y16(zt); continue; }
+        if ((zt = depth_find(phys(t->addr))) != NULL) { depth_y16(zt, light_draw(st)); continue; }
         rt = surface_find(phys(t->addr));
         if (rt && rt->bpp == 4) { surface_sync(rt, 0); surface_y16(rt); }
     }
@@ -3308,7 +3496,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         /* A recycled target address can now hold a streamed compressed or
          * paletted image. Those layouts cannot alias a colour render target;
          * decode their guest bytes instead of sampling the cached target. */
-        rt = !t->cube && kind != K_DXT && t->color != 0x0B
+        rt = !t->cube && !texture_is_volume(t) && kind != K_DXT && t->color != 0x0B
              ? surface_find(phys(t->addr)) : NULL;
         s_draw_textured = 1;
         if (!s_draw_tex_addr) s_draw_tex_addr = t->addr;
@@ -3363,7 +3551,9 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
             pc->tex_scale[n][2] = pc->tex_scale[n][3] = 1.0f;
         }
         if (!view) continue;
-        if (t->cube && !rt) ds->tex[4 + n] = view; else ds->tex[n] = view;
+        if (texture_is_volume(t) && !rt) { ds->tex[9 + n] = view; pc->tex_info[n][3] = 1; }
+        else if (t->cube && !rt) ds->tex[4 + n] = view;
+        else ds->tex[n] = view;
         ds->smp[n] = sampler(t, levels, reduce, !rt && !zt && smooth_magnification(),
                              &pc->lod_bias[n]);
         /* The title opts in its 256x256 DXT5 horizon panorama, magnified
@@ -3534,6 +3724,8 @@ static id<MTLRenderCommandEncoder> apply_draw_state(const DrawState *ds, id<MTLF
         [e setFragmentSamplerState:ds->smp[n] atIndex:(NSUInteger)n];
     }
     [e setFragmentTexture:ds->tex[8] ? ds->tex[8] : s_null_2d atIndex:8];
+    for (n = 0; n < 4; n++)
+        [e setFragmentTexture:ds->tex[9 + n] ? ds->tex[9 + n] : s_null_vol atIndex:(NSUInteger)(9 + n)];
     if (s_pass_log_now) {
         fprintf(stderr, "[PASS]     draw fs %s v%u blend %d %x/%x scissor %lux%lu", [[ds->fs name] UTF8String],
                 ds->variant, ds->blend_enable, ds->sf, ds->df,

@@ -952,6 +952,39 @@ index 4fd7692..7a4f999 100644
  
      /* Set log level from environment variable if present */
      const char* log_env = getenv("XBOX_LOG_LEVEL");
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 0741761..4c5c497 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -237,6 +237,7 @@ typedef struct {
+     int      valid;
+     /* Raw registers the D3D11 path needs as well. */
+     uint32_t format_raw, address_raw, control0, border, palette_len;
++    uint32_t depth;                     /* FORMAT: BASE_SIZE_P of a 3D texture, else 1 */
+     float    bump_mat[4], bump_scale, bump_offset;
+ } Texture;
+ 
+@@ -2632,6 +2633,7 @@ static void d3d_fill_state(NvD3DState *st)
+         o->format = t->format_raw;
+         o->color = t->color;
+         o->width = t->width; o->height = t->height;
++        o->depth = t->depth ? t->depth : 1u;
+         o->pitch = t->pitch;
+         o->levels = t->levels;
+         o->cube = (uint32_t)t->cube;
+@@ -3415,6 +3417,12 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+         t->color = (param >> 8) & 0xFF;
+         t->cube = (param >> 2) & 1;
+         t->levels = (param >> 16) & 0xF;
++        /* DIMENSIONALITY 3 is a volume: BASE_SIZE_P (log2) is its depth. Set
++         * on every FORMAT write, so a stage reused for 2D or a cube map does
++         * not keep a previous volume's depth. MM3's night light pools are
++         * 3D DXT textures (Light/LightDraw.psh). */
++        t->depth = !t->cube && ((param >> 4) & 0xF) == 3u
++                 ? 1u << ((param >> 28) & 0xF) : 1u;
+         /* A swizzled texture carries its own dimensions here, as log2 in
+          * BASE_SIZE_U/V. It has to: IMAGE_RECT describes a linear image, and
+          * a title that only uses swizzled textures never sends one. */
 diff --git a/src/kernel/recomp_thread_state.h b/src/kernel/recomp_thread_state.h
 new file mode 100644
 index 0000000..987e4ce
@@ -2630,3 +2663,15 @@ index 161a080..4a38af0 100644
  #endif
  
  /* A buffer the display reads straight from guest memory because the title is
+diff --git a/src/video/nv2a_d3d11.h b/src/video/nv2a_d3d11.h
+index 8721bc6..1f9739c 100644
+--- a/src/video/nv2a_d3d11.h
++++ b/src/video/nv2a_d3d11.h
+@@ -23,6 +23,7 @@ typedef struct {
+     uint32_t format;        /* raw SET_TEXTURE_FORMAT */
+     uint32_t color;         /* colour-format code */
+     uint32_t width, height; /* texels */
++    uint32_t depth;         /* texels; 1 unless a 3D (volume) texture */
+     uint32_t pitch;         /* linear formats */
+     uint32_t levels;
+     uint32_t cube;
