@@ -53,8 +53,6 @@ licence.
 | `glass` | material regexes for the windows: split out as `GLASS_H` and drawn see-through in the donor's glass part |
 | `hero_metallic` | material regexes rendered as metallic paint by `render_hero.py` |
 
-Use a Koenigsegg-donor slot: the Viper donor draws an imported car's driver-side wheels translucent.
-
 ## Loading screen
 
     Blender -b --factory-startup -P tools/car-import/render_hero.py -- recipe.json /tmp/hero.png

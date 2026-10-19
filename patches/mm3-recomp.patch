@@ -890,6 +890,113 @@ index acdb9f0..faef753 100644
  #include <string.h>
  #include <windows.h>
  
+diff --git a/tests/test_car_editor.py b/tests/test_car_editor.py
+index ea1955a..fcac2c1 100644
+--- a/tests/test_car_editor.py
++++ b/tests/test_car_editor.py
+@@ -259,7 +259,7 @@ class CarEditorTest(unittest.TestCase):
+             realistic = editor.factory.apply_preset(car)
+             restored = editor.defaults.apply_preset(realistic)
+             self.assertEqual(restored["physics"], car["physics"])
+-            self.assertEqual(set(restored["physics"]), {"Mass", "TorqueScale"})
++            self.assertEqual(set(restored["physics"]) - {"GearRatioVector"}, {"Mass", "TorqueScale"})
+             self.assertNotIn("engine_profile", restored)
+             self.model.replace_car(index, restored)
+         self.assertEqual(editor.factory.factory_physics_settings(self.model.config).count(b"\n"), 1)
+diff --git a/tests/test_car_mods.py b/tests/test_car_mods.py
+index 52f96f6..21771ed 100644
+--- a/tests/test_car_mods.py
++++ b/tests/test_car_mods.py
+@@ -369,7 +369,7 @@ class CarModsTest(unittest.TestCase):
+             self.assertIn(f"Mass\t\t{panoz['physics']['Mass']}", text)
+             self.assertIn(f"HANDLING\t\t{panoz['ratings']['HANDLING']}", text)
+             self.assertIn("\tMass\t9\r\nEnd(CarWheel0)", text)
+-            self.assertNotIn("LOCKED", text)
++            self.assertEqual("LOCKED" in text, bool(panoz.get("hidden")))  # hidden slots are locked
+             self.assertNotIn("SKIN", text)
+             paint = hd.read("Cars/Panoz/materialSet00.omb")
+             self.assertIn(b"Cars\\Panoz\\texture.dds", paint)
+@@ -383,7 +383,7 @@ class CarModsTest(unittest.TestCase):
+                 self.assertEqual(dvd.read(f"LoadingScreens/Default_{car['alias']}.tga"), dvd.read(f"LoadingScreens/Default_{car['donor']}.tga"))
+ 
+     def test_requested_cars_are_independent_variants_of_shared_donors(self):
+-        expected = ["Panoz GTR-1", "McLaren F1", "Formula 1", "Ford GT"]
++        expected = ["Panoz GTR-1", "McLaren F1", "Formula 1", "Porsche 930 Turbo"]
+         self.assertEqual([car["display_name"] for car in self.config["cars"][:4]], expected)
+         ids = set(car["id"] for car in self.config["cars"])
+         self.assertEqual(ids, {9004, 9005, 9006, 9009, 9010, 9011, 9012, 9013, 9014})
+@@ -396,7 +396,7 @@ class CarModsTest(unittest.TestCase):
+                 tweak = hd.read(f"Cars/Tweak/{alias}.txt").decode()
+                 self.assertIn(f"ID\t\t{car['id']}\r\n", tweak)
+                 self.assertIn(f"TorqueScale\t\t{car['physics']['TorqueScale']}\r\n", tweak)
+-                self.assertNotIn("LOCKED", tweak)
++                self.assertEqual("LOCKED" in tweak, bool(car.get("hidden")))
+                 for suffix in ("", "_lod1"):
+                     material_name = f"Cars/{alias}{suffix}/materialSet00.omb"
+                     self.assertNotIn(material_name.lower(), materials)
+@@ -443,8 +443,9 @@ class CarModsTest(unittest.TestCase):
+                     self.assertIn(rule, archive.read(path))
+             for car in before["cars"]:
+                 text = archive.read(f"Cars/Tweak/{car['alias']}.txt")
+-                for rule in (b"LOCKED", b"HIDDEN", b"ADMITTANCE"):
+-                    self.assertNotIn(rule, text)
++                self.assertNotIn(b"ADMITTANCE", text)
++                for rule in (b"LOCKED", b"HIDDEN"):   # only a hidden slot is locked
++                    self.assertEqual(rule in text, bool(car.get("hidden")))
+ 
+     def test_catalog_ranking_rejects_unknown_order_ids_and_missing_ratings(self):
+         with zipfile.ZipFile(io.BytesIO(self.originals[MOD.ARCHIVES[0]])) as archive:
+@@ -738,14 +739,21 @@ class CarModsTest(unittest.TestCase):
+             + b"End(CarBody)")
+         for car in self.config["cars"]:
+             with self.subTest(car=car["alias"]):
+-                self.assertEqual(set(car["physics"]), {"Mass", "TorqueScale"})
++                # The imported cars (930, DBS, GT3) also ship their gearbox.
++                gears = "GearRatioVector" in car["physics"]
++                self.assertEqual(set(car["physics"]) - {"GearRatioVector"}, {"Mass", "TorqueScale"})
+                 self.assertNotIn("engine_profile", car)
+                 output = MOD.tweak_variant(donor, car).decode()
+                 for key, value in donor_values.items():
++                    if gears and key in ("NGears", "GearRatioVector"):
++                        continue
+                     line = re.search(r"^\s*" + key + r"\s+([^\r\n]+)", output, re.M)
+                     self.assertIsNotNone(line, key)
+                     self.assertEqual(line.group(1), value, key)
+                 for key, value in car["physics"].items():
++                    if key == "GearRatioVector":
++                        self.assertIn(f"NGears\t\t{len(value) - 1}", output)
++                        continue
+                     self.assertRegex(output, r"\b" + key + r"\s+" + str(value) + r"\s")
+         output = self.plan()
+         self.assertEqual(len(output[MOD.FACTORY_PHYSICS_FILE].splitlines()), 1)
+diff --git a/tests/test_factory_specs.py b/tests/test_factory_specs.py
+index 8b20c8a..da974a6 100644
+--- a/tests/test_factory_specs.py
++++ b/tests/test_factory_specs.py
+@@ -60,7 +60,7 @@ class FactorySpecsTest(unittest.TestCase):
+             self.assertLess(text.index("NGears"), text.index("GearRatioVector"))
+             self.assertIn("TurboSize\t\t0\r\n", text)
+             self.assertNotIn("engine_profile", text)
+-        self.assertEqual(counts, {1, 6, 7})
++        self.assertEqual(counts, {1, 4, 6, 7})  # the 930 has four gears
+ 
+     def test_legacy_alias_does_not_enable_factory_torque_or_high_rpm(self):
+         for car in self.config["cars"]:
+@@ -108,10 +108,12 @@ class FactorySpecsTest(unittest.TestCase):
+                     break
+             else:
+                 self.fail(f"Published power RPM missing from {alias}'s curve")
+-        for alias in ("Panoz", "Form1", "FXXK_Racer", "Regera_GT1", "Senna_GTR1"):
++        for alias in ("Panoz", "Form1", "Regera_GT1"):
+             self.assertIsNone(specs[alias]["specification"]["top_speed_kmh"])
+         self.assertIsNone(specs["McLaren_F1"]["specification"]["torque_nm"])
+-        self.assertIsNone(specs["FXXK_Racer"]["specification"]["mass_kg"])
++        # The Porsches' and the Aston's unverified gear ratios stay unknown.
++        self.assertIsNone(specs["Senna_GTR1"]["specification"]["gear_ratios"])
++        self.assertIsNone(specs["Senna_Road"]["specification"]["gear_ratios"])
+         self.assertTrue(all(entry["notes"] and entry["sources"] for entry in specs.values()))
+ 
+     def test_curve_interpolation_never_exceeds_verified_rated_power(self):
 diff --git a/tools/car-models/build_package.py b/tools/car-models/build_package.py
 index c8e1188..14a3c54 100644
 --- a/tools/car-models/build_package.py
@@ -1100,19 +1207,82 @@ index 44b7009..90d4fa8 100644
              children.extend(extras)
          node.children = children
 diff --git a/tools/car-mods/cars.imported.json b/tools/car-mods/cars.imported.json
-index ecb589b..30f1387 100644
+index ecb589b..8349caa 100644
 --- a/tools/car-mods/cars.imported.json
 +++ b/tools/car-mods/cars.imported.json
-@@ -100,7 +100,7 @@
+@@ -40,7 +40,8 @@
+         "max_kmh": 360,
+         "max_mph": 240
+       },
+-      "model_package": "../../out/car-models/packages/Panoz"
++      "model_package": "../../out/car-models/packages/Panoz",
++      "hidden": true
+     },
+     {
+       "id": 9005,
+@@ -67,7 +68,8 @@
+         "max_kmh": 360,
+         "max_mph": 240
+       },
+-      "model_package": "../../out/car-models/packages/McLaren_F1"
++      "model_package": "../../out/car-models/packages/McLaren_F1",
++      "hidden": true
+     },
+     {
+       "id": 9006,
+@@ -94,23 +96,31 @@
+         "max_kmh": 380,
+         "max_mph": 240
+       },
+-      "model_package": "../../out/car-models/packages/Form1"
++      "model_package": "../../out/car-models/packages/Form1",
++      "hidden": true
+     },
+     {
        "id": 9009,
        "alias": "Ford_GTcar",
        "donor": "Koenigsegg",
 -      "display_name": "Ford GT",
 +      "display_name": "Porsche 930 Turbo",
        "ratings": {
-         "TOPSPEED": 8,
-         "ACCELERATION": 8,
-@@ -127,7 +127,7 @@
+-        "TOPSPEED": 8,
+-        "ACCELERATION": 8,
+-        "MASS": 6,
+-        "HANDLING": 7,
+-        "DURABILITY": 4
++        "TOPSPEED": 6,
++        "ACCELERATION": 6,
++        "MASS": 4,
++        "HANDLING": 5,
++        "DURABILITY": 6
+       },
+       "physics": {
+-        "Mass": 1520,
+-        "TorqueScale": 1000
++        "Mass": 1140,
++        "TorqueScale": 550,
++        "GearRatioVector": [
++          -3.3,
++          3.24,
++          1.87,
++          1.28,
++          0.95
++        ]
+       },
+       "colors": [
+         "#68b7d1",
+@@ -118,8 +128,8 @@
+         "#ad1828"
+       ],
+       "speedometer": {
+-        "max_kmh": 380,
+-        "max_mph": 240
++        "max_kmh": 300,
++        "max_mph": 180
+       },
+       "model_package": "../../out/car-models/packages/Ford_GTcar"
+     },
+@@ -127,17 +137,26 @@
        "id": 9010,
        "alias": "Senna_Road",
        "donor": "Koenigsegg",
@@ -1120,8 +1290,44 @@ index ecb589b..30f1387 100644
 +      "display_name": "Aston Martin DBS",
        "ratings": {
          "TOPSPEED": 8,
-         "ACCELERATION": 9,
-@@ -154,7 +154,7 @@
+-        "ACCELERATION": 9,
+-        "MASS": 5,
+-        "HANDLING": 8,
+-        "DURABILITY": 3
++        "ACCELERATION": 7,
++        "MASS": 7,
++        "HANDLING": 7,
++        "DURABILITY": 6
+       },
+       "physics": {
+-        "Mass": 1309,
+-        "TorqueScale": 1000
++        "Mass": 1695,
++        "TorqueScale": 1070,
++        "GearRatioVector": [
++          -3.3,
++          3.28,
++          1.92,
++          1.28,
++          1.02,
++          0.85,
++          0.79
++        ]
+       },
+       "colors": [
+         "#ff8526",
+@@ -145,8 +164,8 @@
+         "#d9e2e9"
+       ],
+       "speedometer": {
+-        "max_kmh": 360,
+-        "max_mph": 240
++        "max_kmh": 340,
++        "max_mph": 200
+       },
+       "model_package": "../../out/car-models/packages/Senna_Road"
+     },
+@@ -154,17 +173,26 @@
        "id": 9011,
        "alias": "Senna_GTR1",
        "donor": "Koenigsegg",
@@ -1129,30 +1335,181 @@ index ecb589b..30f1387 100644
 +      "display_name": "Porsche 911 GT3",
        "ratings": {
          "TOPSPEED": 8,
-         "ACCELERATION": 9,
-@@ -181,7 +181,7 @@
+-        "ACCELERATION": 9,
++        "ACCELERATION": 8,
+         "MASS": 5,
+         "HANDLING": 9,
+-        "DURABILITY": 2
++        "DURABILITY": 4
+       },
+       "physics": {
+-        "Mass": 1270,
+-        "TorqueScale": 1025
++        "Mass": 1435,
++        "TorqueScale": 1055,
++        "GearRatioVector": [
++          -3.3,
++          3.35,
++          2.13,
++          1.54,
++          1.2,
++          0.95,
++          0.75
++        ]
+       },
+       "colors": [
+         "#efeff2",
+@@ -172,8 +200,8 @@
+         "#b32431"
+       ],
+       "speedometer": {
+-        "max_kmh": 360,
+-        "max_mph": 240
++        "max_kmh": 340,
++        "max_mph": 200
+       },
+       "model_package": "../../out/car-models/packages/Senna_GTR1"
+     },
+@@ -181,17 +209,24 @@
        "id": 9012,
        "alias": "FXXK_Racer",
        "donor": "Koenigsegg",
 -      "display_name": "Ferrari FXX K",
 +      "display_name": "Porsche 930 Turbo Red",
        "ratings": {
-         "TOPSPEED": 8,
-         "ACCELERATION": 9,
+-        "TOPSPEED": 8,
+-        "ACCELERATION": 9,
+-        "MASS": 6,
+-        "HANDLING": 9,
+-        "DURABILITY": 2
++        "TOPSPEED": 6,
++        "ACCELERATION": 6,
++        "MASS": 4,
++        "HANDLING": 5,
++        "DURABILITY": 6
+       },
+       "physics": {
+-        "Mass": 1590,
+-        "TorqueScale": 1150
++        "Mass": 1140,
++        "TorqueScale": 550,
++        "GearRatioVector": [
++          -3.3,
++          3.24,
++          1.87,
++          1.28,
++          0.95
++        ]
+       },
+       "colors": [
+         "#d2202c",
+@@ -199,8 +234,8 @@
+         "#e7e8ea"
+       ],
+       "speedometer": {
+-        "max_kmh": 400,
+-        "max_mph": 260
++        "max_kmh": 300,
++        "max_mph": 180
+       },
+       "model_package": "../../out/car-models/packages/FXXK_Racer"
+     },
+@@ -229,7 +264,8 @@
+         "max_kmh": 440,
+         "max_mph": 280
+       },
+-      "model_package": "../../out/car-models/packages/Regera_GT1"
++      "model_package": "../../out/car-models/packages/Regera_GT1",
++      "hidden": true
+     },
+     {
+       "id": 9014,
+@@ -256,7 +292,8 @@
+         "max_kmh": 380,
+         "max_mph": 240
+       },
+-      "model_package": "../../out/car-models/packages/AventadorX"
++      "model_package": "../../out/car-models/packages/AventadorX",
++      "hidden": true
+     }
+   ]
+ }
 diff --git a/tools/car-mods/cars.json b/tools/car-mods/cars.json
-index b9526f6..755a1a2 100644
+index b9526f6..3045359 100644
 --- a/tools/car-mods/cars.json
 +++ b/tools/car-mods/cars.json
-@@ -97,7 +97,7 @@
+@@ -39,7 +39,8 @@
+       "speedometer": {
+         "max_kmh": 360,
+         "max_mph": 240
+-      }
++      },
++      "hidden": true
+     },
+     {
+       "id": 9005,
+@@ -65,7 +66,8 @@
+       "speedometer": {
+         "max_kmh": 360,
+         "max_mph": 240
+-      }
++      },
++      "hidden": true
+     },
+     {
+       "id": 9006,
+@@ -91,23 +93,31 @@
+       "speedometer": {
+         "max_kmh": 380,
+         "max_mph": 240
+-      }
++      },
++      "hidden": true
+     },
+     {
        "id": 9009,
        "alias": "Ford_GTcar",
        "donor": "Koenigsegg",
 -      "display_name": "Ford GT",
 +      "display_name": "Porsche 930 Turbo",
        "ratings": {
-         "TOPSPEED": 8,
-         "ACCELERATION": 8,
-@@ -123,7 +123,7 @@
+-        "TOPSPEED": 8,
+-        "ACCELERATION": 8,
+-        "MASS": 6,
+-        "HANDLING": 7,
+-        "DURABILITY": 4
++        "TOPSPEED": 6,
++        "ACCELERATION": 6,
++        "MASS": 4,
++        "HANDLING": 5,
++        "DURABILITY": 6
+       },
+       "physics": {
+-        "Mass": 1520,
+-        "TorqueScale": 1000
++        "Mass": 1140,
++        "TorqueScale": 550,
++        "GearRatioVector": [
++          -3.3,
++          3.24,
++          1.87,
++          1.28,
++          0.95
++        ]
+       },
+       "colors": [
+         "#68b7d1",
+@@ -115,25 +125,34 @@
+         "#ad1828"
+       ],
+       "speedometer": {
+-        "max_kmh": 380,
+-        "max_mph": 240
++        "max_kmh": 300,
++        "max_mph": 180
+       }
+     },
+     {
        "id": 9010,
        "alias": "Senna_Road",
        "donor": "Koenigsegg",
@@ -1160,8 +1517,43 @@ index b9526f6..755a1a2 100644
 +      "display_name": "Aston Martin DBS",
        "ratings": {
          "TOPSPEED": 8,
-         "ACCELERATION": 9,
-@@ -149,7 +149,7 @@
+-        "ACCELERATION": 9,
+-        "MASS": 5,
+-        "HANDLING": 8,
+-        "DURABILITY": 3
++        "ACCELERATION": 7,
++        "MASS": 7,
++        "HANDLING": 7,
++        "DURABILITY": 6
+       },
+       "physics": {
+-        "Mass": 1309,
+-        "TorqueScale": 1000
++        "Mass": 1695,
++        "TorqueScale": 1070,
++        "GearRatioVector": [
++          -3.3,
++          3.28,
++          1.92,
++          1.28,
++          1.02,
++          0.85,
++          0.79
++        ]
+       },
+       "colors": [
+         "#ff8526",
+@@ -141,25 +160,34 @@
+         "#d9e2e9"
+       ],
+       "speedometer": {
+-        "max_kmh": 360,
+-        "max_mph": 240
++        "max_kmh": 340,
++        "max_mph": 200
+       }
+     },
+     {
        "id": 9011,
        "alias": "Senna_GTR1",
        "donor": "Koenigsegg",
@@ -1169,18 +1561,148 @@ index b9526f6..755a1a2 100644
 +      "display_name": "Porsche 911 GT3",
        "ratings": {
          "TOPSPEED": 8,
-         "ACCELERATION": 9,
-@@ -175,7 +175,7 @@
+-        "ACCELERATION": 9,
++        "ACCELERATION": 8,
+         "MASS": 5,
+         "HANDLING": 9,
+-        "DURABILITY": 2
++        "DURABILITY": 4
+       },
+       "physics": {
+-        "Mass": 1270,
+-        "TorqueScale": 1025
++        "Mass": 1435,
++        "TorqueScale": 1055,
++        "GearRatioVector": [
++          -3.3,
++          3.35,
++          2.13,
++          1.54,
++          1.2,
++          0.95,
++          0.75
++        ]
+       },
+       "colors": [
+         "#efeff2",
+@@ -167,25 +195,32 @@
+         "#b32431"
+       ],
+       "speedometer": {
+-        "max_kmh": 360,
+-        "max_mph": 240
++        "max_kmh": 340,
++        "max_mph": 200
+       }
+     },
+     {
        "id": 9012,
        "alias": "FXXK_Racer",
        "donor": "Koenigsegg",
 -      "display_name": "Ferrari FXX K",
 +      "display_name": "Porsche 930 Turbo Red",
        "ratings": {
-         "TOPSPEED": 8,
-         "ACCELERATION": 9,
+-        "TOPSPEED": 8,
+-        "ACCELERATION": 9,
+-        "MASS": 6,
+-        "HANDLING": 9,
+-        "DURABILITY": 2
++        "TOPSPEED": 6,
++        "ACCELERATION": 6,
++        "MASS": 4,
++        "HANDLING": 5,
++        "DURABILITY": 6
+       },
+       "physics": {
+-        "Mass": 1590,
+-        "TorqueScale": 1150
++        "Mass": 1140,
++        "TorqueScale": 550,
++        "GearRatioVector": [
++          -3.3,
++          3.24,
++          1.87,
++          1.28,
++          0.95
++        ]
+       },
+       "colors": [
+         "#d2202c",
+@@ -193,8 +228,8 @@
+         "#e7e8ea"
+       ],
+       "speedometer": {
+-        "max_kmh": 400,
+-        "max_mph": 260
++        "max_kmh": 300,
++        "max_mph": 180
+       }
+     },
+     {
+@@ -221,7 +256,8 @@
+       "speedometer": {
+         "max_kmh": 440,
+         "max_mph": 280
+-      }
++      },
++      "hidden": true
+     },
+     {
+       "id": 9014,
+@@ -247,7 +283,8 @@
+       "speedometer": {
+         "max_kmh": 380,
+         "max_mph": 240
+-      }
++      },
++      "hidden": true
+     }
+   ]
+ }
+diff --git a/tools/car-mods/driving_defaults.py b/tools/car-mods/driving_defaults.py
+index b667535..66a8164 100644
+--- a/tools/car-mods/driving_defaults.py
++++ b/tools/car-mods/driving_defaults.py
+@@ -14,15 +14,25 @@ TUNING = {
+     "Panoz": (980, 750),
+     "McLaren_F1": (1050, 800),
+     "Form1": (600, 420),
+-    "Ford_GTcar": (1520, 1000),
+-    "Senna_Road": (1309, 1000),
+-    "Senna_GTR1": (1270, 1025),
+-    "FXXK_Racer": (1590, 1150),
++    "Ford_GTcar": (1140, 550),          # Porsche 930 Turbo
++    "Senna_Road": (1695, 1070),         # Aston Martin DBS
++    "Senna_GTR1": (1435, 1055),         # Porsche 911 GT3 (992)
++    "FXXK_Racer": (1140, 550),          # Porsche 930 Turbo, Guards Red
+     "Regera_GT1": (1590, 1250),
+     "AventadorX": (1675, 1100),
+ }
+ 
+ 
++# The imported cars also carry their own gearbox: reverse, then forward ratios
++# scaled from the donor's top gear for each car's real top speed.
++GEARS = {
++    "Ford_GTcar": [-3.3, 3.24, 1.87, 1.28, 0.95],
++    "Senna_Road": [-3.3, 3.28, 1.92, 1.28, 1.02, 0.85, 0.79],
++    "Senna_GTR1": [-3.3, 3.35, 2.13, 1.54, 1.2, 0.95, 0.75],
++    "FXXK_Racer": [-3.3, 3.24, 1.87, 1.28, 0.95],
++}
++
++
+ def apply_preset(car: dict) -> dict:
+     """Reset driving only; preserve identity, model, paint, ratings and gauges."""
+     alias = car.get("alias")
+@@ -31,5 +41,7 @@ def apply_preset(car: dict) -> dict:
+     result = copy.deepcopy(car)
+     mass, torque = TUNING[alias]
+     result["physics"] = {"Mass": mass, "TorqueScale": torque}
++    if alias in GEARS:
++        result["physics"]["GearRatioVector"] = list(GEARS[alias])
+     result.pop("engine_profile", None)
+     return result
 diff --git a/tools/car-mods/factory_specs.json b/tools/car-mods/factory_specs.json
-index 49ca372..621691b 100644
+index 49ca372..cae9260 100644
 --- a/tools/car-mods/factory_specs.json
 +++ b/tools/car-mods/factory_specs.json
 @@ -374,57 +374,49 @@
@@ -1683,13 +2205,13 @@ index 49ca372..621691b 100644
 -            7500,
 -            0.966069538497
 +            8400,
-+            0.95
++            0.907
            ],
            [
 -            8250,
 -            0.84
 +            9000,
-+            0.85
++            0.8
            ]
          ],
 -        "drag_coefficient_native": 0.67,
