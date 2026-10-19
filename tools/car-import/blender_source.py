@@ -188,10 +188,41 @@ def write_solid_png(path, rgb, size=8):
         f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
                 + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
+def write_rgb_png(path, rgb):
+    """An 8-bit RGB PNG from a rows x cols x 3 uint8 array, top row first."""
+    import struct, zlib
+    h, w, _ = rgb.shape
+    rows = b"".join(b"\x00" + rgb[y].tobytes() for y in range(h))
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(rows, 6)) + chunk(b"IEND", b""))
+
+def write_border_png(path, colour=(0.95, 0.95, 0.95), w=128, h=40, border=3):
+    """A plate of one colour with a black border, 8-bit RGB."""
+    import struct, zlib
+    rows = bytearray()
+    for yy in range(h):
+        rows += b"\x00"
+        for xx in range(w):
+            edge = xx < border or yy < border or xx >= w - border or yy >= h - border
+            rows += b"\x10\x10\x10" if edge else bytes(max(0, min(255, round(c * 255))) for c in colour)
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(bytes(rows))) + chunk(b"IEND", b""))
+
 def material_id(mat):
     if mat in mat_index:
         return mat_index[mat]
     name = mat.name if mat else "untextured"
+    if mat is not None and "mm3_texture" in mat:     # made by the exporter itself
+        mat_index[mat] = len(materials)
+        materials.append({"name": name, "texture": mat["mm3_texture"], "diffuse": [1.0, 1.0, 1.0, 1.0],
+                          "shininess": 0.1})
+        return mat_index[mat]
     record = {"name": name, "texture": None, "diffuse": [0.8, 0.8, 0.8, 1.0]}
     p = principled(mat)
     if p:
@@ -216,12 +247,20 @@ def material_id(mat):
             if max(w, h) > limit:
                 s = limit / max(w, h)
                 img.scale(max(1, int(w * s)), max(1, int(h * s)))
-            if matches(name, recipe.get("opaque_textures", [])):
-                # Detail stored under transparent texels (lamp lenses) would be
-                # baked over black by the package builder; keep it opaque.
-                px = list(img.pixels)
-                px[3::4] = [1.0] * (len(px) // 4)
-                img.pixels[:] = px
+            opaque = recipe.get("opaque_textures", [])
+            backing = next((c for p, c in opaque.items() if re.search(p, name, re.I)), None) \
+                if isinstance(opaque, dict) else ((0, 0, 0) if matches(name, opaque) else None)
+            if backing is not None:
+                # The package builder bakes transparent texels over near-black;
+                # lamp lenses look through to a chrome reflector, so lay them
+                # over the recipe's colour (a list of patterns: just drop alpha).
+                import numpy as np
+                px = np.array(img.pixels[:], dtype=np.float32).reshape(-1, 4)
+                if isinstance(opaque, dict):
+                    lin = np.array([c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in backing])
+                    px[:, :3] = px[:, :3] * px[:, 3:4] + lin * (1 - px[:, 3:4])
+                px[:, 3] = 1.0
+                img.pixels[:] = px.ravel()
             img.filepath_raw = path
             img.file_format = "PNG"
             img.save()
@@ -436,6 +475,152 @@ def drop_faces_near(bm, mats, rules):
 drop_faces_near(body, body_mats, recipe.get("drop_faces_near", []))
 body = decimate(body, recipe.get("body_tris", 30000))
 body.normal_update()
+
+def bake_ao(bm, mats, patterns, size=1024, strength=0.7, samples=48):
+    """Bake ambient occlusion into the faces of the named untextured
+    materials (the paint): a new UV layout for them, Cycles' AO with the
+    rest of the body in the scene to cast it, and one texture of the
+    material's colour times the shading. Returns the number of faces."""
+    import numpy as np
+    ids = {i for i, m in enumerate(mats) if m and matches(m.name, patterns)}
+    targets = [f for f in bm.faces if f.material_index in ids]
+    if not targets:
+        return 0
+    def object_from(faces, name):
+        me = bpy.data.meshes.new(name)
+        out = bmesh.new()
+        src = out.faces.layers.int.new("src")
+        vmap = {}
+        for number, f in enumerate(faces):
+            for v in f.verts:
+                if v not in vmap:
+                    vmap[v] = out.verts.new(v.co)
+            try:
+                nf = out.faces.new([vmap[v] for v in f.verts])
+                nf.smooth = f.smooth
+                nf[src] = number
+            except ValueError:
+                pass
+        # glTF splits vertices at every shading seam; welded, the paint is a
+        # few large panels for the UV layout instead of loose triangles.
+        bmesh.ops.remove_doubles(out, verts=out.verts, dist=1e-4)
+        out.to_mesh(me)
+        out.free()
+        ob = bpy.data.objects.new(name, me)
+        scene.collection.objects.link(ob)
+        return ob
+    # Surfaces hugging the paint (liners, decals, a headliner just under the
+    # roof) would shadow it completely; only things standing off it cast.
+    import mathutils
+    near = mathutils.kdtree.KDTree(len(targets))
+    for i, f in enumerate(targets):
+        near.insert(f.calc_center_median(), i)
+    near.balance()
+    casters = [f for f in bm.faces if f.material_index not in ids
+               and near.find(f.calc_center_median())[2] > recipe.get("ao_ignore_within", 0.02)]
+    occluder = object_from(casters, "ao_occluder")
+    paint = object_from(targets, "ao_paint")
+    # The imported car is still in the scene in Blender's own orientation,
+    # crossing these copies in game orientation: only the copies take part.
+    hidden = [o for o in scene.objects if o not in (paint, occluder) and not o.hide_render]
+    for o in hidden:
+        o.hide_render = True
+    for o in scene.objects:
+        o.select_set(False)
+    bpy.context.view_layer.objects.active = paint
+    paint.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.uv.smart_project(angle_limit=math.radians(66), island_margin=0.004)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    image = bpy.data.images.new("ao_bake", size, size, float_buffer=True)
+    mat = bpy.data.materials.new("ao_target")
+    mat.use_nodes = True
+    node = mat.node_tree.nodes.new("ShaderNodeTexImage")
+    node.image = image
+    mat.node_tree.nodes.active = node
+    paint.data.materials.append(mat)
+    scene.render.engine = "CYCLES"
+    scene.cycles.samples = samples
+    scene.cycles.device = "CPU"
+    scene.render.bake.margin = 6
+    bpy.ops.object.bake(type="AO")
+    for o in hidden:
+        o.hide_render = False
+    ao = np.array(image.pixels[:], dtype=np.float32).reshape(size, size, 4)[..., 0]
+    # One baked texture per material: its colour times the shading.
+    first = {}
+    for i in sorted(ids):
+        colour = materials[material_id(mats[i])]["diffuse"][:3]
+        shade = (1 - strength) + strength * ao
+        rgb = np.clip(shade[..., None] * np.asarray(colour)[None, None, :], 0, 1)
+        fname = "baked_" + re.sub(r"[^A-Za-z0-9_.-]", "_", mats[i].name) + ".png"
+        write_rgb_png(os.path.join(out_dir, "textures", fname), np.uint8(np.rint(rgb[::-1] * 255)))
+        baked = bpy.data.materials.new(mats[i].name + " (baked)")
+        baked["mm3_texture"] = "textures/" + fname
+        mats.append(baked)
+        first[i] = len(mats) - 1
+    # Back into the body: the new UVs and the baked material.
+    # Welding dropped collapsed faces, so pair faces by their recorded
+    # index and corners by position.
+    me = paint.data
+    layer = me.uv_layers.active.data
+    number = me.attributes["src"].data
+    uv = bm.loops.layers.uv.active
+    corners_of, done = [], set()
+    for poly in me.polygons:
+        corners = [(me.vertices[me.loops[li].vertex_index].co.copy(), layer[li].uv.copy())
+                   for li in poly.loop_indices]
+        corners_of.append(corners)
+        n = number[poly.index].value
+        done.add(n)
+        for loop in targets[n].loops:
+            loop[uv].uv = min(corners, key=lambda c: (c[0] - loop.vert.co).length_squared)[1]
+    # Faces with no copy (a duplicate triangle, or collapsed by the weld)
+    # take the layout of the nearest copied face.
+    import mathutils
+    tree = mathutils.kdtree.KDTree(len(corners_of))
+    for i, corners in enumerate(corners_of):
+        tree.insert(sum((c[0] for c in corners), Vector()) / len(corners), i)
+    tree.balance()
+    for n, f in enumerate(targets):
+        if n in done:
+            continue
+        corners = corners_of[tree.find(f.calc_center_median())[1]]
+        for loop in f.loops:
+            loop[uv].uv = min(corners, key=lambda c: (c[0] - loop.vert.co).length_squared)[1]
+    for f in targets:
+        f.material_index = first[f.material_index]
+    for o in (paint, occluder):
+        bpy.data.objects.remove(o)
+    return len(targets)
+
+if recipe.get("bake_ao"):
+    print("BAKED", bake_ao(body, body_mats, recipe["bake_ao"], recipe.get("bake_size", 1024),
+                           recipe.get("ao_strength", 0.7)), "faces")
+
+def plate_backing(bm, mats, centre, size=(0.40, 0.118)):
+    """A panel just in front of the body behind the rear plate, a little
+    larger than the donor's 0.387 x 0.105 m plate: its rim shows round the
+    plate as a border (the plate's own background is one flat colour)."""
+    path = os.path.join(out_dir, "textures", "plate_backing.png")
+    write_border_png(path, recipe.get("plate_backing_color", (0.05, 0.05, 0.05)))
+    mat = bpy.data.materials.new("plate backing")
+    mat["mm3_texture"] = "textures/plate_backing.png"
+    mats.append(mat)
+    uv = bm.loops.layers.uv.active or bm.loops.layers.uv.new("uv")
+    x, y, z = centre
+    w, h = size[0] / 2, size[1] / 2
+    vs = [bm.verts.new((x + dx, y + dy, z - 0.004)) for dx, dy in ((-w, -h), (w, -h), (w, h), (-w, h))]
+    for tri, uvs in (((0, 1, 2), ((0, 1), (1, 1), (1, 0))), ((0, 2, 3), ((0, 1), (1, 0), (0, 0)))):
+        f = bm.faces.new([vs[i] for i in tri])
+        f.material_index = len(mats) - 1
+        for loop, t in zip(f.loops, uvs):
+            loop[uv].uv = (t[0], 1 - t[1])    # mesh_record flips v again
+    bm.normal_update()
+
+if "rear_plate" in recipe and recipe.get("plate_backing", False):
+    plate_backing(body, body_mats, recipe["rear_plate"], tuple(recipe.get("plate_backing_size", (0.40, 0.118))))
 meshes.insert(0, mesh_record("BODY_H", body, body_mats, Vector((0, 0, 0))))
 body.free()
 
@@ -473,6 +658,10 @@ model = {"version": 1, "name": recipe["name"], "source_format": "Blender " + ext
                          "uv_origin": "top_left", "transform_vectors": "columns"},
          "paintjob": 0, "paintjob_count": 1, "meshes": meshes, "materials": materials,
          "references": [], "offset": [0, 0, 0]}
+if "rear_plate" in recipe:          # where the game's rear number plate goes
+    model["plates"] = {"back": recipe["rear_plate"]}
+    if "plate_color" in recipe:     # tint of the game's plate material
+        model["plates"]["color"] = recipe["plate_color"]
 with open(os.path.join(out_dir, "model.json"), "w") as f:
     json.dump(model, f, separators=(",", ":"))
 for m in meshes:

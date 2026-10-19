@@ -39,13 +39,16 @@ licence.
 | `wheel` | regexes for wheel parts; they are sorted into the four corners |
 | `headlight`, `taillight` | regexes for lamp parts; their centres place the game's lights |
 | `colors` | material regex to display-value RGB, replacing that material's colour |
-| `opaque_textures` | material regexes whose texture alpha is dropped (detail stored under transparent texels) |
+| `opaque_textures` | material regexes whose texture alpha is dropped, or `{regex: rgb}` to lay transparent texels over that colour (lamp lenses over a chrome reflector) |
 | `body_tris`, `wheel_tris` | triangle budgets (the game copes with ~30k and ~6k) |
 | `solid_textures` | material regexes given a small texture of their colour (untextured wheel parts) |
 | `drop_faces_near` | `[material, object, margin]`: drop that material's faces inside pieces of those objects (lens covers sharing the windows' material) |
 | `rear_colors` | material regex to `{"tint": rgb}` or `{"color": rgba, "below": height}` for faces behind the rear axle (red tail-lamp lenses) |
 | `headlight_where`, `taillight_where` | `{"material", "below", "above"}`: narrow the lamp helpers to the lenses |
 | `symmetric_wheels` | default true: each wheel also gets a mirrored copy (the donors show the inside of a shared wheel mesh on the left) |
+| `rear_plate` | `[x, y, z]` in the exported coordinates: the donor's rear number plate (with the player's plate text) is moved there; front plates stay hidden |
+| `plate_color` | display RGB of the rear plate background: the builder gives the car a recoloured copy of the game's plate font atlas |
+| `plate_backing` | true: a panel (`plate_backing_color`, default black; `plate_backing_size`, default 0.40 x 0.118 m) behind the plate, showing as a border |
 | `hero_metallic` | material regexes rendered as metallic paint by `render_hero.py` |
 
 Use a Koenigsegg-donor slot: the Viper donor draws an imported car's driver-side wheels translucent.

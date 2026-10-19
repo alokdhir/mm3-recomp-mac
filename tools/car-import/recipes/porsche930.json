@@ -9,7 +9,8 @@
     "wunderbaum",
     "lights_refraction",
     "^Object_49 ",
-    "^Object_76 "
+    "^Object_76 ",
+    "plate\\.001"
   ],
   "wheel": [
     "930_rim",
@@ -31,7 +32,19 @@
       0.41
     ]
   },
-  "opaque_textures": [
-    "930_lights"
+  "opaque_textures": {
+    "930_lights": [
+      0.82,
+      0.83,
+      0.85
+    ]
+  },
+  "rear_plate": [
+    0.0,
+    0.4,
+    2.17
+  ],
+  "bake_ao": [
+    "^paint\\.001$"
   ]
 }

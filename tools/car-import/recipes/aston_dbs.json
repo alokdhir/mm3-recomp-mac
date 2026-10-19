@@ -23,9 +23,9 @@
   "wheel_tris": 6000,
   "colors": {
     "^Paint$": [
-      0.42,
-      0.43,
-      0.45
+      0.33,
+      0.34,
+      0.36
     ],
     "^Other$": [
       0.68,
@@ -79,5 +79,19 @@
     "material": "^Material\\.002$",
     "below": 0.9,
     "above": 0.5
-  }
+  },
+  "rear_plate": [
+    0.0,
+    0.76,
+    2.245
+  ],
+  "plate_color": [
+    0.98,
+    0.8,
+    0.08
+  ],
+  "plate_backing": true,
+  "bake_ao": [
+    "^Paint$"
+  ]
 }
