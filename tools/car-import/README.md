@@ -49,6 +49,7 @@ licence.
 | `rear_plate` | `[x, y, z]` in the exported coordinates: the donor's rear number plate (with the player's plate text) is moved there; front plates stay hidden |
 | `plate_color` | display RGB of the rear plate background: the builder gives the car a recoloured copy of the game's plate font atlas |
 | `plate_backing` | true: a panel (`plate_backing_color`, default black; `plate_backing_size`, default 0.40 x 0.118 m) behind the plate, showing as a border |
+| `glass` | material regexes for the windows: split out as `GLASS_H` and drawn see-through in the donor's glass part |
 | `hero_metallic` | material regexes rendered as metallic paint by `render_hero.py` |
 
 Use a Koenigsegg-donor slot: the Viper donor draws an imported car's driver-side wheels translucent.

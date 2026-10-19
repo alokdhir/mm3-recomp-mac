@@ -214,6 +214,35 @@ def write_border_png(path, colour=(0.95, 0.95, 0.95), w=128, h=40, border=3):
         f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
                 + chunk(b"IDAT", zlib.compress(bytes(rows))) + chunk(b"IEND", b""))
 
+def export_image(image, backing=None, suffix="", alpha_only=False):
+    """Save a material's image as PNG (once) and return its file name.
+    backing: an RGB the transparent texels are laid over (the package
+    builder would bake them over near-black: lamp lenses look through to a
+    reflector); alpha_only drops the alpha without a colour."""
+    fname = os.path.splitext(re.sub(r"[^A-Za-z0-9_.-]", "_", image.name))[0] + suffix + ".png"
+    path = os.path.join(out_dir, "textures", fname)
+    if os.path.exists(path):
+        return fname
+    img = image.copy()
+    limit = recipe.get("texture_limit", 2048)
+    w, h = img.size
+    if max(w, h) > limit:
+        s = limit / max(w, h)
+        img.scale(max(1, int(w * s)), max(1, int(h * s)))
+    if backing is not None:
+        import numpy as np
+        px = np.array(img.pixels[:], dtype=np.float32).reshape(-1, 4)
+        if not alpha_only:
+            lin = np.array([c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in backing])
+            px[:, :3] = px[:, :3] * px[:, 3:4] + lin * (1 - px[:, 3:4])
+        px[:, 3] = 1.0
+        img.pixels[:] = px.ravel()
+    img.filepath_raw = path
+    img.file_format = "PNG"
+    img.save()
+    bpy.data.images.remove(img)
+    return fname
+
 def material_id(mat):
     if mat in mat_index:
         return mat_index[mat]
@@ -221,7 +250,7 @@ def material_id(mat):
     if mat is not None and "mm3_texture" in mat:     # made by the exporter itself
         mat_index[mat] = len(materials)
         materials.append({"name": name, "texture": mat["mm3_texture"], "diffuse": [1.0, 1.0, 1.0, 1.0],
-                          "shininess": 0.1})
+                          "shininess": mat.get("mm3_shininess", 0.1), "mode": int(mat.get("mm3_mode", 2))})
         return mat_index[mat]
     record = {"name": name, "texture": None, "diffuse": [0.8, 0.8, 0.8, 1.0]}
     p = principled(mat)
@@ -237,34 +266,10 @@ def material_id(mat):
         record["diffuse"] = list(mat.diffuse_color)
     image = base_color_image(mat)
     if image:
-        fname = re.sub(r"[^A-Za-z0-9_.-]", "_", image.name)
-        fname = os.path.splitext(fname)[0] + ".png"
-        path = os.path.join(out_dir, "textures", fname)
-        if not os.path.exists(path):
-            img = image.copy()
-            limit = recipe.get("texture_limit", 2048)
-            w, h = img.size
-            if max(w, h) > limit:
-                s = limit / max(w, h)
-                img.scale(max(1, int(w * s)), max(1, int(h * s)))
-            opaque = recipe.get("opaque_textures", [])
-            backing = next((c for p, c in opaque.items() if re.search(p, name, re.I)), None) \
-                if isinstance(opaque, dict) else ((0, 0, 0) if matches(name, opaque) else None)
-            if backing is not None:
-                # The package builder bakes transparent texels over near-black;
-                # lamp lenses look through to a chrome reflector, so lay them
-                # over the recipe's colour (a list of patterns: just drop alpha).
-                import numpy as np
-                px = np.array(img.pixels[:], dtype=np.float32).reshape(-1, 4)
-                if isinstance(opaque, dict):
-                    lin = np.array([c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in backing])
-                    px[:, :3] = px[:, :3] * px[:, 3:4] + lin * (1 - px[:, 3:4])
-                px[:, 3] = 1.0
-                img.pixels[:] = px.ravel()
-            img.filepath_raw = path
-            img.file_format = "PNG"
-            img.save()
-            bpy.data.images.remove(img)
+        opaque = recipe.get("opaque_textures", [])
+        backing = next((c for p, c in opaque.items() if re.search(p, name, re.I)), None) \
+            if isinstance(opaque, dict) else ((0, 0, 0) if matches(name, opaque) else None)
+        fname = export_image(image, backing, alpha_only=not isinstance(opaque, dict))
         record["texture"] = "textures/" + fname
         record["diffuse"] = [1.0, 1.0, 1.0, record["diffuse"][3]]
     for pattern, colour in recipe.get("colors", {}).items():
@@ -285,8 +290,9 @@ def material_id(mat):
 def rear_material_id(mat, height):
     """The material for a face behind the rear axle line: a recoloured copy
     when the recipe's "rear_colors" names it, else the material itself.
-    A rule is {"tint": [r, g, b]} (multiplies) or {"color": [r, g, b, a]}
-    (replaces, dropping the texture), optionally only "below" a height:
+    A rule is {"tint": [r, g, b]} (multiplies), {"color": [r, g, b, a]}
+    (replaces, dropping the texture) or {"backing": [r, g, b]} (the texture
+    with its transparent texels over that colour), optionally only "below" a height:
     red tail lamps whose lenses share a material with the windows."""
     base_id = material_id(mat)
     name = mat.name if mat else "untextured"
@@ -299,6 +305,10 @@ def rear_material_id(mat, height):
             if "color" in rule:
                 record["texture"] = None
                 record["diffuse"] = list(rule["color"]) + record["diffuse"][len(rule["color"]):]
+            elif "backing" in rule:          # the texture over another colour
+                image = base_color_image(mat)
+                if image:
+                    record["texture"] = "textures/" + export_image(image, rule["backing"], "_rear")
             else:
                 record["diffuse"] = [d * t for d, t in zip(record["diffuse"][:3], rule["tint"])] + record["diffuse"][3:]
             mat_index[key] = len(materials)
@@ -558,6 +568,8 @@ def bake_ao(bm, mats, patterns, size=1024, strength=0.7, samples=48):
         write_rgb_png(os.path.join(out_dir, "textures", fname), np.uint8(np.rint(rgb[::-1] * 255)))
         baked = bpy.data.materials.new(mats[i].name + " (baked)")
         baked["mm3_texture"] = "textures/" + fname
+        baked["mm3_mode"] = 0          # paint: drawn with the body, as retail textured paint
+        baked["mm3_shininess"] = materials[material_id(mats[i])].get("shininess", 0.25)
         mats.append(baked)
         first[i] = len(mats) - 1
     # Back into the body: the new UVs and the baked material.
@@ -621,6 +633,42 @@ def plate_backing(bm, mats, centre, size=(0.40, 0.118)):
 
 if "rear_plate" in recipe and recipe.get("plate_backing", False):
     plate_backing(body, body_mats, recipe["rear_plate"], tuple(recipe.get("plate_backing_size", (0.40, 0.118))))
+def split_glass(bm, mats, patterns):
+    """Move window faces (the recipe's "glass" materials) into their own
+    bmesh for the donor's see-through glass part; faces recoloured as rear
+    lamp lenses stay with the body."""
+    ids = {i for i, m in enumerate(mats) if m and matches(m.name, patterns)}
+    def lens(f):
+        c = f.calc_center_median()
+        m = mats[f.material_index]
+        return c.z > rear_line and any(re.search(p, m.name, re.I) and c.y < rule.get("below", 1e9)
+                                       for p, rule in recipe.get("rear_colors", {}).items())
+    faces = [f for f in bm.faces if f.material_index in ids and not lens(f)]
+    out = bmesh.new()
+    uv_out = out.loops.layers.uv.new("uv")
+    uv_in = bm.loops.layers.uv.active
+    vmap = {}
+    for f in faces:
+        for v in f.verts:
+            if v not in vmap:
+                vmap[v] = out.verts.new(v.co)
+        try:
+            nf = out.faces.new([vmap[v] for v in f.verts])
+        except ValueError:
+            continue
+        nf.material_index, nf.smooth = f.material_index, f.smooth
+        for a, b in zip(f.loops, nf.loops):
+            b[uv_out].uv = a[uv_in].uv
+    bmesh.ops.delete(bm, geom=faces, context="FACES")
+    out.normal_update()
+    return out
+
+if recipe.get("glass"):
+    glass = split_glass(body, body_mats, recipe["glass"])
+    print("GLASS", len(glass.faces), "faces")
+    if glass.faces:
+        meshes.append(mesh_record("GLASS_H", glass, body_mats, Vector((0, 0, 0))))
+    glass.free()
 meshes.insert(0, mesh_record("BODY_H", body, body_mats, Vector((0, 0, 0))))
 body.free()
 

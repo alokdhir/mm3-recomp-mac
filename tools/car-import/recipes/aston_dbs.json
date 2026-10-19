@@ -5,8 +5,7 @@
   "forward": "-Y",
   "scale": 1.0,
   "drop": [
-    "Refracted",
-    "^\\S+ \\S+ Interior$"
+    "Refracted"
   ],
   "wheel": [
     "Rim Paint",
@@ -93,5 +92,8 @@
   "plate_backing": true,
   "bake_ao": [
     "^Paint$"
+  ],
+  "glass": [
+    "^Material\\.002$"
   ]
 }

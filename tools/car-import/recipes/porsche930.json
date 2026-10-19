@@ -10,7 +10,8 @@
     "lights_refraction",
     "^Object_49 ",
     "^Object_76 ",
-    "plate\\.001"
+    "plate\\.001",
+    "^Object_91 "
   ],
   "wheel": [
     "930_rim",
@@ -46,5 +47,22 @@
   ],
   "bake_ao": [
     "^paint\\.001$"
+  ],
+  "plate_backing": true,
+  "rear_colors": {
+    "930_lights": {
+      "backing": [
+        0.62,
+        0.04,
+        0.03
+      ]
+    }
+  },
+  "taillight_where": {
+    "above": 0.5,
+    "below": 0.62
+  },
+  "glass": [
+    "^glass\\.001$"
   ]
 }
