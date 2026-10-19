@@ -3617,7 +3617,13 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
          * reflection into the sky's cube map) is drawn blue; see ps tint. */
         static int tint = -1;
         if (tint < 0) tint = !getenv("MM3_WATER_TINT") || atoi(getenv("MM3_WATER_TINT")) != 0;
-        pc->pad0 = tint && st->rc_seen && st->rc.stage_program == 0x64621u && st->tex[3].cube;
+        /* The showroom's reflective floor runs the same program; the water
+         * alone reads a 128x128 ripple map the game draws, and a 64x64 sky
+         * cube map. */
+        pc->pad0 = tint && st->rc_seen && st->rc.stage_program == 0x64621u &&
+                   st->tex[3].cube && st->tex[3].width == 64 &&
+                   st->tex[0].width == 128 && st->tex[0].height == 128 &&
+                   surface_find(phys(st->tex[0].addr)) != NULL;
     }
     pc->dot_map = st->dot_rgb_mapping;
     /* SET_FOG_COLOR keeps red in the low byte. */
