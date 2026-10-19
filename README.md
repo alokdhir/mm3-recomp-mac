@@ -72,6 +72,25 @@ repository; for a self-contained copy, with the game data inside the app
 
 Xbox One, Series and PlayStation controllers work over Bluetooth or USB.
 
+## Extra cars
+
+Four imported cars can replace the extra slots' stand-in models. The models
+are not in this repository (licences); download them, then build each from
+its recipe in [`tools/car-import/recipes`](tools/car-import/recipes):
+
+| Car | Download (Sketchfab, free account) | Recipe |
+|---|---|---|
+| Porsche 930 Turbo (silver / Guards Red) | [FREE 1975 Porsche 911 (930) Turbo](https://sketchfab.com/3d-models/free-1975-porsche-911-930-turbo-8568d9d14a994b9cae59499f0dbed21e), Lionsharp Studios, CC BY | `porsche930.json`, `porsche930_red.json` |
+| Aston Martin DBS | [2009 Aston Martin DBS](https://sketchfab.com/3d-models/2009-aston-martin-dbs-aaef9c2b0b1a4af2815f30aa0893a00e), Galaxy Car Showroom, CC BY | `aston_dbs.json` |
+| Porsche 911 GT3 (992) | [2022 Porsche 911 GT3 (992)](https://sketchfab.com/3d-models/2022-porsche-911-gt3-992-ba01afbaf32846e598db315be3507db3), Ddiaz Design, CC BY-NC-SA (from CSR2; personal use) | `porsche992gt3.json` |
+
+Unzip each download where its recipe's `source` points (under
+`~/Downloads`), then follow [`tools/car-import/README.md`](tools/car-import/README.md):
+export with Blender, build the package, point the slot at it in
+`third_party/mm3-recomp/tools/car-mods/cars.local.json`, and apply.
+`scripts/workshop.sh` opens Car Workshop (ratings, physics, gearing,
+speedometer) and copies the applied data into the app.
+
 ## How it is put together
 
 - `third_party/mm3-recomp` — the upstream project as a pinned submodule,
