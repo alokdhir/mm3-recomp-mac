@@ -93,11 +93,17 @@ def bm_center(bm):
     return (lo + hi) / 2, lo, hi
 
 def merge(objs):
-    """One bmesh of several objects; materials remapped into one list."""
+    """One bmesh of several objects; materials remapped into one list.
+    An item may be (object, face indices) to take only those faces."""
     out, out_mats = bmesh.new(), []
     uv_out = out.loops.layers.uv.new("uv")
-    for o in objs:
+    for item in objs:
+        o, only = item if isinstance(item, tuple) else (item, None)
         bm, mats = world_mesh(o)
+        if only is not None:
+            bm.faces.ensure_lookup_table()
+            gone = [f for f in bm.faces if f.index not in only]
+            bmesh.ops.delete(bm, geom=gone, context="FACES")
         uv_in = bm.loops.layers.uv.active
         index = []
         for m in mats or [None]:
@@ -171,6 +177,17 @@ def srgb(c):
     """Blender colour values are linear; the neutral model's are display values."""
     return c * 12.92 if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
 
+def write_solid_png(path, rgb, size=8):
+    """An 8-bit RGB PNG of one colour (display values 0..1)."""
+    import struct, zlib
+    px = bytes(max(0, min(255, round(c * 255))) for c in rgb)
+    rows = b"".join(b"\x00" + px * size for _ in range(size))
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
 def material_id(mat):
     if mat in mat_index:
         return mat_index[mat]
@@ -215,15 +232,48 @@ def material_id(mat):
         if re.search(pattern, name, re.I):   # display-value RGB(A) override
             record["texture"] = None
             record["diffuse"] = list(colour) + record["diffuse"][len(colour):]
+    if not record["texture"] and matches(name, recipe.get("solid_textures", [])):
+        # Some donor parts (the Viper's wheels) draw untextured materials as
+        # translucent; give those a small texture of their colour instead.
+        fname = "solid_" + re.sub(r"[^A-Za-z0-9_.-]", "_", name) + ".png"
+        write_solid_png(os.path.join(out_dir, "textures", fname), record["diffuse"][:3])
+        record["texture"] = "textures/" + fname
+        record["diffuse"] = [1.0, 1.0, 1.0, record["diffuse"][3]]
     mat_index[mat] = len(materials)
     materials.append(record)
     return mat_index[mat]
+
+def rear_material_id(mat, height):
+    """The material for a face behind the rear axle line: a recoloured copy
+    when the recipe's "rear_colors" names it, else the material itself.
+    A rule is {"tint": [r, g, b]} (multiplies) or {"color": [r, g, b, a]}
+    (replaces, dropping the texture), optionally only "below" a height:
+    red tail lamps whose lenses share a material with the windows."""
+    base_id = material_id(mat)
+    name = mat.name if mat else "untextured"
+    for pattern, rule in recipe.get("rear_colors", {}).items():
+        if not re.search(pattern, name, re.I) or height >= rule.get("below", 1e9):
+            continue
+        key = ("rear", mat)
+        if key not in mat_index:
+            record = dict(materials[base_id], name=name + " (rear)")
+            if "color" in rule:
+                record["texture"] = None
+                record["diffuse"] = list(rule["color"]) + record["diffuse"][len(rule["color"]):]
+            else:
+                record["diffuse"] = [d * t for d, t in zip(record["diffuse"][:3], rule["tint"])] + record["diffuse"][3:]
+            mat_index[key] = len(materials)
+            materials.append(record)
+        return mat_index[key]
+    return base_id
 
 def mesh_record(name, bm, mats, pivot):
     uv = bm.loops.layers.uv.active
     positions, normals, uvs, triangles, key = [], [], [], [], {}
     for f in bm.faces:
-        mid = material_id(mats[f.material_index] if f.material_index < len(mats) else None)
+        mat = mats[f.material_index] if f.material_index < len(mats) else None
+        centre = f.calc_center_median()
+        mid = rear_material_id(mat, centre.y) if centre.z > rear_line else material_id(mat)
         corners = []
         for loop in f.loops:
             co = loop.vert.co - pivot
@@ -244,12 +294,36 @@ def mesh_record(name, bm, mats, pivot):
             "normals": normals, "uvs": uvs, "triangles": triangles, "transform": transform}
 
 # --- wheels: four corners -----------------------------------------------------
+def pieces(bm):
+    """Connected groups of faces (an object can hold wheels of both sides)."""
+    seen, groups = set(), []
+    for f in bm.faces:
+        if f.index in seen:
+            continue
+        group, todo = [], [f]
+        seen.add(f.index)
+        while todo:
+            g = todo.pop()
+            group.append(g)
+            for v in g.verts:
+                for h in v.link_faces:
+                    if h.index not in seen:
+                        seen.add(h.index)
+                        todo.append(h)
+        groups.append(group)
+    return groups
+
 corners = {}
 for o in parts["wheel"]:
     bm, _ = world_mesh(o)
-    c, _, _ = bm_center(bm)
+    bm.faces.ensure_lookup_table()
+    split = {}
+    for group in pieces(bm):
+        c = sum((f.calc_center_median() for f in group), Vector()) / len(group)
+        split.setdefault((c.x > 0, c.z > 0), set()).update(f.index for f in group)
     bm.free()
-    corners.setdefault((c.x > 0, c.z > 0), []).append(o)
+    for corner, faces in split.items():
+        corners.setdefault(corner, []).append((o, faces))
 if len(corners) != 4:
     raise SystemExit(f"expected wheel parts at four corners, found {sorted(corners)}")
 
@@ -279,10 +353,37 @@ def straighten(bm, mats):
     bm.normal_update()
     return math.degrees(axle.angle(Vector((1, 0, 0))))
 
+def mirror_wheel(bm):
+    """Add the wheel mirrored about its own centre plane (x = centre).
+
+    The donors share one wheel mesh per axle and turn it round for the left
+    side, so the game can show either face of a wheel. Game-ready wheels
+    often have no inner tyre wall or rim face; mirrored, both faces exist."""
+    c, _, _ = bm_center(bm)
+    uv = bm.loops.layers.uv.active
+    faces = list(bm.faces)
+    vmap = {}
+    for f in faces:
+        for v in f.verts:
+            if v not in vmap:
+                vmap[v] = bm.verts.new((2 * c.x - v.co.x, v.co.y, v.co.z))
+    for f in faces:
+        try:
+            nf = bm.faces.new([vmap[v] for v in reversed(f.verts)])
+        except ValueError:
+            continue
+        nf.material_index, nf.smooth = f.material_index, f.smooth
+        if uv:
+            for la, lb in zip(reversed(f.loops), nf.loops):
+                lb[uv].uv = la[uv].uv
+    bm.normal_update()
+
 for corner, objs in corners.items():
     bm, mats = merge(objs)
     bm = decimate(bm, recipe.get("wheel_tris", 6000))
     print("WHEEL", names[corner], "straightened by %.1f degrees" % straighten(bm, mats))
+    if recipe.get("symmetric_wheels", True):
+        mirror_wheel(bm)
     c, lo, hi = bm_center(bm)
     ground = lo.y if ground is None else min(ground, lo.y)
     built[corner] = (bm, mats, c)
@@ -292,6 +393,7 @@ front_z = sum(built[k][2].z for k in built if not k[1]) / 2
 rear_z = sum(built[k][2].z for k in built if k[1]) / 2
 mid_x = sum(built[k][2].x for k in built) / 4
 shift = Vector((-mid_x, -ground, -(front_z + rear_z) / 2))
+rear_line = rear_z + shift.z    # the rear axle, in shifted coordinates
 
 def shifted(bm):
     bmesh.ops.translate(bm, verts=bm.verts, vec=shift)
@@ -307,26 +409,59 @@ for corner, (bm, mats, c) in built.items():
 # --- body and lamp helpers ----------------------------------------------------
 body, body_mats = merge(parts["body"])
 shifted(body)
+
+def drop_faces_near(bm, mats, rules):
+    """[material regex, object regex, margin]: remove faces of that material
+    lying inside any connected piece of those objects (lens covers over lamp
+    clusters, when the covers share a material with the windows)."""
+    for mat_p, obj_p, margin in rules:
+        boxes = []
+        for o in parts["body"]:
+            if not re.search(obj_p, object_label(o), re.I):
+                continue
+            ref, _ = world_mesh(o)
+            bmesh.ops.translate(ref, verts=ref.verts, vec=shift)
+            for group in pieces(ref):
+                vs = [v.co for f in group for v in f.verts]
+                boxes.append((Vector([min(v[i] for v in vs) - margin for i in range(3)]),
+                              Vector([max(v[i] for v in vs) + margin for i in range(3)])))
+            ref.free()
+        ids = {i for i, m in enumerate(mats) if m and re.search(mat_p, m.name, re.I)}
+        gone = [f for f in bm.faces if f.material_index in ids and any(
+            all(lo[i] <= c[i] <= hi[i] for i in range(3))
+            for c in [f.calc_center_median()] for lo, hi in boxes)]
+        print("DROP", len(gone), "faces of", mat_p, "near", obj_p, "in", len(boxes), "pieces")
+        bmesh.ops.delete(bm, geom=gone, context="FACES")
+
+drop_faces_near(body, body_mats, recipe.get("drop_faces_near", []))
 body = decimate(body, recipe.get("body_tris", 30000))
 body.normal_update()
 meshes.insert(0, mesh_record("BODY_H", body, body_mats, Vector((0, 0, 0))))
 body.free()
 
-def lamps(patterns, rear):
+def lamps(patterns, rear, where):
+    """Faces of the lamp parts at one end; "where" ({"material": regex,
+    "below": height, "above": height}) narrows them to the lamp lenses."""
     objs = [o for o in parts["body"] if matches(object_label(o), patterns)]
     if not objs:
         return None
     bm, mats = merge(objs)
     shifted(bm)
-    keep = [f for f in bm.faces if (f.calc_center_median().z > 0) == rear]
+    def wanted(f):
+        c = f.calc_center_median()
+        m = mats[f.material_index] if f.material_index < len(mats) else None
+        return ((c.z > 0) == rear and c.y < where.get("below", 1e9) and c.y > where.get("above", -1e9)
+                and (not where.get("material") or (m and re.search(where["material"], m.name, re.I))))
+    keep = [f for f in bm.faces if wanted(f)]
     bmesh.ops.delete(bm, geom=[f for f in bm.faces if f not in keep], context="FACES")
     if not bm.faces:
         bm.free()
         return None
     return bm, mats
 
-for name, patterns, rear in (("HLIGHT_H", head_p, False), ("TLIGHT_H", tail_p, True)):
-    got = lamps(patterns, rear)
+for name, patterns, rear, where in (("HLIGHT_H", head_p, False, recipe.get("headlight_where", {})),
+                                   ("TLIGHT_H", tail_p, True, recipe.get("taillight_where", {}))):
+    got = lamps(patterns, rear, where)
     if got:
         bm, mats = got
         bm.normal_update()

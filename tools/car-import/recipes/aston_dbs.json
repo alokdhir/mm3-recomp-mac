@@ -1,0 +1,83 @@
+{
+  "_about": "2009 Aston Martin DBS by Galaxy Car Showroom, CC BY (sketchfab.com/3d-models/2009-aston-martin-dbs-aaef9c2b0b1a4af2815f30aa0893a00e). Unzip 2009-aston-martin-dbs.zip into ~/Downloads first.",
+  "source": "~/Downloads/2009-aston-martin-dbs/source/Aston Martin DBS.glb",
+  "name": "aston_martin_dbs_2009",
+  "forward": "-Y",
+  "scale": 1.0,
+  "drop": [
+    "Refracted",
+    "^\\S+ \\S+ Interior$"
+  ],
+  "wheel": [
+    "Rim Paint",
+    "Tires",
+    "Brakes"
+  ],
+  "headlight": [
+    "M_LightCluster_High "
+  ],
+  "taillight": [
+    "^M_GlassLights_High "
+  ],
+  "body_tris": 34000,
+  "wheel_tris": 6000,
+  "colors": {
+    "^Paint$": [
+      0.42,
+      0.43,
+      0.45
+    ],
+    "^Other$": [
+      0.68,
+      0.68,
+      0.7
+    ],
+    "^Tires$": [
+      0.07,
+      0.07,
+      0.07
+    ],
+    "^Smooth Plastic$": [
+      0.06,
+      0.06,
+      0.06
+    ],
+    "^Red Glass$": [
+      0.8,
+      0.04,
+      0.04,
+      1.0
+    ]
+  },
+  "hero_metallic": [
+    "^Paint$"
+  ],
+  "solid_textures": [
+    "^Tires$",
+    "^Rim Paint$",
+    "^Brakes$"
+  ],
+  "drop_faces_near": [
+    [
+      "^Material\\.002$",
+      "^M_LightCluster_High ",
+      0.04
+    ]
+  ],
+  "rear_colors": {
+    "^Material\\.002$": {
+      "color": [
+        0.78,
+        0.05,
+        0.05,
+        1.0
+      ],
+      "below": 0.9
+    }
+  },
+  "taillight_where": {
+    "material": "^Material\\.002$",
+    "below": 0.9,
+    "above": 0.5
+  }
+}
