@@ -453,6 +453,23 @@ index 91ec457..fa6bc9e 100644
      }
  }
 +#endif /* _WIN32 */
+diff --git a/src/mm3_custom_car_names.c b/src/mm3_custom_car_names.c
+index e950122..9c6fb06 100644
+--- a/src/mm3_custom_car_names.c
++++ b/src/mm3_custom_car_names.c
+@@ -24,9 +24,9 @@ static const struct {
+     { "SID_CAR_MF_9006", "Formula" },
+     { "SID_CAR_MODEL_9006", "1" },
+     { "SID_CAR_SHORT_9006", "Formula 1" },
+-    { "SID_CAR_MF_9009", "Ford" },
+-    { "SID_CAR_MODEL_9009", "GT" },
+-    { "SID_CAR_SHORT_9009", "Ford GT" },
++    { "SID_CAR_MF_9009", "Porsche" },
++    { "SID_CAR_MODEL_9009", "930 Turbo" },
++    { "SID_CAR_SHORT_9009", "Porsche 930 Turbo" },
+     { "SID_CAR_MF_9010", "McLaren" },
+     { "SID_CAR_MODEL_9010", "Senna" },
+     { "SID_CAR_SHORT_9010", "McLaren Senna" },
 diff --git a/src/mm3_recomp_types.h b/src/mm3_recomp_types.h
 index 6cfdcf2..4195253 100644
 --- a/src/mm3_recomp_types.h
@@ -809,3 +826,64 @@ index acdb9f0..faef753 100644
  #include <string.h>
  #include <windows.h>
  
+diff --git a/tools/car-mods/cars.imported.json b/tools/car-mods/cars.imported.json
+index ecb589b..b267481 100644
+--- a/tools/car-mods/cars.imported.json
++++ b/tools/car-mods/cars.imported.json
+@@ -100,7 +100,7 @@
+       "id": 9009,
+       "alias": "Ford_GTcar",
+       "donor": "Koenigsegg",
+-      "display_name": "Ford GT",
++      "display_name": "Porsche 930 Turbo",
+       "ratings": {
+         "TOPSPEED": 8,
+         "ACCELERATION": 8,
+diff --git a/tools/car-mods/cars.json b/tools/car-mods/cars.json
+index b9526f6..88627d9 100644
+--- a/tools/car-mods/cars.json
++++ b/tools/car-mods/cars.json
+@@ -97,7 +97,7 @@
+       "id": 9009,
+       "alias": "Ford_GTcar",
+       "donor": "Koenigsegg",
+-      "display_name": "Ford GT",
++      "display_name": "Porsche 930 Turbo",
+       "ratings": {
+         "TOPSPEED": 8,
+         "ACCELERATION": 8,
+diff --git a/tools/car-mods/prepare.py b/tools/car-mods/prepare.py
+index d3208b1..7a1f0d4 100644
+--- a/tools/car-mods/prepare.py
++++ b/tools/car-mods/prepare.py
+@@ -75,7 +75,7 @@ IDENTITIES = {
+     9004: ("Panoz", "Viper", "Panoz GTR-1"),
+     9005: ("McLaren_F1", "Koenigsegg", "McLaren F1"),
+     9006: ("Form1", "Lotus", "Formula 1"),
+-    9009: ("Ford_GTcar", "Koenigsegg", "Ford GT"),
++    9009: ("Ford_GTcar", "Koenigsegg", "Porsche 930 Turbo"),
+     9010: ("Senna_Road", "Koenigsegg", "McLaren Senna"),
+     9011: ("Senna_GTR1", "Koenigsegg", "McLaren Senna GTR"),
+     9012: ("FXXK_Racer", "Koenigsegg", "Ferrari FXX K"),
+@@ -108,7 +108,9 @@ def load_config(path: Path) -> dict:
+     seen_ids, seen_aliases = set(), set()
+     for car in config["cars"]:
+         required = {"id", "alias", "donor", "display_name", "ratings", "physics", "colors"}
+-        exact_keys(car, required | {"speedometer", "model_package", "engine_profile"}, "car")
++        exact_keys(car, required | {"speedometer", "model_package", "engine_profile", "hidden"}, "car")
++        if not isinstance(car.get("hidden", False), bool):
++            raise ValueError("hidden must be true or false")
+         if not required <= set(car):
+             raise ValueError("Each car requires id, alias, donor, display_name, ratings, physics, colors")
+         ident = car["id"]
+@@ -327,6 +329,10 @@ def tweak_variant(original: bytes, car: dict) -> bytes:
+     info = {"ID": car["id"], **car["ratings"], "PAINTJOBNAME": car["alias"]}
+     text = update_section(text, "CarInfo", info, {"LOCKED", "HIDDEN", "ADMITTANCE", "SKIN", "COLOR"})
+     colors = "".join(f"\tCOLOR\t\t{i} 0x{c[1:]} 0x{c[1:]}\r\n" for i, c in enumerate(car["colors"]))
++    # A hidden car is left out of the menus the way retail hides its unused
++    # cars: locked, hidden and with no admittance to unlock it.
++    if car.get("hidden"):
++        colors += "\tHIDDEN\r\n\tLOCKED\r\n"
+     text = text.replace("End(CarInfo)", colors + "End(CarInfo)", 1)
+     physics = dict(car["physics"])
+     if "GearRatioVector" in physics:
