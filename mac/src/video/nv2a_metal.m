@@ -3613,6 +3613,12 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
                    (s_draw_bspline ? 4u : 0u);
     pc->clip_plane = st->clip_plane_mode;
     pc->other_input = st->other_stage_input;
+    {   /* MM3's water (Water.psh: a 2D ripple map, two dot products and a
+         * reflection into the sky's cube map) is drawn blue; see ps tint. */
+        static int tint = -1;
+        if (tint < 0) tint = !getenv("MM3_WATER_TINT") || atoi(getenv("MM3_WATER_TINT")) != 0;
+        pc->pad0 = tint && st->rc_seen && st->rc.stage_program == 0x64621u && st->tex[3].cube;
+    }
     pc->dot_map = st->dot_rgb_mapping;
     /* SET_FOG_COLOR keeps red in the low byte. */
     pc->fog_color[0] = (st->fog_color & 0xFF) / 255.0f;

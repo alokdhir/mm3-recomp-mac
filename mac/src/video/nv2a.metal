@@ -217,7 +217,7 @@ struct PSConsts {
     float4 cf0[8]; float4 cf1[8]; float4 fin_c0; float4 fin_c1;
     uint fin0; uint fin1; uint rc_control; uint stage_prog;
     uint alpha_func; uint alpha_ref; uint ps_flags; uint clip_plane;
-    uint other_input; uint dot_map; uint pad0; uint pad1;
+    uint other_input; uint dot_map; uint pad0; uint pad1;   /* pad0 1: water tint */
     uint4 tex_info[4];      /* x: bit0 alphakill, y: signed mask (filter>>28), z: tapbox,
                              * w: a volume (3D) texture is bound */
     float4 tex_scale[4];    /* xy multiply the coordinate (1/size for linear) */
@@ -599,6 +599,12 @@ static float4 shade(TEXARGS, constant PSConsts &pc, float4 ipos, float4 id0, flo
         } else o = R[12];
     }
     o = saturate(o);
+    if (pc.pad0 == 1u) {
+        /* The water (Water.psh) reflects a grey sky map: keep its light and
+         * shade, the ripples and highlights, in a cartoon blue. */
+        float l = dot(o.rgb, float3(0.299, 0.587, 0.114));
+        o.rgb = saturate(mix(o.rgb, l * float3(0.45, 0.85, 1.45), 0.8));
+    }
     cov = 0xFFFFFFFFu;
     /* Alpha test. On a multisampled target an inequality test becomes sample
      * coverage across the one-pixel band around its threshold, so cut-out
