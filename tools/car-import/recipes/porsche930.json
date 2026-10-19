@@ -1,0 +1,37 @@
+{
+  "_about": "Lionsharp Studios, FREE 1975 Porsche 911 (930) Turbo, CC BY (sketchfab.com/3d-models/free-1975-porsche-911-930-turbo-8568d9d14a994b9cae59499f0dbed21e). Unzip the download into ~/Downloads first.",
+  "source": "~/Downloads/1975-porsche-911-930-turbo/source/00001700071.glb",
+  "name": "porsche_930_turbo_lionsharp",
+  "forward": "-Y",
+  "drop": [
+    "coat\\.001",
+    "Material\\.001",
+    "wunderbaum",
+    "lights_refraction",
+    "^Object_49 ",
+    "^Object_76 "
+  ],
+  "wheel": [
+    "930_rim",
+    "930_tire"
+  ],
+  "headlight": [
+    "^Object_130 "
+  ],
+  "taillight": [
+    "^Object_132 "
+  ],
+  "body_tris": 30000,
+  "wheel_tris": 6000,
+  "scale": 0.885,
+  "colors": {
+    "^paint\\.001$": [
+      0.4,
+      0.4,
+      0.41
+    ]
+  },
+  "opaque_textures": [
+    "930_lights"
+  ]
+}
