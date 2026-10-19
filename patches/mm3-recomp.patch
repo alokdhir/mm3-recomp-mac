@@ -466,10 +466,10 @@ index 91ec457..fa6bc9e 100644
  }
 +#endif /* _WIN32 */
 diff --git a/src/mm3_custom_car_names.c b/src/mm3_custom_car_names.c
-index e950122..b61cb0a 100644
+index e950122..9bfa348 100644
 --- a/src/mm3_custom_car_names.c
 +++ b/src/mm3_custom_car_names.c
-@@ -24,15 +24,15 @@ static const struct {
+@@ -24,18 +24,18 @@ static const struct {
      { "SID_CAR_MF_9006", "Formula" },
      { "SID_CAR_MODEL_9006", "1" },
      { "SID_CAR_SHORT_9006", "Formula 1" },
@@ -482,6 +482,9 @@ index e950122..b61cb0a 100644
 -    { "SID_CAR_MF_9011", "McLaren" },
 -    { "SID_CAR_MODEL_9011", "Senna GTR" },
 -    { "SID_CAR_SHORT_9011", "McLaren Senna GTR" },
+-    { "SID_CAR_MF_9012", "Ferrari" },
+-    { "SID_CAR_MODEL_9012", "FXX K" },
+-    { "SID_CAR_SHORT_9012", "Ferrari FXX K" },
 +    { "SID_CAR_MF_9009", "Porsche" },
 +    { "SID_CAR_MODEL_9009", "930 Turbo" },
 +    { "SID_CAR_SHORT_9009", "Porsche 930 Turbo" },
@@ -491,9 +494,12 @@ index e950122..b61cb0a 100644
 +    { "SID_CAR_MF_9011", "Porsche" },
 +    { "SID_CAR_MODEL_9011", "911 GT3" },
 +    { "SID_CAR_SHORT_9011", "Porsche 911 GT3" },
-     { "SID_CAR_MF_9012", "Ferrari" },
-     { "SID_CAR_MODEL_9012", "FXX K" },
-     { "SID_CAR_SHORT_9012", "Ferrari FXX K" },
++    { "SID_CAR_MF_9012", "Porsche" },
++    { "SID_CAR_MODEL_9012", "930 Turbo Red" },
++    { "SID_CAR_SHORT_9012", "Porsche 930 Turbo Red" },
+     { "SID_CAR_MF_9013", "Koenigsegg" },
+     { "SID_CAR_MODEL_9013", "Regera" },
+     { "SID_CAR_SHORT_9013", "Koenigsegg Regera" },
 diff --git a/src/mm3_recomp_types.h b/src/mm3_recomp_types.h
 index 6cfdcf2..4195253 100644
 --- a/src/mm3_recomp_types.h
@@ -1094,7 +1100,7 @@ index 44b7009..90d4fa8 100644
              children.extend(extras)
          node.children = children
 diff --git a/tools/car-mods/cars.imported.json b/tools/car-mods/cars.imported.json
-index ecb589b..08c7c2f 100644
+index ecb589b..30f1387 100644
 --- a/tools/car-mods/cars.imported.json
 +++ b/tools/car-mods/cars.imported.json
 @@ -100,7 +100,7 @@
@@ -1124,8 +1130,17 @@ index ecb589b..08c7c2f 100644
        "ratings": {
          "TOPSPEED": 8,
          "ACCELERATION": 9,
+@@ -181,7 +181,7 @@
+       "id": 9012,
+       "alias": "FXXK_Racer",
+       "donor": "Koenigsegg",
+-      "display_name": "Ferrari FXX K",
++      "display_name": "Porsche 930 Turbo Red",
+       "ratings": {
+         "TOPSPEED": 8,
+         "ACCELERATION": 9,
 diff --git a/tools/car-mods/cars.json b/tools/car-mods/cars.json
-index b9526f6..2da9281 100644
+index b9526f6..755a1a2 100644
 --- a/tools/car-mods/cars.json
 +++ b/tools/car-mods/cars.json
 @@ -97,7 +97,7 @@
@@ -1155,23 +1170,34 @@ index b9526f6..2da9281 100644
        "ratings": {
          "TOPSPEED": 8,
          "ACCELERATION": 9,
+@@ -175,7 +175,7 @@
+       "id": 9012,
+       "alias": "FXXK_Racer",
+       "donor": "Koenigsegg",
+-      "display_name": "Ferrari FXX K",
++      "display_name": "Porsche 930 Turbo Red",
+       "ratings": {
+         "TOPSPEED": 8,
+         "ACCELERATION": 9,
 diff --git a/tools/car-mods/prepare.py b/tools/car-mods/prepare.py
-index d3208b1..98f0012 100644
+index d3208b1..c15003a 100644
 --- a/tools/car-mods/prepare.py
 +++ b/tools/car-mods/prepare.py
-@@ -75,9 +75,9 @@ IDENTITIES = {
+@@ -75,10 +75,10 @@ IDENTITIES = {
      9004: ("Panoz", "Viper", "Panoz GTR-1"),
      9005: ("McLaren_F1", "Koenigsegg", "McLaren F1"),
      9006: ("Form1", "Lotus", "Formula 1"),
 -    9009: ("Ford_GTcar", "Koenigsegg", "Ford GT"),
 -    9010: ("Senna_Road", "Koenigsegg", "McLaren Senna"),
 -    9011: ("Senna_GTR1", "Koenigsegg", "McLaren Senna GTR"),
+-    9012: ("FXXK_Racer", "Koenigsegg", "Ferrari FXX K"),
 +    9009: ("Ford_GTcar", "Koenigsegg", "Porsche 930 Turbo"),
 +    9010: ("Senna_Road", "Koenigsegg", "Aston Martin DBS"),
 +    9011: ("Senna_GTR1", "Koenigsegg", "Porsche 911 GT3"),
-     9012: ("FXXK_Racer", "Koenigsegg", "Ferrari FXX K"),
++    9012: ("FXXK_Racer", "Koenigsegg", "Porsche 930 Turbo Red"),
      9013: ("Regera_GT1", "Koenigsegg", "Koenigsegg Regera"),
      9014: ("AventadorX", "Koenigsegg", "Lamborghini Aventador"),
+ }
 @@ -108,7 +108,9 @@ def load_config(path: Path) -> dict:
      seen_ids, seen_aliases = set(), set()
      for car in config["cars"]:
