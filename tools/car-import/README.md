@@ -41,6 +41,23 @@ licence.
 | `colors` | material regex to display-value RGB, replacing that material's colour |
 | `opaque_textures` | material regexes whose texture alpha is dropped (detail stored under transparent texels) |
 | `body_tris`, `wheel_tris` | triangle budgets (the game copes with ~30k and ~6k) |
+| `solid_textures` | material regexes given a small texture of their colour (untextured wheel parts) |
+| `drop_faces_near` | `[material, object, margin]`: drop that material's faces inside pieces of those objects (lens covers sharing the windows' material) |
+| `rear_colors` | material regex to `{"tint": rgb}` or `{"color": rgba, "below": height}` for faces behind the rear axle (red tail-lamp lenses) |
+| `headlight_where`, `taillight_where` | `{"material", "below", "above"}`: narrow the lamp helpers to the lenses |
+| `symmetric_wheels` | default true: each wheel also gets a mirrored copy (the donors show the inside of a shared wheel mesh on the left) |
+| `hero_metallic` | material regexes rendered as metallic paint by `render_hero.py` |
+
+Use a Koenigsegg-donor slot: the Viper donor draws an imported car's driver-side wheels translucent.
+
+## Loading screen
+
+    Blender -b --factory-startup -P tools/car-import/render_hero.py -- recipe.json /tmp/hero.png
+    python tools/car-import/compose_loading.py /tmp/hero.png Default_Koenigsegg.tga Default_<alias>.tga
+
+`Default_Koenigsegg.tga` is the retail screen from `Data_dvd.zip` `LoadingScreens/`;
+add the result to the package's `package.json` as
+`{"archive": "Data_dvd.zip", "path": "LoadingScreens/Default_<alias>.tga", ...}`.
 
 Wheels modelled steered or cambered are straightened about their tyre's axle.
 Patterns match child object names (`Object_132`), not the parent empties
