@@ -879,10 +879,22 @@ index acdb9f0..faef753 100644
  #include <windows.h>
  
 diff --git a/tools/car-models/build_package.py b/tools/car-models/build_package.py
-index c8e1188..538fb66 100644
+index c8e1188..14a3c54 100644
 --- a/tools/car-models/build_package.py
 +++ b/tools/car-models/build_package.py
-@@ -188,12 +188,38 @@ def build(source_path: Path, output: Path, car_id: int, *, y_offset=None,
+@@ -164,7 +164,10 @@ def build(source_path: Path, output: Path, car_id: int, *, y_offset=None,
+             # MM3's transparent car pass shades glass separately and does not
+             # retain the imported surface RGB. Bake source alpha over a dark
+             # base for this first visual port, preserving banners and details.
+-            record['mode'] = 2
++            # Retail exterior details use mode 2; textured paint (the
++            # Koenigsegg's Lack_textur) is mode 0, drawn with the body
++            # rather than after it. A source material may say which.
++            record['mode'] = int(material.get('mode', 2))
+             textures.append((texture_path, texture_name))
+         else:
+             record['texture'], record['mode'] = 'No', 0
+@@ -188,12 +191,48 @@ def build(source_path: Path, output: Path, car_id: int, *, y_offset=None,
          target.write_bytes(blob)
          files.append(dict(archive=archive, path=path, source=source_name))
  
@@ -912,18 +924,28 @@ index c8e1188..538fb66 100644
 +            plate_texture = f'+Cars\\{alias}\\license_plate.dds'
 +        native_materials.append(dict(name='numberplate', texture=plate_texture,
 +                                     diffuse=[0, 0, 0, 255], mode=0))
++    # Windows split out as GLASS_H take a see-through material like the
++    # Koenigsegg's own "windows" record, in the donor's glass part.
++    glass_material = None
++    if any(mesh['name'] == 'GLASS_H' and mesh['triangles'] for mesh in source['meshes']):
++        if len(native_materials) >= 23:
++            raise ValueError('No material slot left for the windows')
++        glass_material = len(native_materials)
++        native_materials.append(dict(name='windows', texture=None, diffuse=[114, 127, 135, 89], mode=0))
++        material_shading[glass_material] = mm3_model.source_material_shading({'name': 'glass'})
      for suffix in ('', '_lod1'):
          template = alias_paths(data.read(f'cars/{donor}{suffix}/body.cmp'), donor, alias)
          blob, report = mm3_model.convert_exterior(template, source,
              material_map=mapping, body_names=body_names,
              source_transform=transform, flip_winding=True, keep_interior=False,
 -            material_shading=material_shading)
-+            material_shading=material_shading, plate_material=plate_material)
++            material_shading=material_shading, plate_material=plate_material,
++            glass_material=glass_material)
          blob, report['lights'] = mm3_lights.align_lights(blob, light_anchors,
                                                             source_transform=transform)
          asset('loose', f'Data/Shared/Cars/{alias}{suffix}/body.cmp', blob)
 diff --git a/tools/car-models/mm3_model.py b/tools/car-models/mm3_model.py
-index 44b7009..548f236 100644
+index 44b7009..90d4fa8 100644
 --- a/tools/car-models/mm3_model.py
 +++ b/tools/car-models/mm3_model.py
 @@ -425,6 +425,14 @@ def mesh_metadata(block: MeshBlock, version: int) -> dict:
@@ -941,18 +963,27 @@ index 44b7009..548f236 100644
  def remap_mesh_materials(block: MeshBlock, version: int,
                           material_map: Mapping[int, int]) -> MeshBlock:
      """Change retained interior material slots without changing its geometry."""
-@@ -661,7 +669,7 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+@@ -661,7 +669,8 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
                       source_transform=None, keep_interior=True,
                       flip_winding=True, specular=MATTE_VERTEX_SHADING,
                       material_palette_offsets=None,
 -                     material_shading=None) -> tuple[bytes, dict]:
-+                     material_shading=None, plate_material=None) -> tuple[bytes, dict]:
++                     material_shading=None, plate_material=None,
++                     glass_material=None) -> tuple[bytes, dict]:
      """Replace body/wheels in a donor. Returns bytes and a conversion report.
  
      Visible meshes receive the imported geometry; a closed convex stencil proxy
-@@ -705,7 +713,12 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+@@ -704,8 +713,20 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+     geometry_parts = {"body": split_mesh_geometry(*body)}
      geometry_parts.update({name: split_mesh_geometry(*global_meshes[source_name][:4])
                             for name, source_name in wheel_names.items()})
++    # GLASS_H, with glass_material: the windows go into the donor's own
++    # glass_windows part, drawn in the game's see-through car glass pass.
++    glass_map = {}
++    if glass_material is not None and "GLASS_H" in source_meshes and source_meshes["GLASS_H"]["triangles"]:
++        gp, gn, guv, gtri, _ = _neutral_world(source_meshes["GLASS_H"], transform)
++        glass_map = {int(m): int(glass_material) for m in np.unique(gtri[:, 3])}
++        geometry_parts["glass"] = split_mesh_geometry(gp, gn, guv, gtri)
      all_positions = np.concatenate([body[0]] + [global_meshes[n][0] for n in wheel_names.values()])
 -    report = dict(version=model.version, replaced=[], hidden=[], retained=[], shadows=[],
 +    # "plates": {"back": [x, y, z]} in the source's coordinates: keep the
@@ -964,7 +995,7 @@ index 44b7009..548f236 100644
                    split_meshes=[], wheel_pivots={}, bounds_min=all_positions.min(0).tolist(),
                    bounds_max=all_positions.max(0).tolist())
      found_body, found_wheels = False, set()
-@@ -717,7 +730,17 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+@@ -717,7 +738,17 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
      if shadow_template is None:
          raise FormatError("Donor has no native stencil shadow template")
  
@@ -983,7 +1014,7 @@ index 44b7009..548f236 100644
          nonlocal found_body
          siblings = []
          path += "/" + node.name
-@@ -729,6 +752,15 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+@@ -729,6 +760,15 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
              node.set_translation(pivot, relative_pivot)
              current_matrix = parent_matrix @ node.relative_matrix()
              report["wheel_pivots"][wheel] = pivot.tolist()
@@ -999,7 +1030,7 @@ index 44b7009..548f236 100644
          if node.kind == 1 and (node.name.lower() in ("car", "body") or node.name in wheel_names):
              points = (global_meshes[wheel_names[node.name]][0] if node.name in wheel_names
                        else body[0] if node.name.lower() == "body" else all_positions)
-@@ -738,9 +770,15 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+@@ -738,9 +778,15 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
          if node.kind in (2, 6):
              if not node.meshes:
                  return []
@@ -1016,7 +1047,38 @@ index 44b7009..548f236 100644
                  if interior_material_map:
                      node.meshes = [remap_mesh_materials(block, model.version, interior_material_map)
                                     if block.payload else block for block in node.meshes]
-@@ -812,7 +850,7 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+@@ -751,6 +797,9 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+                 elif "/body/" in path.lower():
+                     parts = geometry_parts["body"]
+                     found_body = True
++                elif "glass" in geometry_parts and "glass_windows" in path.lower():
++                    parts = geometry_parts["glass"]
++                    report["replaced"].append(path)
+                 else:
+                     p = np.zeros((3, 3)); n = np.tile((0, 1, 0), (3, 1))
+                     uv = np.zeros((3, 2)); tri = np.array([[0, 1, 2, 0]])
+@@ -790,10 +839,11 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+                         name = f"mm3import_{target.name}_{wheel or 'body'}_{suffix}.dob"
+                         if directory:
+                             name = directory + "\\" + name
++                        glass = "glass_windows" in path.lower() and "glass" in geometry_parts
+                         if shadow:
+                             complete = (global_meshes[wheel_names[wheel]][0] if wheel else body[0])
+                             shadowp = ((complete - current_matrix[:3, 3]) @
+-                                       np.linalg.inv(current_matrix[:3, :3]).T) if part_index == 0 else []
++                                       np.linalg.inv(current_matrix[:3, :3]).T) if part_index == 0 and not glass else []
+                             block = encode_shadow_mesh(name, shadowp, localn, tri,
+                                 original_mesh, model.version, flip_winding=flip_winding)
+                             new_meshes.append(block)
+@@ -805,14 +855,14 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+                                 vertices=mesh_metadata(block, model.version)["vertex_count"]))
+                         else:
+                             new_meshes.append(encode_mesh(name, localp, localn, uv, tri,
+-                                material_map, donor_block, model.version,
++                                glass_map if glass else material_map, donor_block, model.version,
+                                 specular=specular, flip_winding=flip_winding,
+                                 material_palette_offsets=material_palette_offsets,
+                                 material_shading=material_shading))
                      target.meshes = new_meshes
          children = []
          for child in node.children:
