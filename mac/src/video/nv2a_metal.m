@@ -3198,9 +3198,15 @@ static uint32_t s_bspline_sf, s_bspline_df;
 extern const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *version))[4];
 extern const float (*nv2a_vsh_constants(uint32_t *version))[4];
 
+/* The title asks for lamp glows to be tested against scene depth as on
+ * D3D11, but here that test hides every lamp glow (car lights, street lamps,
+ * indicators). Their own occluder taps of the frame's alpha (Flares.psh,
+ * averaged over the guest pixel by tapbox) decide visibility correctly, so
+ * the depth test stays off unless MM3_FLARE_DEPTH=1. */
 void nv2a_d3d_set_flare_depth_test(int on)
 {
-    s_flare_depth_test = on != 0;
+    const char *e = getenv("MM3_FLARE_DEPTH");
+    s_flare_depth_test = on != 0 && e && atoi(e) != 0;
 }
 
 static int flare_needs_depth(const NvD3DState *st)
