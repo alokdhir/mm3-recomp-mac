@@ -1,0 +1,52 @@
+{
+  "_about": "2022 Porsche 911 GT3 (992) by Ddiaz Design, CC BY-NC-SA (sketchfab.com/3d-models/2022-porsche-911-gt3-992-ba01afbaf32846e598db315be3507db3; the author credits the CSR2 game and GM25). Personal use: unzip 2022-porsche-911-gt3-992.zip and its source/FINAL_MODEL (2).zip into ~/Downloads/2022-porsche-911-gt3-992/.",
+  "source": "~/Downloads/2022-porsche-911-gt3-992/FINAL_MODEL.fbx",
+  "name": "porsche_911_gt3_992",
+  "forward": "-Y",
+  "scale": 100.0,
+  "drop": [
+    "ManufacturerPlateA"
+  ],
+  "wheel": [
+    "Wheel1A_3D"
+  ],
+  "headlight": [
+    "^Kit0_Light_Geo_lodA "
+  ],
+  "taillight": [
+    "RED_GLASS"
+  ],
+  "glass": [
+    "Window_Material"
+  ],
+  "object_tris": {
+    "Interior_Geo": 6000
+  },
+  "body_tris": 34000,
+  "wheel_tris": 6000,
+  "colors": {
+    "Paint_Material$": [
+      0.09,
+      0.33,
+      0.58
+    ],
+    "^RED_GLASS$": [
+      0.75,
+      0.03,
+      0.03,
+      1.0
+    ]
+  },
+  "bake_ao": [
+    "Paint_Material$"
+  ],
+  "hero_metallic": [
+    "Paint_Material$"
+  ],
+  "rear_plate": [
+    0.0,
+    0.48,
+    2.26
+  ],
+  "plate_backing": true
+}

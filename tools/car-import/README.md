@@ -40,6 +40,7 @@ licence.
 | `headlight`, `taillight` | regexes for lamp parts; their centres place the game's lights |
 | `colors` | material regex to display-value RGB, replacing that material's colour |
 | `opaque_textures` | material regexes whose texture alpha is dropped, or `{regex: rgb}` to lay transparent texels over that colour (lamp lenses over a chrome reflector) |
+| `object_tris` | object regex to a triangle budget for that part alone, before the body budget (a 63k-triangle interior) |
 | `body_tris`, `wheel_tris` | triangle budgets (the game copes with ~30k and ~6k) |
 | `solid_textures` | material regexes given a small texture of their colour (untextured wheel parts) |
 | `drop_faces_near` | `[material, object, margin]`: drop that material's faces inside pieces of those objects (lens covers sharing the windows' material) |

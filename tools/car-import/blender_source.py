@@ -100,6 +100,10 @@ def merge(objs):
     for item in objs:
         o, only = item if isinstance(item, tuple) else (item, None)
         bm, mats = world_mesh(o)
+        for pattern, target in recipe.get("object_tris", {}).items():
+            if only is None and re.search(pattern, object_label(o), re.I):
+                bm = decimate(bm, target)     # its own budget (a dense interior)
+                break
         if only is not None:
             bm.faces.ensure_lookup_table()
             gone = [f for f in bm.faces if f.index not in only]
@@ -396,6 +400,9 @@ def straighten(bm, mats):
     axle = Vector(vecs[:, 0])
     if axle.x < 0:
         axle = -axle
+    angle = math.degrees(axle.angle(Vector((1, 0, 0))))
+    if angle < recipe.get("straighten_min_degrees", 5.0):
+        return 0.0                       # rim detail, not a steered wheel
     turn = axle.rotation_difference(Vector((1, 0, 0))).to_matrix().to_4x4()
     about = Matrix.Translation(Vector(centre)) @ turn @ Matrix.Translation(-Vector(centre))
     bm.transform(about)

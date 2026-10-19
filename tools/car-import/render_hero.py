@@ -32,6 +32,15 @@ for o in list(sc.objects):
     if any(re.search(p, label, re.I) for p in recipe.get("drop", [])):
         bpy.data.objects.remove(o)
 
+# The recipe's scale (a model authored in centimetres), applied to the roots.
+scale = recipe.get("scale", 1.0)
+if scale != 1.0:
+    for o in sc.objects:
+        if o.parent is None:
+            o.scale = [x * scale for x in o.scale]
+            o.location = [x * scale for x in o.location]
+    bpy.context.view_layer.update()
+
 def linear(c):
     return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
 
