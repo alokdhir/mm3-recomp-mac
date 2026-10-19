@@ -878,6 +878,153 @@ index acdb9f0..faef753 100644
  #include <string.h>
  #include <windows.h>
  
+diff --git a/tools/car-models/build_package.py b/tools/car-models/build_package.py
+index c8e1188..538fb66 100644
+--- a/tools/car-models/build_package.py
++++ b/tools/car-models/build_package.py
+@@ -188,12 +188,38 @@ def build(source_path: Path, output: Path, car_id: int, *, y_offset=None,
+         target.write_bytes(blob)
+         files.append(dict(archive=archive, path=path, source=source_name))
+ 
++    # The game draws the player's plate text with its own numberplate
++    # material (+Cars\license.dds); a rear plate needs that record too.
++    plate_material = None
++    if source.get('plates'):
++        if len(native_materials) >= 23:
++            raise ValueError('No material slot left for the number plate')
++        plate_material = len(native_materials)
++        tint = source['plates'].get('color')
++        plate_texture = '+Cars\\license.dds'
++        if tint:
++            # The plate draws its characters from the game's font atlas
++            # (black glyphs on white, a blank cell for the background); a
++            # copy with white turned to the plate colour, in this car's folder.
++            import mm3view
++            atlas = mm3view.load_image('Cars/License.cdds', data.read('Cars/License.cdds')).convert('RGB')
++            px = np.asarray(atlas, dtype=float) / 255
++            light = px.mean(axis=2, keepdims=True)
++            coloured = Image.fromarray(np.uint8(np.clip(light * np.asarray(tint[:3]) * 255, 0, 255)))
++            plate_path = output / 'baked-textures' / 'license_plate.png'
++            plate_path.parent.mkdir(parents=True, exist_ok=True)
++            coloured.save(plate_path)
++            asset('Data_dvd.zip', f'Cars/{alias}/license_plate.cdds',
++                  mm3_textures.image_to_cdds(plate_path, max_size=128))
++            plate_texture = f'+Cars\\{alias}\\license_plate.dds'
++        native_materials.append(dict(name='numberplate', texture=plate_texture,
++                                     diffuse=[0, 0, 0, 255], mode=0))
+     for suffix in ('', '_lod1'):
+         template = alias_paths(data.read(f'cars/{donor}{suffix}/body.cmp'), donor, alias)
+         blob, report = mm3_model.convert_exterior(template, source,
+             material_map=mapping, body_names=body_names,
+             source_transform=transform, flip_winding=True, keep_interior=False,
+-            material_shading=material_shading)
++            material_shading=material_shading, plate_material=plate_material)
+         blob, report['lights'] = mm3_lights.align_lights(blob, light_anchors,
+                                                            source_transform=transform)
+         asset('loose', f'Data/Shared/Cars/{alias}{suffix}/body.cmp', blob)
+diff --git a/tools/car-models/mm3_model.py b/tools/car-models/mm3_model.py
+index 44b7009..548f236 100644
+--- a/tools/car-models/mm3_model.py
++++ b/tools/car-models/mm3_model.py
+@@ -425,6 +425,14 @@ def mesh_metadata(block: MeshBlock, version: int) -> dict:
+                 vertex_count=vertex_count, material_offsets=material_offsets)
+ 
+ 
++def _all_materials_to(block: MeshBlock, version: int, slot: int) -> dict:
++    """A material map sending every material the mesh uses to one slot."""
++    meta = mesh_metadata(block, version)
++    used = {struct.unpack_from("<I", block.payload, o)[0] for o in meta["material_offsets"]}
++    used |= {block.payload[meta["vertex_offset"] + i * 24 + 12] // 11 for i in range(meta["vertex_count"])}
++    return {m: slot for m in used}
++
++
+ def remap_mesh_materials(block: MeshBlock, version: int,
+                          material_map: Mapping[int, int]) -> MeshBlock:
+     """Change retained interior material slots without changing its geometry."""
+@@ -661,7 +669,7 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+                      source_transform=None, keep_interior=True,
+                      flip_winding=True, specular=MATTE_VERTEX_SHADING,
+                      material_palette_offsets=None,
+-                     material_shading=None) -> tuple[bytes, dict]:
++                     material_shading=None, plate_material=None) -> tuple[bytes, dict]:
+     """Replace body/wheels in a donor. Returns bytes and a conversion report.
+ 
+     Visible meshes receive the imported geometry; a closed convex stencil proxy
+@@ -705,7 +713,12 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+     geometry_parts.update({name: split_mesh_geometry(*global_meshes[source_name][:4])
+                            for name, source_name in wheel_names.items()})
+     all_positions = np.concatenate([body[0]] + [global_meshes[n][0] for n in wheel_names.values()])
+-    report = dict(version=model.version, replaced=[], hidden=[], retained=[], shadows=[],
++    # "plates": {"back": [x, y, z]} in the source's coordinates: keep the
++    # donor's rear number plate (the game draws the player's plate text on
++    # it) and move it there. Front plates stay hidden.
++    plates = {key: (transform @ np.append(np.asarray(point, dtype=float), 1.0))[:3]
++              for key, point in (source.get("plates") or {}).items() if key == "back"}
++    report = dict(version=model.version, replaced=[], hidden=[], retained=[], shadows=[], plates={},
+                   split_meshes=[], wheel_pivots={}, bounds_min=all_positions.min(0).tolist(),
+                   bounds_max=all_positions.max(0).tolist())
+     found_body, found_wheels = False, set()
+@@ -717,7 +730,17 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+     if shadow_template is None:
+         raise FormatError("Donor has no native stencil shadow template")
+ 
+-    def visit(node: Node, parent_matrix: np.ndarray, path: str, wheel=None):
++    def plate_centre(node: Node) -> np.ndarray | None:
++        """The centre of a plate node's first mesh, in the node's frame."""
++        for child in node.children:
++            for block in child.meshes:
++                if block.payload and len(block.payload) >= 28:
++                    b = native_bounds(np.array(struct.unpack_from("<6f", block.payload, 4)).reshape(2, 3))
++                    centre = np.append(b.mean(0), 1.0)
++                    return (child.relative_matrix() @ centre)[:3]
++        return None
++
++    def visit(node: Node, parent_matrix: np.ndarray, path: str, wheel=None, plate=False):
+         nonlocal found_body
+         siblings = []
+         path += "/" + node.name
+@@ -729,6 +752,15 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+             node.set_translation(pivot, relative_pivot)
+             current_matrix = parent_matrix @ node.relative_matrix()
+             report["wheel_pivots"][wheel] = pivot.tolist()
++        if node.kind == 1 and node.name.lower() == "backnumber" and "back" in plates:
++            local = plate_centre(node)
++            if local is not None:
++                now = (current_matrix @ np.append(local, 1.0))[:3]
++                world = current_matrix[:3, 3] + (plates["back"] - now)
++                node.set_translation(world, np.linalg.solve(parent_matrix[:3, :3], world - parent_matrix[:3, 3]))
++                current_matrix = parent_matrix @ node.relative_matrix()
++                report["plates"]["back"] = plates["back"].tolist()
++                plate = True
+         if node.kind == 1 and (node.name.lower() in ("car", "body") or node.name in wheel_names):
+             points = (global_meshes[wheel_names[node.name]][0] if node.name in wheel_names
+                       else body[0] if node.name.lower() == "body" else all_positions)
+@@ -738,9 +770,15 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+         if node.kind in (2, 6):
+             if not node.meshes:
+                 return []
+-            retained = keep_interior and "lowdash" in path.lower()
++            retained = (keep_interior and "lowdash" in path.lower()) or plate
+             if retained:
+                 report["retained"].append(path)
++                if plate and plate_material is not None:
++                    # The donor's plate material is appended to the imported
++                    # set at plate_material; point every plate face there.
++                    node.meshes = [remap_mesh_materials(block, model.version,
++                                                        _all_materials_to(block, model.version, plate_material))
++                                   if block.payload else block for block in node.meshes]
+                 if interior_material_map:
+                     node.meshes = [remap_mesh_materials(block, model.version, interior_material_map)
+                                    if block.payload else block for block in node.meshes]
+@@ -812,7 +850,7 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+                     target.meshes = new_meshes
+         children = []
+         for child in node.children:
+-            extras = visit(child, current_matrix, path, wheel)
++            extras = visit(child, current_matrix, path, wheel, plate)
+             children.append(child)
+             children.extend(extras)
+         node.children = children
 diff --git a/tools/car-mods/cars.imported.json b/tools/car-mods/cars.imported.json
 index ecb589b..65863cc 100644
 --- a/tools/car-mods/cars.imported.json
