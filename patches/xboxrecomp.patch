@@ -122,7 +122,7 @@ index 58a5053..46f2cf5 100644
          /* Let the guest in once per frame.
           *
 diff --git a/src/apu/apu_mmio_hook.c b/src/apu/apu_mmio_hook.c
-index 46cc2c5..97bfa45 100644
+index 46cc2c5..383ff90 100644
 --- a/src/apu/apu_mmio_hook.c
 +++ b/src/apu/apu_mmio_hook.c
 @@ -18,8 +18,11 @@ MCPXAPUState *g_apu_state = NULL;
@@ -183,7 +183,7 @@ index 46cc2c5..97bfa45 100644
  /* ============================================================
   * Public API (called from VEH in main.c)
   * ============================================================ */
-@@ -280,3 +315,33 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+@@ -280,3 +315,45 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
  }
  
  #endif /* _WIN32 */
@@ -198,9 +198,21 @@ index 46cc2c5..97bfa45 100644
 + * thousands of times a second). Fenced like the trap, which orders the access
 + * against everything around it. 0 when the APU is off: the caller then makes
 + * the plain access, which faults as before. */
++/* Off unless RECOMP_APU_DIRECT=1: every access then takes the fault path.
++ * With the direct path MM3 loses sound effects partway through a race
++ * (its voice lists briefly loop and DirectSound stops starting voices);
++ * through the fault path, races keep their sound. Why the timing matters
++ * is not yet understood, so the slower path is the default. */
++static int apu_direct_off(void)
++{
++    static int off = -1;
++    if (off < 0) off = !(getenv("RECOMP_APU_DIRECT") && atoi(getenv("RECOMP_APU_DIRECT")) != 0);
++    return off;
++}
++
 +int xbox_ApuDirectRead(uint32_t va, unsigned size, uint64_t *out)
 +{
-+    if (!g_apu_state) return 0;
++    if (!g_apu_state || apu_direct_off()) return 0;
 +    __atomic_thread_fence(__ATOMIC_SEQ_CST);
 +    *out = mcpx_apu_mmio_read(g_apu_state, va - APU_MMIO_BASE, size);
 +    __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -210,7 +222,7 @@ index 46cc2c5..97bfa45 100644
 +
 +int xbox_ApuDirectWrite(uint32_t va, uint64_t value, unsigned size)
 +{
-+    if (!g_apu_state) return 0;
++    if (!g_apu_state || apu_direct_off()) return 0;
 +    __atomic_thread_fence(__ATOMIC_SEQ_CST);
 +    mcpx_apu_mmio_write(g_apu_state, va - APU_MMIO_BASE, value, size);
 +    __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -231,7 +243,7 @@ index a647924..73fdb7f 100644
  /* DSP functions */
  void mcpx_apu_dsp_init(MCPXAPUState *d);
 diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
-index d3c5a7a..cfb9aeb 100644
+index d3c5a7a..39d07e5 100644
 --- a/src/apu/apu_vp.c
 +++ b/src/apu/apu_vp.c
 @@ -48,6 +48,66 @@ static const struct {
@@ -333,7 +345,7 @@ index d3c5a7a..cfb9aeb 100644
          }
          break;
  
-@@ -625,8 +689,52 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
+@@ -625,8 +689,84 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
      MCPXAPUState *d = (MCPXAPUState *)opaque;
      (void)size;
  
@@ -376,6 +388,38 @@ index d3c5a7a..cfb9aeb 100644
 +                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
 +        }
 +    }
++    {   /* Sound starts stopped while voices stay listed, or a list loops:
++         * name each listed voice once (bounded per session). */
++        static unsigned quiet, dumps;
++        quiet = s_fe_count.on == 0 && (len[0] || len[2]) ? quiet + 1 : 0;
++        if (dumps < 6 && (quiet == 2 || len[0] == MCPX_HW_MAX_VOICES ||
++                          len[2] == MCPX_HW_MAX_VOICES)) {
++            static const char *const names[3] = { "2D", "3D", "MP" };
++            dumps++;
++            for (int list = 0; list < 3; list++) {
++                uint8_t seen[MCPX_HW_MAX_VOICES / 8] = { 0 };
++                uint32_t v = d->regs[voice_list_regs[list].top];
++                unsigned n = 0;
++                while (v != 0xFFFF && n < 64) {
++                    uint32_t next = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_TAR_PITCH_LINK,
++                                                   NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
++                    int again = v < MCPX_HW_MAX_VOICES && (seen[v / 8] >> (v % 8) & 1);
++                    fprintf(stderr, "[APU_STUCK] %s v%03X next %04X fmt %08X state %08X"
++                            " cbo %06X ebo %06X lbo %06X ba %06X%s\n", names[list], v, next,
++                            voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu),
++                            voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFFu),
++                            voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
++                            voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
++                            voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CUR_PSH_SAMPLE, NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO),
++                            voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CUR_PSL_START, NV_PAVS_VOICE_CUR_PSL_START_BA),
++                            again ? "  (seen: loop)" : "");
++                    if (again || v >= MCPX_HW_MAX_VOICES) break;
++                    seen[v / 8] |= (uint8_t)(1u << (v % 8));
++                    v = next; n++;
++                }
++            }
++        }
++    }
 +    qemu_mutex_lock(&s_fe_lock);
 +    fprintf(stderr, "[APU_VOICES] lists 2D %u 3D %u MP %u | on %u off %u release %u"
 +            " idle-traps %u irqs %u | waited %u overflow %u queued %u\n",
@@ -388,7 +432,7 @@ index d3c5a7a..cfb9aeb 100644
  }
  
  /* ============================================================
-@@ -1320,7 +1428,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+@@ -1320,7 +1460,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
  
              if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                  NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
@@ -401,7 +445,7 @@ index d3c5a7a..cfb9aeb 100644
              } else {
                  /* Process voice directly (single-threaded) */
                  voice_spin_lock(d, v);
-@@ -1359,6 +1471,7 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
+@@ -1359,6 +1503,7 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
       * Keeping the table in the APU avoids lazy-init races and shared state. */
      d->vp.attenuation_rounding = -2;
      prepare_attenuation(d);
