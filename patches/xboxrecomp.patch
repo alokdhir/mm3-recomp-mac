@@ -243,7 +243,7 @@ index a647924..73fdb7f 100644
  /* DSP functions */
  void mcpx_apu_dsp_init(MCPXAPUState *d);
 diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
-index d3c5a7a..39d07e5 100644
+index d3c5a7a..abe4917 100644
 --- a/src/apu/apu_vp.c
 +++ b/src/apu/apu_vp.c
 @@ -48,6 +48,66 @@ static const struct {
@@ -345,7 +345,7 @@ index d3c5a7a..39d07e5 100644
          }
          break;
  
-@@ -625,8 +689,84 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
+@@ -625,8 +689,99 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
      MCPXAPUState *d = (MCPXAPUState *)opaque;
      (void)size;
  
@@ -374,6 +374,8 @@ index d3c5a7a..39d07e5 100644
 +/* Every ~5 s of audio: what the front end did since the last report and how
 + * many voices each list holds, so a leak shows as starts with no stops.
 + * Returns whether it reported (irqs, the caller's count, then starts over). */
++extern unsigned long long g_dsp_report_interp[2], g_dsp_report_recomp[2];
++
 +bool mcpx_apu_vp_report(MCPXAPUState *d, unsigned irqs)
 +{
 +    static int next = 48000 / NUM_SAMPLES_PER_FRAME * 5;
@@ -426,13 +428,51 @@ index d3c5a7a..39d07e5 100644
 +            len[0], len[1], len[2], s_fe_count.on, s_fe_count.off,
 +            s_fe_count.release, s_fe_count.idle_traps, irqs,
 +            s_fe_count.deferred, s_fe_count.overflow, s_fe_queued);
++    {   /* How long these 5 s of audio took, and how much DSP work ran in the
++         * interpreter: a report much slower than 5 s is sound played slow. */
++        static ULONGLONG last;
++        ULONGLONG now = GetTickCount64();
++        double took = last ? (now - last) / 1000.0 : 0;
++        last = now;
++        fprintf(stderr, "[APU_PACE] 5 s of audio in %.2f s | DSP interpreted GP %.0f%% EP %.0f%%\n", took,
++                100.0 * g_dsp_report_interp[0] / (double)(g_dsp_report_interp[0] + g_dsp_report_recomp[0] + 1),
++                100.0 * g_dsp_report_interp[1] / (double)(g_dsp_report_interp[1] + g_dsp_report_recomp[1] + 1));
++        memset(g_dsp_report_interp, 0, sizeof g_dsp_report_interp);
++        memset(g_dsp_report_recomp, 0, sizeof g_dsp_report_recomp);
++        fflush(stderr);
++    }
 +    memset(&s_fe_count, 0, sizeof s_fe_count);
 +    qemu_mutex_unlock(&s_fe_lock);
 +    return true;
  }
  
  /* ============================================================
-@@ -1320,7 +1460,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+@@ -1307,20 +1462,35 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+         next = voice_list_regs[list].next;
+ 
+         d->regs[current] = d->regs[top];
++        uint64_t seen[MCPX_HW_MAX_VOICES / 64] = { 0 };
+ 
+         for (int i = 0; d->regs[current] != 0xFFFF; i++) {
+-            if (i >= MCPX_HW_MAX_VOICES) {
++            if (i >= MCPX_HW_MAX_VOICES || d->regs[current] >= MCPX_HW_MAX_VOICES) {
+                 DPRINTF("Voice list contains invalid entry!\n");
+                 break;
+             }
+ 
+             uint16_t v = (uint16_t)d->regs[current];
++            /* A voice linked twice makes the list a loop; walking it would
++             * play its voices over and over in one frame. Stop at the repeat. */
++            if (seen[v / 64] >> (v % 64) & 1) {
++                static unsigned noted;
++                if (noted++ < 8)
++                    fprintf(stderr, "[APU] %s voice list loops at voice %03X\n",
++                            list == 0 ? "2D" : list == 1 ? "3D" : "MP", v);
++                break;
++            }
++            seen[v / 64] |= 1ull << (v % 64);
+             d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
  
              if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                  NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
@@ -445,7 +485,7 @@ index d3c5a7a..39d07e5 100644
              } else {
                  /* Process voice directly (single-threaded) */
                  voice_spin_lock(d, v);
-@@ -1359,6 +1503,7 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
+@@ -1359,6 +1529,7 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
       * Keeping the table in the APU avoids lazy-init races and shared state. */
      d->vp.attenuation_rounding = -2;
      prepare_attenuation(d);
@@ -454,10 +494,19 @@ index d3c5a7a..39d07e5 100644
  
  void mcpx_apu_vp_finalize(MCPXAPUState *d)
 diff --git a/src/apu/dsp/dsp.c b/src/apu/dsp/dsp.c
-index 5da7653..474aa3b 100644
+index 5da7653..c7f0b6b 100644
 --- a/src/apu/dsp/dsp.c
 +++ b/src/apu/dsp/dsp.c
-@@ -304,8 +304,13 @@ bool dsp_has_work(const DSPState *dsp)
+@@ -242,6 +242,8 @@ void dsp_bootstrap(DSPState *dsp)
+ /* Cycles each processor ran in the interpreter rather than recompiled code,
+  * and the program addresses it interpreted. */
+ static unsigned interpreted_cycles[2];
++/* Since the last sound report: cycles interpreted and run recompiled. */
++unsigned long long g_dsp_report_interp[2], g_dsp_report_recomp[2];
+ static uint8_t interpreted_at[2][DSP_PRAM_SIZE];
+ 
+ /* RECOMP_DSP_PROGRAM_DIR: save the code a processor runs (gp.p.bin, ep.p.bin:
+@@ -304,8 +306,13 @@ bool dsp_has_work(const DSPState *dsp)
  
  void dsp_run(DSPState *dsp, int cycles)
  {
@@ -472,7 +521,7 @@ index 5da7653..474aa3b 100644
      uint64_t previous_cycles = dsp->core.cycle_count;
      dsp->save_cycles += cycles;
      while (dsp->save_cycles > 0 && dsp_has_work(dsp)) {
-@@ -318,7 +323,7 @@ void dsp_run(DSPState *dsp, int cycles)
+@@ -318,17 +325,19 @@ void dsp_run(DSPState *dsp, int cycles)
              continue;
          }
          bool dma_running = (dsp->dma.control & DMA_CONTROL_RUNNING) != 0;
@@ -481,6 +530,18 @@ index 5da7653..474aa3b 100644
              int used = dsp56k_execute_recompiled(&dsp->core, dsp->save_cycles,
                                                   &dsp->dma.control, DMA_CONTROL_RUNNING);
              if (used) {
+                 dsp->save_cycles -= used;
++                g_dsp_report_recomp[dsp->is_gp ? 0 : 1] += (unsigned)used;
+                 continue;
+             }
+         }
+         interpreted_at[dsp->is_gp ? 0 : 1][dsp->core.pc & (DSP_PRAM_SIZE - 1)] = 1;
+         dsp56k_execute_instruction(&dsp->core);
+         interpreted_cycles[dsp->is_gp ? 0 : 1] += dsp->core.instr_cycle;
++        g_dsp_report_interp[dsp->is_gp ? 0 : 1] += dsp->core.instr_cycle;
+         /* A START issued by this instruction schedules work for the next
+          * instruction boundary, so the guest can observe the running engine. */
+         if (dma_running && !dsp->core.is_stopped && !dsp->core.is_debugging) dsp_dma_step(&dsp->dma);
 diff --git a/src/apu/dsp/interp/dsp_cpu.c b/src/apu/dsp/interp/dsp_cpu.c
 index 7fd522e..7e579d7 100644
 --- a/src/apu/dsp/interp/dsp_cpu.c
