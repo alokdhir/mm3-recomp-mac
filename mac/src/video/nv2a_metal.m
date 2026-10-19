@@ -47,6 +47,8 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 
 /* Not windows.h: its BOOL and GetCurrentThread clash with the Objective-C
  * and Carbon ones. The few Win32 names this file uses: */
@@ -948,6 +950,25 @@ static dispatch_queue_t s_archive_queue;
 static _Atomic int s_archive_dirty;
 static pthread_mutex_t s_archive_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* The executable's LC_UUID, new with every link: pipelines depend on the
+ * renderer's code as well as the shader source. */
+static uint64_t build_id(void)
+{
+    const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    const uint8_t *p = (const uint8_t *)(h + 1);
+    for (uint32_t i = 0; h && i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmd == LC_UUID) {
+            const uint8_t *u = ((const struct uuid_command *)lc)->uuid;
+            uint64_t a, b;
+            memcpy(&a, u, 8); memcpy(&b, u + 8, 8);
+            return a ^ (b * 0x9E3779B97F4A7C15ull);
+        }
+        p += lc->cmdsize;
+    }
+    return 0;
+}
+
 static void archive_init(uint64_t shader_hash)
 {
     const char *e = getenv("RECOMP_PSO_ARCHIVE");
@@ -960,8 +981,15 @@ static void archive_init(uint64_t shader_hash)
     dir = [dir stringByAppendingPathComponent:@"org.mm3-port.midtown-madness-3"];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES
                                                attributes:nil error:nil];
-    s_archive_url = [[NSURL fileURLWithPath:[dir stringByAppendingPathComponent:
-        [NSString stringWithFormat:@"nv2a-pipelines-%016llx.binarchive", (unsigned long long)shader_hash]]] retain];
+    /* One archive per build: a pipeline cached by another build (the same
+     * shader source, different renderer code) drew the car selector's floor
+     * over the car. Archives of other builds are removed. */
+    shader_hash ^= build_id() * 0xBF58476D1CE4E5B9ull;
+    NSString *name = [NSString stringWithFormat:@"nv2a-pipelines-%016llx.binarchive", (unsigned long long)shader_hash];
+    for (NSString *f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil])
+        if ([f hasPrefix:@"nv2a-pipelines-"] && [f hasSuffix:@".binarchive"] && ![f isEqualToString:name])
+            [[NSFileManager defaultManager] removeItemAtPath:[dir stringByAppendingPathComponent:f] error:nil];
+    s_archive_url = [[NSURL fileURLWithPath:[dir stringByAppendingPathComponent:name]] retain];
     d = [[MTLBinaryArchiveDescriptor alloc] init];
     if ([[NSFileManager defaultManager] fileExistsAtPath:[s_archive_url path]]) d.url = s_archive_url;
     s_archive = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
