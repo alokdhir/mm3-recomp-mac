@@ -603,7 +603,7 @@ static float4 shade(TEXARGS, constant PSConsts &pc, float4 ipos, float4 id0, flo
         /* The water (Water.psh) reflects a grey sky map: keep its light and
          * shade, the ripples and highlights, in a cartoon blue. */
         float l = dot(o.rgb, float3(0.299, 0.587, 0.114));
-        o.rgb = saturate(mix(o.rgb, l * float3(0.45, 0.85, 1.45), 0.8));
+        o.rgb = saturate(mix(o.rgb, l * float3(0.30, 0.80, 1.70), 0.9));
     }
     cov = 0xFFFFFFFFu;
     /* Alpha test. On a multisampled target an inequality test becomes sample
