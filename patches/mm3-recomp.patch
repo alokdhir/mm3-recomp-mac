@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 4353ace..b5cf75c 100644
+index 4353ace..8be3c7d 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -25,7 +25,9 @@ endif()
@@ -52,7 +52,31 @@ index 4353ace..b5cf75c 100644
  endif()
  if(MM3_FRONTEND_WATCH)
      list(APPEND MM3_RENAMED_FUNCTIONS sub_000FA37E sub_0011935B sub_001253F4 sub_0008E420 sub_0008E3C0)
-@@ -281,21 +294,30 @@ foreach(distance_input IN LISTS distance_owners)
+@@ -156,6 +169,8 @@ list(REMOVE_DUPLICATES MM3_SEAM_FUNCTIONS)
+ include("${CMAKE_CURRENT_SOURCE_DIR}/scripts/mm3_race_guidance_seam.cmake")
+ include("${CMAKE_CURRENT_SOURCE_DIR}/scripts/mm3_tree_contact_seam.cmake")
+ list(APPEND MM3_SEAM_FUNCTIONS sub_0015BF5A sub_0015D2DD)
++include("${CMAKE_CURRENT_SOURCE_DIR}/scripts/mm3_dsound_isr_seam.cmake")
++list(APPEND MM3_SEAM_FUNCTIONS ${MM3_DSOUND_GUARD_FUNCTIONS})
+ if(MM3_NATIVE_FENCE_WAIT)
+     list(APPEND MM3_SEAM_FUNCTIONS sub_00344640)
+     include("${CMAKE_CURRENT_SOURCE_DIR}/scripts/mm3_fence_wait_seam.cmake")
+@@ -265,6 +280,14 @@ foreach(distance_input IN LISTS distance_owners)
+     if(owner_sub_0016AEDB STREQUAL distance_input)
+         mm3_add_tree_mesh(distance_content)
+     endif()
++    if(owner_sub_0027AF28 STREQUAL distance_input)
++        foreach(dsound_owner IN LISTS MM3_DSOUND_GUARD_FUNCTIONS)
++            if(NOT owner_${dsound_owner} STREQUAL distance_input)
++                message(FATAL_ERROR "MM3 DirectSound ISR sync: ${dsound_owner} moved to another chunk")
++            endif()
++        endforeach()
++        mm3_add_dsound_isr_sync(distance_content)
++    endif()
+     foreach(tree_owner sub_0015BF5A sub_0015D2DD)
+         if(owner_${tree_owner} STREQUAL distance_input)
+             mm3_add_tree_render(distance_content ${tree_owner})
+@@ -281,21 +304,30 @@ foreach(distance_input IN LISTS distance_owners)
      list(APPEND RECOMP_GEN_SOURCES "${distance_output}")
  endforeach()
  
@@ -89,7 +113,7 @@ index 4353ace..b5cf75c 100644
      src/mods/framerate.c
      src/mm3_unresolved_stubs.c
   src/mm3_memory_compat.c
-@@ -317,7 +339,6 @@ add_executable(${PROJECT_NAME}
+@@ -317,7 +349,6 @@ add_executable(${PROJECT_NAME}
   src/mods/widescreen.c
   src/mods/draw_distance.c
   src/mods/teleport.c
@@ -97,7 +121,7 @@ index 4353ace..b5cf75c 100644
   ${RECOMP_GEN_SOURCES})
  
  set_property(SOURCE src/recomp_manual.c APPEND PROPERTY COMPILE_DEFINITIONS
-@@ -343,9 +364,15 @@ target_include_directories(${PROJECT_NAME} PRIVATE
+@@ -343,9 +374,15 @@ target_include_directories(${PROJECT_NAME} PRIVATE
      ${XBOXRECOMP_DIR}/include
      ${XBOXRECOMP_DIR}/src/video)
  
@@ -115,7 +139,7 @@ index 4353ace..b5cf75c 100644
  # Focused offline checks; explicitly built, never part of the game build.
  foreach(check teleport dev_tools overlay input_capture)
      if(check STREQUAL "overlay")
-@@ -362,11 +389,13 @@ foreach(check teleport dev_tools overlay input_capture)
+@@ -362,11 +399,13 @@ foreach(check teleport dev_tools overlay input_capture)
      endif()
  endforeach()
  target_link_libraries(mm3_overlay_contract PRIVATE mm3_imgui xinput)
@@ -130,7 +154,7 @@ index 4353ace..b5cf75c 100644
   target_link_options(${PROJECT_NAME} PRIVATE
    "-Wl,--wrap=xbox_ReserveAlloc"
    "-Wl,--wrap=recomp_trace_esp")
-@@ -381,6 +410,7 @@ if(MSVC)
+@@ -381,6 +420,7 @@ if(MSVC)
      target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
  endif()
  
@@ -138,7 +162,7 @@ index 4353ace..b5cf75c 100644
  target_link_libraries(mm3_input_capture_contract PRIVATE xinput)
  target_include_directories(mm3_input_capture_contract PRIVATE ${XBOXRECOMP_DIR}/src)
  
-@@ -395,3 +425,4 @@ target_link_libraries(mm3_launcher_settings_contract PRIVATE RmlUi::RmlUi d3d11
+@@ -395,3 +435,4 @@ target_link_libraries(mm3_launcher_settings_contract PRIVATE RmlUi::RmlUi d3d11
  if(MSVC)
      target_compile_options(mm3_launcher_settings_contract PRIVATE /UNDEBUG)
  endif()
@@ -203,6 +227,41 @@ index 2f88cd8..6937500 100644
      return out
  
  
+diff --git a/scripts/mm3_dsound_isr_seam.cmake b/scripts/mm3_dsound_isr_seam.cmake
+new file mode 100644
+index 0000000..14ad05d
+--- /dev/null
++++ b/scripts/mm3_dsound_isr_seam.cmake
+@@ -0,0 +1,29 @@
++# DirectSound raises a counter (+0x2BC of its APU object) before it edits the
++# voice lists, and its interrupt leaves an idle voice linked while the counter
++# is up. Here the interrupt runs beside the title rather than between two of
++# its instructions, so wait out a running one right after each raise
++# (xbox_IrqlSyncInterrupts). All seven raises sit in one chunk; fail closed if
++# the lifted text changes rather than guessing other sites.
++set(MM3_DSOUND_GUARD_FUNCTIONS sub_0027AF28 sub_0027AF8B sub_0027B01F sub_0027B0F5
++    sub_0027DECF sub_0027E341)
++function(mm3_add_dsound_isr_sync source_variable)
++    set(content "${${source_variable}}")
++    set(total 0)
++    foreach(reg esi eax)
++        set(raise "MEM32(${reg} + 0x2BC) = MEM32(${reg} + 0x2BC) + 1;")
++        string(REGEX MATCHALL "MEM32\\(${reg} \\+ 0x2BC\\) = MEM32\\(${reg} \\+ 0x2BC\\) \\+ 1" raises "${content}")
++        list(LENGTH raises count)
++        math(EXPR total "${total} + ${count}")
++        string(REPLACE "${raise}" "${raise} xbox_IrqlSyncInterrupts();" content "${content}")
++    endforeach()
++    if(NOT total EQUAL 7)
++        message(FATAL_ERROR "MM3 DirectSound ISR sync: expected 7 voice-list guard raises, found ${total}")
++    endif()
++    string(FIND "${content}" "\r\n" crlf_position)
++    if(crlf_position LESS 0)
++        set(newline "\n")
++    else()
++        set(newline "\r\n")
++    endif()
++    set(${source_variable} "extern void xbox_IrqlSyncInterrupts(void);${newline}${content}" PARENT_SCOPE)
++endfunction()
 diff --git a/scripts/tso_accessors.py b/scripts/tso_accessors.py
 new file mode 100644
 index 0000000..5ee8a05

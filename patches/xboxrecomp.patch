@@ -122,7 +122,7 @@ index 58a5053..46f2cf5 100644
          /* Let the guest in once per frame.
           *
 diff --git a/src/apu/apu_mmio_hook.c b/src/apu/apu_mmio_hook.c
-index 46cc2c5..383ff90 100644
+index 46cc2c5..5800890 100644
 --- a/src/apu/apu_mmio_hook.c
 +++ b/src/apu/apu_mmio_hook.c
 @@ -18,8 +18,11 @@ MCPXAPUState *g_apu_state = NULL;
@@ -183,7 +183,7 @@ index 46cc2c5..383ff90 100644
  /* ============================================================
   * Public API (called from VEH in main.c)
   * ============================================================ */
-@@ -280,3 +315,45 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+@@ -280,3 +315,46 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
  }
  
  #endif /* _WIN32 */
@@ -198,15 +198,16 @@ index 46cc2c5..383ff90 100644
 + * thousands of times a second). Fenced like the trap, which orders the access
 + * against everything around it. 0 when the APU is off: the caller then makes
 + * the plain access, which faults as before. */
-+/* Off unless RECOMP_APU_DIRECT=1: every access then takes the fault path.
-+ * With the direct path MM3 loses sound effects partway through a race
-+ * (its voice lists briefly loop and DirectSound stops starting voices);
-+ * through the fault path, races keep their sound. Why the timing matters
-+ * is not yet understood, so the slower path is the default. */
++/* On unless RECOMP_APU_DIRECT=0, which sends every access down the fault
++ * path. The direct path once cost MM3 its sound effects partway through a
++ * race (voice lists looping, DirectSound starting no more voices): its speed
++ * widened a race between DirectSound's interrupt and the title's own list
++ * edits, which xbox_IrqlSyncInterrupts now closes. The fault path only made
++ * that race rarer. */
 +static int apu_direct_off(void)
 +{
 +    static int off = -1;
-+    if (off < 0) off = !(getenv("RECOMP_APU_DIRECT") && atoi(getenv("RECOMP_APU_DIRECT")) != 0);
++    if (off < 0) off = getenv("RECOMP_APU_DIRECT") && atoi(getenv("RECOMP_APU_DIRECT")) == 0;
 +    return off;
 +}
 +
@@ -243,7 +244,7 @@ index a647924..73fdb7f 100644
  /* DSP functions */
  void mcpx_apu_dsp_init(MCPXAPUState *d);
 diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
-index d3c5a7a..abe4917 100644
+index d3c5a7a..0674892 100644
 --- a/src/apu/apu_vp.c
 +++ b/src/apu/apu_vp.c
 @@ -48,6 +48,66 @@ static const struct {
@@ -345,7 +346,7 @@ index d3c5a7a..abe4917 100644
          }
          break;
  
-@@ -625,8 +689,99 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
+@@ -625,8 +689,102 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
      MCPXAPUState *d = (MCPXAPUState *)opaque;
      (void)size;
  
@@ -375,6 +376,8 @@ index d3c5a7a..abe4917 100644
 + * many voices each list holds, so a leak shows as starts with no stops.
 + * Returns whether it reported (irqs, the caller's count, then starts over). */
 +extern unsigned long long g_dsp_report_interp[2], g_dsp_report_recomp[2];
++/* DirectSound list edits that waited out a running interrupt (kernel_hal.c). */
++extern volatile LONG g_irql_sync_waits;
 +
 +bool mcpx_apu_vp_report(MCPXAPUState *d, unsigned irqs)
 +{
@@ -424,10 +427,11 @@ index d3c5a7a..abe4917 100644
 +    }
 +    qemu_mutex_lock(&s_fe_lock);
 +    fprintf(stderr, "[APU_VOICES] lists 2D %u 3D %u MP %u | on %u off %u release %u"
-+            " idle-traps %u irqs %u | waited %u overflow %u queued %u\n",
++            " idle-traps %u irqs %u | waited %u overflow %u queued %u | isr-sync %ld\n",
 +            len[0], len[1], len[2], s_fe_count.on, s_fe_count.off,
 +            s_fe_count.release, s_fe_count.idle_traps, irqs,
-+            s_fe_count.deferred, s_fe_count.overflow, s_fe_queued);
++            s_fe_count.deferred, s_fe_count.overflow, s_fe_queued,
++            (long)InterlockedExchange(&g_irql_sync_waits, 0));
 +    {   /* How long these 5 s of audio took, and how much DSP work ran in the
 +         * interpreter: a report much slower than 5 s is sound played slow. */
 +        static ULONGLONG last;
@@ -447,7 +451,7 @@ index d3c5a7a..abe4917 100644
  }
  
  /* ============================================================
-@@ -1307,20 +1462,35 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+@@ -1307,20 +1465,35 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
          next = voice_list_regs[list].next;
  
          d->regs[current] = d->regs[top];
@@ -485,7 +489,7 @@ index d3c5a7a..abe4917 100644
              } else {
                  /* Process voice directly (single-threaded) */
                  voice_spin_lock(d, v);
-@@ -1359,6 +1529,7 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
+@@ -1359,6 +1532,7 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
       * Keeping the table in the APU avoids lazy-init races and shared state. */
      d->vp.attenuation_rounding = -2;
      prepare_attenuation(d);
@@ -813,6 +817,18 @@ index 75c5484..08d0c8e 100644
  else()
      # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
      find_package(OpenSSL REQUIRED)
+diff --git a/src/kernel/kernel.h b/src/kernel/kernel.h
+index e6d7182..3a5168a 100644
+--- a/src/kernel/kernel.h
++++ b/src/kernel/kernel.h
+@@ -808,6 +808,7 @@ int     xbox_IrqlCurrent(void);
+ int     xbox_IrqlRaisedCount(void);
+ int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
+ void    xbox_IrqlLeaveInterrupt(int saved);
++void    xbox_IrqlSyncInterrupts(void);
+ 
+ /* Total crossings of the DISPATCH boundary, and who is holding it up.
+  * A depth that is non-zero while this stops moving is stuck, not busy. */
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
 index 899f180..2346185 100644
 --- a/src/kernel/kernel_bridge.c
@@ -834,7 +850,7 @@ index 899f180..2346185 100644
  extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
  extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
-index 98092ac..52dcc92 100644
+index 98092ac..f759f41 100644
 --- a/src/kernel/kernel_hal.c
 +++ b/src/kernel/kernel_hal.c
 @@ -54,7 +54,7 @@ int xbox_IrqlCurrent(void)
@@ -854,6 +870,37 @@ index 98092ac..52dcc92 100644
  
  static void irql_holder_add(void *ra)
  {
+@@ -323,6 +322,30 @@ void xbox_IrqlLeaveInterrupt(int saved)
+         LeaveCriticalSection(&g_isr_lock);
+ }
+ 
++/* Wait until no device interrupt is running.
++ *
++ * A device interrupt runs beside a thread at DISPATCH_LEVEL here (see
++ * xbox_IrqlEnterInterrupt), where on the console it would have run between
++ * two of that thread's instructions. DirectSound guards its voice lists with
++ * a counter its interrupt checks before unlinking an idle voice; with the two
++ * truly concurrent, the interrupt could pass the check just before the title
++ * raised the counter, and both then edited the lists at once (a removed voice
++ * left linked: the list loops, and every voice stop waits out DirectSound's
++ * 0.5 s timeout). The title calls this right after raising such a counter:
++ * an interrupt that began before it either saw the counter or is finished
++ * when this returns, as on the console. */
++volatile LONG g_irql_sync_waits;     /* times it found one running */
++
++void xbox_IrqlSyncInterrupts(void)
++{
++    InitOnceExecuteOnce(&g_dispatch_lock_once, dispatch_lock_init, NULL, NULL);
++    if (!TryEnterCriticalSection(&g_isr_lock)) {
++        InterlockedIncrement(&g_irql_sync_waits);
++        EnterCriticalSection(&g_isr_lock);
++    }
++    LeaveCriticalSection(&g_isr_lock);
++}
++
+ /*
+  * KfRaiseIrql - Raises IRQL to the specified level.
+  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).
 diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
 index b67e08c..281bd1e 100644
 --- a/src/kernel/kernel_path.c
