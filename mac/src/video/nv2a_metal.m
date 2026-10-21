@@ -4799,6 +4799,30 @@ static void pace_flip(FlipPacing *pacing)
     if (s_prof_on > 0) s_prof[PROF_PACE] += pacing->ticks;
 }
 
+/* When frames actually reach the screen. The flip log above only sees the
+ * renderer; a freeze with every flip on time is the compositor or display.
+ * Each drawable reports its presentedTime (0 if it never showed). */
+static _Atomic int64_t s_shown_last_ns;
+static _Atomic int s_shown_dropped;
+
+static void watch_presented(id<CAMetalDrawable> dr)
+{
+    [dr addPresentedHandler:^(id<MTLDrawable> d) {
+        CFTimeInterval t = d.presentedTime;
+        int64_t ns, last;
+        static unsigned told;
+        if (t <= 0) { atomic_fetch_add(&s_shown_dropped, 1); return; }
+        ns = (int64_t)(t * 1e9);
+        last = atomic_exchange(&s_shown_last_ns, ns);
+        if (last && ns - last > 100000000 && s_frame > 300 && told++ < 100) {
+            fprintf(stderr, "[METAL] display: %.0f ms between frames reaching the screen"
+                    " (%d not shown since the last report), frame %u\n",
+                    (ns - last) / 1e6, atomic_exchange(&s_shown_dropped, 0), s_frame);
+            fflush(stderr);
+        }
+    }];
+}
+
 /* The kept image presented again; 0 if there is none to show. */
 static int present_kept(void)
 {
@@ -4809,6 +4833,7 @@ static int present_kept(void)
     if (!dr) return 0;
     [blit_encoder_for(BRK_PRESENT) copyFromTexture:s_kept toTexture:[dr texture]];
     capture_backbuffer([dr texture]);
+    watch_presented(dr);
     [cmd() presentDrawable:dr];
     submit(0);
     s_last_present = GetTickCount();
@@ -4827,6 +4852,42 @@ static uint32_t s_hist_frame[HIST_FRAMES];
 static int s_hist_next;
 static _Atomic int s_hist_save;
 static int s_hist_saved;            /* this frame wrote them: not a hitch */
+
+/* When each of the last 20 s of frames went out, and whether it was the
+ * title's flip or the last image repeated between world updates. A pause
+ * noticed a few seconds late is still in it; history_save writes it out
+ * beside the images as timings.txt. */
+#define TIMELINE_FRAMES 1200
+static struct { uint32_t frame; float ms; char kind; } s_timeline[TIMELINE_FRAMES];
+static int s_timeline_next;
+
+static void timeline_note(char kind)
+{
+    static int64_t last;
+    int64_t now = qpc();
+    s_timeline[s_timeline_next].frame = s_frame;
+    s_timeline[s_timeline_next].ms = last ? (float)((now - last) * 1000.0 / QPC_FREQ) : 0.0f;
+    s_timeline[s_timeline_next].kind = kind;
+    s_timeline_next = (s_timeline_next + 1) % TIMELINE_FRAMES;
+    last = now;
+}
+
+static void timeline_save(const char *dir)
+{
+    char path[1200];
+    FILE *f;
+    int i;
+    snprintf(path, sizeof path, "%s/timings.txt", dir);
+    if (!(f = fopen(path, "w"))) return;
+    fprintf(f, "# frame, F = the title's flip / R = last image repeated, ms since the frame before\n");
+    for (i = 0; i < TIMELINE_FRAMES; i++) {
+        int k = (s_timeline_next + i) % TIMELINE_FRAMES;
+        if (!s_timeline[k].kind) continue;
+        fprintf(f, "%u %c %.1f%s\n", s_timeline[k].frame, s_timeline[k].kind, s_timeline[k].ms,
+                s_timeline[k].ms > 40.0f ? "  <-- slow" : "");
+    }
+    fclose(f);
+}
 
 void nv2a_metal_save_recent_frames(void)
 {
@@ -4870,6 +4931,7 @@ static void history_save(void)
         snprintf(path, sizeof path, "%s/%02d-frame%u.bmp", dir, n++, s_hist_frame[k]);
         write_bmp(s_hist[k], path);
     }
+    timeline_save(dir);
     fprintf(stderr, "[METAL] saved %d recent frames to %s\n", n, dir);
     fflush(stderr);
 }
@@ -4905,6 +4967,7 @@ static void present_surface(Surface *s, FlipPacing *pacing)
             /* Composite and capture are complete; align the actual host
              * submission, without pacing tick/movie-only presentations. */
             if (pacing && !pace_after_present()) pace_flip(pacing);
+            watch_presented(dr);
             [cmd() presentDrawable:dr];
             submit(0);
             s->cpu_present_pending = 0;
@@ -5121,6 +5184,7 @@ void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
             s_mr_frame_n = 0;
         }
         s_depth_hazed = 0;
+        timeline_note('F');
         {   /* A flip long after the last one, mid-game: say where it went. */
             static int64_t last;
             int64_t now = qpc();
@@ -5224,6 +5288,7 @@ void nv2a_d3d_tick(void)
         return;
     @autoreleasepool {
         if (atomic_load(&s_repeat)) {
+            timeline_note('R');
             if (!present_kept())
                 present_surface(s_shown, NULL);
             pace_vblank();

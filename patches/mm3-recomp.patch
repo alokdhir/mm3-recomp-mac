@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index a1ecc4b..411ef32 100644
+index c33b56c..f3821c0 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -3,8 +3,11 @@ project(mm3_recomp C CXX)
@@ -816,58 +816,6 @@ index 0000000..520204c
 +    sub_000CF2DA_original();
 +    MEM32(at) = mask;
 +}
-diff --git a/src/mods/draw_distance.c b/src/mods/draw_distance.c
-index 92cd0c1..899f6af 100644
---- a/src/mods/draw_distance.c
-+++ b/src/mods/draw_distance.c
-@@ -223,20 +223,43 @@ void sub_002256C7(void)
- /* Replace the Xbox Fog.dma draw with an ordered native host fog pass.
-  * The camera supplies the W-buffer scale and sky colour, never a fog texture. */
- extern void sub_000F8DCE_original(void);
-+extern void sub_00344770(void);
-+/* Room for the fog command in the push buffer, the way the title's own D3D
-+ * asks for it: below the limit there is always room for this much (D3D
-+ * keeps 0x188 bytes past it), and at the limit MakeSpace (0x344770,
-+ * stdcall: the push size [0x352E00] and half of it) waits for the GPU and
-+ * returns the new cursor. Giving up instead dropped the fog for that frame:
-+ * the sky and the distance flashed bright. */
-+static uint32_t fog_push_space(uint32_t device)
-+{
-+    uint32_t cursor = MEM32(device), size;
-+    if (cursor < MEM32(device + 4)) return cursor;
-+    {
-+        static unsigned told;
-+        if (told++ < 10) fprintf(stderr, "[MM3_DISTANCE] fog: push buffer full, making space\n");
-+    }
-+    size = MEM32(0x352E00);
-+    g_esp -= 4; MEM32(g_esp) = size;
-+    g_esp -= 4; MEM32(g_esp) = size >> 1;
-+    g_esp -= 4; MEM32(g_esp) = 0;   /* return address; the callee's ret 8 pops all three */
-+    sub_00344770();
-+    return g_eax;
-+}
-+
- void sub_000F8DCE(void)
- {
-     if (!mm3_mod_on(MM3_MOD_DRAW_DISTANCE)) { sub_000F8DCE_original(); return; }
--    uint32_t camera = MEM32(g_ecx+0xC), device = MEM32(0x351F48);
--    uint32_t cursor = MEM32(device), limit = MEM32(device+4);
-+    uint32_t camera = MEM32(g_ecx+0xC), device = MEM32(0x351F48), argb = MEM32(g_esp+4);
-+    uint32_t cursor = device ? fog_push_space(device) : 0;
-     float depth_scale = MEMF(camera+0x1ED8), far_clip = MEMF(camera+0x1FB0);
--    if (cursor && !(cursor&3) && limit >= cursor && limit-cursor >= MM3_FOG_WORDS*4) {
-+    if (cursor && !(cursor&3)) {
-         MEM32(cursor) = MM3_FOG_HEADER; /* Eleven non-increasing NV097_NO_OPERATION parameters. */
-         MEM32(cursor+4) = MM3_FOG_TAG;
-         MEMF(cursor+8) = 1.f/depth_scale;
-         MEMF(cursor+12) = far_clip;
-         MEMF(cursor+16) = fminf(300.f,far_clip*.4f);
-         MEMF(cursor+20) = far_clip*.9f;
--        MEM32(cursor+24) = MEM32(g_esp+4);
-+        MEM32(cursor+24) = argb;
-         MEM32(cursor+28) = MM3_FOG_SKY_MASK | MM3_FOG_SKY_FILL | MM3_FOG_SKY_FADE; /* Sky mask and untextured distant air. */
-         /* World-up dotted with a camera ray: pitch/roll and projection follow
-          * the native cloud dome. Fade its lower edge over about nine degrees. */
 diff --git a/src/mods/framerate.c b/src/mods/framerate.c
 index daa9685..11ec346 100644
 --- a/src/mods/framerate.c
