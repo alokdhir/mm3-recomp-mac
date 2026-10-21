@@ -27,6 +27,13 @@ int xbox_FramebufferOverlay(XboxOverlay *o) { (void)o; return 0; }
 int xbox_FramebufferScanSource(uint32_t *va, uint32_t *pitch) { (void)va; (void)pitch; return 0; }
 const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *version))[4] { (void)start; (void)version; return NULL; }
 const float (*nv2a_vsh_constants(uint32_t *version))[4] { (void)version; return NULL; }
+/* fb_present.c's window state (fb_window.h). */
+volatile unsigned char fbw_key_down[256];
+volatile float fbw_mouse_x, fbw_mouse_y;
+volatile int32_t fbw_mouse_moves, fbw_inactive;
+void (*fbw_close_handler)(void);
+int fbw_title_due(uint16_t *out, size_t count) { (void)out; (void)count; return 0; }
+int xbox_FramebufferPaused(void) { return 0; }
 void xbox_FramebufferWindowStart(void);
 
 static const char *s_cap;

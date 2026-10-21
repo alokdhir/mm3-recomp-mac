@@ -1,27 +1,48 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 940b087..912f497 100644
+index e5fb032..b1ab265 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -60,7 +60,7 @@ add_subdirectory(src/net)
- add_subdirectory(src/video)
- 
- # Host bring-up: MMIO routing to the APU/USB/NV2A models, window and device
--if(WIN32)
-+if(WIN32 OR APPLE)
-     add_subdirectory(src/host)
+@@ -29,14 +29,20 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+ # The host renderer. D3D11 is Windows-only and the default there; SDL3_GPU
+ # (Vulkan, Direct3D 12 or Metal through SDL3) is the one choice elsewhere.
+ # SDL3_GPU also moves the window and its input to SDL3, and off Windows the
+-# audio output and game controllers too.
++# audio output and game controllers too. EXTERNAL is a renderer and window
++# the including project supplies (XBOX_VIDEO_BACKEND_SOURCES, implementing
++# nv2a_d3d11.h and fb_present.h), with its own audio and input backends
++# (XBOX_AUDIO_BACKEND_SOURCES, XBOX_INPUT_BACKEND_SOURCES): the macOS port's
++# Metal renderer, AppKit window, Core Audio and GameController.
+ if(WIN32)
+     set(_xbr_renderer_default D3D11)
++elseif(XBOX_VIDEO_BACKEND_SOURCES)
++    set(_xbr_renderer_default EXTERNAL)
+ else()
+     set(_xbr_renderer_default SDL3_GPU)
  endif()
- 
-@@ -79,7 +79,7 @@ target_link_libraries(xboxrecomp INTERFACE
-     xbox_nv2a
-     xbox_video
- )
--if(WIN32)
-+if(WIN32 OR APPLE)
-     target_link_libraries(xboxrecomp INTERFACE xbox_host)
+-set(XBOXRECOMP_RENDERER "${_xbr_renderer_default}" CACHE STRING "Host renderer: D3D11 or SDL3_GPU")
+-set_property(CACHE XBOXRECOMP_RENDERER PROPERTY STRINGS D3D11 SDL3_GPU)
++set(XBOXRECOMP_RENDERER "${_xbr_renderer_default}" CACHE STRING "Host renderer: D3D11, SDL3_GPU or EXTERNAL")
++set_property(CACHE XBOXRECOMP_RENDERER PROPERTY STRINGS D3D11 SDL3_GPU EXTERNAL)
+ if(XBOXRECOMP_RENDERER STREQUAL "SDL3_GPU")
+     set(XBOXRECOMP_SDL3 ON)
+     include(Sdl3)
+@@ -46,8 +52,13 @@ elseif(XBOXRECOMP_RENDERER STREQUAL "D3D11")
+         message(FATAL_ERROR "XBOXRECOMP_RENDERER=D3D11 needs Windows; use SDL3_GPU")
+     endif()
+     set(XBOXRECOMP_SDL3 OFF)
++elseif(XBOXRECOMP_RENDERER STREQUAL "EXTERNAL")
++    if(NOT XBOX_VIDEO_BACKEND_SOURCES)
++        message(FATAL_ERROR "XBOXRECOMP_RENDERER=EXTERNAL needs XBOX_VIDEO_BACKEND_SOURCES")
++    endif()
++    set(XBOXRECOMP_SDL3 OFF)
+ else()
+-    message(FATAL_ERROR "XBOXRECOMP_RENDERER must be D3D11 or SDL3_GPU, not ${XBOXRECOMP_RENDERER}")
++    message(FATAL_ERROR "XBOXRECOMP_RENDERER must be D3D11, SDL3_GPU or EXTERNAL, not ${XBOXRECOMP_RENDERER}")
  endif()
- 
+ message(STATUS "xboxrecomp renderer: ${XBOXRECOMP_RENDERER}")
+ if(XBOXRECOMP_SDL3)
 diff --git a/src/apu/CMakeLists.txt b/src/apu/CMakeLists.txt
-index 209c578..f91f43f 100644
+index 50730eb..559d0bd 100644
 --- a/src/apu/CMakeLists.txt
 +++ b/src/apu/CMakeLists.txt
 @@ -4,6 +4,15 @@
@@ -71,13 +92,26 @@ index 209c578..f91f43f 100644
 +elseif(XBOX_AUDIO_BACKEND_SOURCES)
 +    target_link_libraries(xbox_apu PRIVATE platform m ${XBOX_AUDIO_BACKEND_LIBRARIES})
  else()
-     # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
-     find_package(SDL2 REQUIRED)
+     # Elsewhere: platform layer (Win32 primitives on POSIX) + SDL3 audio + libm
+     include(Sdl3)
 diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
-index 58a5053..46f2cf5 100644
+index 8ab4dad..6ffb267 100644
 --- a/src/apu/apu_core.c
 +++ b/src/apu/apu_core.c
-@@ -101,6 +101,7 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
+@@ -100,6 +100,12 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
+      * reads; skip the lookup for known pages. Bytes are only ever set: no lock. */
+     static uint8_t known_contig[(64u << 20) >> 12];     /* XBOX_CONTIG_SIZE (kernel.h) */
+     uint32_t raw = (uint32_t)addr, guest_va;
++    /* A page already seen allocated, first: the runtime's physical IDs sit
++     * above all guest VAs (xbox_GetRamPhysicalBase, 128 MB or more), so an
++     * address below 64 MB is never one, and the resolve below takes a lock
++     * the voice processor would otherwise take for every field it reads. */
++    if (addr < (64u << 20) && known_contig[addr >> 12])
++        return g_apu_ram_ptr + 0x80000000u + (uint32_t)addr;
+     if (addr <= UINT32_MAX &&
+         xbox_PhysicalAddressResolve(raw, 1, &guest_va) == 1) {
+         /* Check the bus width before masking: otherwise a valid high runtime
+@@ -139,6 +145,7 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
   * pci_irq_assert, which is an empty stub here, so DirectSound's service
   * routine never ran and no voice completion ever reached it. */
  static volatile LONG s_irq_line;
@@ -85,7 +119,7 @@ index 58a5053..46f2cf5 100644
  
  static void update_irq(MCPXAPUState *d)
  {
-@@ -137,8 +138,7 @@ extern void xbox_IrqlLeaveInterrupt(int saved);
+@@ -175,8 +182,7 @@ extern void xbox_IrqlLeaveInterrupt(int saved);
  #else
  #  define APU_TLS __thread
  #endif
@@ -95,7 +129,7 @@ index 58a5053..46f2cf5 100644
  
  /* Call the connected service routine while the line is up, from the frame
   * thread, the way the OHCI model delivers USB interrupts (ohci_call_isr):
-@@ -185,6 +185,7 @@ static void apu_deliver_irq(MCPXAPUState *d)
+@@ -223,6 +229,7 @@ static void apu_deliver_irq(MCPXAPUState *d)
      { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
      xbox_worker_stack_free(slot);
      qemu_mutex_lock(&d->lock);
@@ -103,7 +137,7 @@ index 58a5053..46f2cf5 100644
  
      {
          static unsigned n;
-@@ -270,6 +271,8 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
+@@ -308,6 +315,8 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
                                  " (SECTL=%08X FECTL=%08X)\n", sectl, fectl);
              }
          }
@@ -112,7 +146,7 @@ index 58a5053..46f2cf5 100644
          qemu_cond_broadcast(&d->cond);
          break;
      case NV_PAPU_FEMEMDATA:
-@@ -681,6 +684,8 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -719,6 +728,8 @@ static void *mcpx_apu_frame_thread(void *arg)
              d->set_irq = false;
          }
          apu_deliver_irq(d);
@@ -122,30 +156,34 @@ index 58a5053..46f2cf5 100644
          /* Let the guest in once per frame.
           *
 diff --git a/src/apu/apu_mmio_hook.c b/src/apu/apu_mmio_hook.c
-index 46cc2c5..5800890 100644
+index 84eeb97..87ef90b 100644
 --- a/src/apu/apu_mmio_hook.c
 +++ b/src/apu/apu_mmio_hook.c
-@@ -18,8 +18,11 @@ MCPXAPUState *g_apu_state = NULL;
- /* The MMIO hook is a Win32-VEH x86-64 instruction decoder. On Linux the
-  * equivalent goes through sigaction + ucontext_t (Stage 2 / main.c). For
-  * now the whole body is Windows-only so apu_emu links on Debian. */
-+#if defined(_WIN32) || (defined(__APPLE__) && defined(__aarch64__))
- #if defined(_WIN32)
- #include <windows.h>
-+#endif
+@@ -15,10 +15,12 @@
+  * platform's MMIO hook is active, so define it before the #if guard. */
+ MCPXAPUState *g_apu_state = NULL;
+ 
+-/* The MMIO hook decodes x86-64 instructions from a vectored exception
+- * handler's CONTEXT: Win32 VEH, or win32_compat's SIGSEGV dispatch. */
+-#if defined(_WIN32) || defined(__x86_64__)
++/* The MMIO hook decodes the faulting instruction from a vectored exception
++ * handler's CONTEXT: Win32 VEH, win32_compat's SIGSEGV dispatch (x86-64), or
++ * posix_veh.c (arm64 Darwin). */
++#if defined(_WIN32) || defined(__x86_64__) || (defined(__APPLE__) && defined(__aarch64__))
+ #include "platform/xbox_winnt.h"
 +#include "../platform/mmio_decode.h"
  
  /* APU MMIO base in Xbox VA space */
  #define APU_MMIO_BASE  0xFE800000u
-@@ -32,6 +35,7 @@ static int g_apu_mmio_read_count = 0;
+@@ -31,6 +33,7 @@ static int g_apu_mmio_read_count = 0;
  static int g_apu_mmio_write_count = 0;
  static int g_apu_mmio_decode_fail = 0;
  
-+#if defined(_WIN32)
++#if defined(_WIN32) || defined(__x86_64__)
  /* ============================================================
   * x86-64 register access helpers (same as NV2A hook)
   * ============================================================ */
-@@ -250,6 +254,37 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
+@@ -249,6 +252,37 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
      return false;
  }
  
@@ -183,10 +221,12 @@ index 46cc2c5..5800890 100644
  /* ============================================================
   * Public API (called from VEH in main.c)
   * ============================================================ */
-@@ -280,3 +315,46 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+@@ -278,4 +312,47 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+     return ok;
  }
  
- #endif /* _WIN32 */
+-#endif /* _WIN32 || __x86_64__ */
++#endif /* _WIN32 || __x86_64__ || arm64 Darwin */
 +
 +/* ============================================================
 + * Trap-free access (arm64 Darwin's ordered accessors)
@@ -244,10 +284,10 @@ index a647924..73fdb7f 100644
  /* DSP functions */
  void mcpx_apu_dsp_init(MCPXAPUState *d);
 diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
-index d3c5a7a..0674892 100644
+index 6a98811..d7f1a0f 100644
 --- a/src/apu/apu_vp.c
 +++ b/src/apu/apu_vp.c
-@@ -48,6 +48,66 @@ static const struct {
+@@ -53,6 +53,66 @@ static const struct {
      { NV_PAPU_TVLMP, NV_PAPU_CVLMP, NV_PAPU_NVLMP }, /* MP */
  };
  
@@ -314,7 +354,7 @@ index d3c5a7a..0674892 100644
  /* ============================================================
   * Notify status helper
   * ============================================================ */
-@@ -250,6 +310,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+@@ -255,6 +315,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
  
      case NV1BA0_PIO_VOICE_ON: {
          selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
@@ -322,7 +362,7 @@ index d3c5a7a..0674892 100644
  
          bool locked = is_voice_locked(d, (uint16_t)selected_handle);
          if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
-@@ -340,6 +401,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+@@ -345,6 +406,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
  
      case NV1BA0_PIO_VOICE_RELEASE: {
          selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
@@ -330,7 +370,7 @@ index d3c5a7a..0674892 100644
  
          bool locked = is_voice_locked(d, (uint16_t)selected_handle);
          if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
-@@ -366,6 +428,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+@@ -371,6 +433,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
      }
  
      case NV1BA0_PIO_VOICE_OFF:
@@ -338,7 +378,7 @@ index d3c5a7a..0674892 100644
          voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
          break;
  
-@@ -551,6 +614,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+@@ -556,6 +619,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
              d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FETRAPREASON;
              d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
              d->set_irq = true;
@@ -346,7 +386,47 @@ index d3c5a7a..0674892 100644
          }
          break;
  
-@@ -625,8 +689,102 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
+@@ -616,8 +680,37 @@ uint64_t mcpx_apu_vp_read(void *opaque, hwaddr addr, unsigned int size)
+     (void)opaque; (void)size;
+ 
+     switch (addr) {
+-    case NV1BA0_PIO_FREE:
+-        return 0x80; /* Always pretend queue is empty */
++    case NV1BA0_PIO_FREE: {
++        /* Free FIFO bytes (32 entries of 4). Methods held back while the
++         * front end is trapped are what the hardware FIFO would still hold,
++         * and DirectSound waits for it to read empty (0x80) before editing
++         * the voice lists itself. Always answering empty let those edits run
++         * ahead of a queued VOICE_ON: the voice then went into a list after
++         * DirectSound had already taken it out, and starting it again linked
++         * it to itself (MP list loops, half-second stalls, sound lost). The
++         * lock orders the drained methods' writes before the title's.
++         * A front end left stopped past 50 ms is not going to drain (see the
++         * overflow in mcpx_apu_vp_write): answer empty then, as before. */
++        static ULONGLONG busy_since;
++        static unsigned gave_up;
++        unsigned queued;
++        qemu_mutex_lock(&s_fe_lock);
++        queued = s_fe_queued;
++        qemu_mutex_unlock(&s_fe_lock);
++        if (!queued) {
++            busy_since = 0;
++            return 0x80;
++        }
++        if (!busy_since) {
++            busy_since = GetTickCount64();
++        } else if (GetTickCount64() - busy_since > 50) {
++            if (gave_up++ < 4)
++                fprintf(stderr, "[APU] front end stopped with %u methods queued for 50 ms;"
++                        " reporting the FIFO empty\n", queued);
++            return 0x80;
++        }
++        return queued >= 0x20 ? 0 : 0x80 - queued * 4;
++    }
+     default:
+         break;
+     }
+@@ -630,8 +723,102 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
      MCPXAPUState *d = (MCPXAPUState *)opaque;
      (void)size;
  
@@ -451,7 +531,7 @@ index d3c5a7a..0674892 100644
  }
  
  /* ============================================================
-@@ -1307,20 +1465,35 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+@@ -1334,20 +1521,35 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
          next = voice_list_regs[list].next;
  
          d->regs[current] = d->regs[top];
@@ -489,7 +569,7 @@ index d3c5a7a..0674892 100644
              } else {
                  /* Process voice directly (single-threaded) */
                  voice_spin_lock(d, v);
-@@ -1359,6 +1532,7 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
+@@ -1386,6 +1588,7 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
       * Keeping the table in the APU avoids lazy-init races and shared state. */
      d->vp.attenuation_rounding = -2;
      prepare_attenuation(d);
@@ -662,7 +742,7 @@ index 0e6485a..c66d0aa 100644
  
  /**********************************
 diff --git a/src/d3d/CMakeLists.txt b/src/d3d/CMakeLists.txt
-index bb42c28..ac050ca 100644
+index b57b875..9573175 100644
 --- a/src/d3d/CMakeLists.txt
 +++ b/src/d3d/CMakeLists.txt
 @@ -17,6 +17,13 @@ if(WIN32)
@@ -680,32 +760,36 @@ index bb42c28..ac050ca 100644
      add_library(xbox_d3d8 STATIC
          d3d8_gl.c
 diff --git a/src/host/host.c b/src/host/host.c
-index b2a89d1..ab0bfaa 100644
+index 6c2e1b7..b053dd9 100644
 --- a/src/host/host.c
 +++ b/src/host/host.c
-@@ -3,9 +3,13 @@
- #include <stdio.h>
- #include <stdlib.h>
+@@ -5,7 +5,15 @@
  #include <string.h>
-+#if defined(_WIN32)
- #include <windows.h>
--
+ #include "platform/xbox_winnt.h"
+ 
++/* Only the Windows D3D11 renderer makes a D3D8 device here; the SDL3 GPU
++ * renderer and an including project's own (EXTERNAL) open their window and
++ * device with the pushbuffer executor. */
++#if defined(_WIN32) && !defined(XBOXRECOMP_SDL3)
++#define HOST_D3D8_DEVICE 1
  #include <d3d/d3d8_xbox.h>
 +#else
 +#include <unistd.h>
-+#include "platform/xbox_winnt.h"
 +#endif
  #include "xbox_memory_layout.h"
  #include "nv2a_mmio_hook.h"
  #include "nv2a_state.h"
-@@ -29,9 +33,19 @@ extern bool apu_hook_handle_mmio(PCONTEXT context, uintptr_t fault_address,
+@@ -29,11 +37,21 @@ extern bool apu_hook_handle_mmio(PCONTEXT context, uintptr_t fault_address,
                                   uint32_t guest_address, int is_write);
  
  static PVOID s_mmio_veh;
-+#if defined(_WIN32)
+-#if !defined(XBOXRECOMP_SDL3)
++#if defined(HOST_D3D8_DEVICE)
  static IDirect3D8 *s_d3d;
  static IDirect3DDevice8 *s_device;
+ #endif
  
++#if defined(_WIN32)
 +static uint32_t host_trap_bytes(void) { return 0x1000u; }
 +#else
 +static uint32_t host_trap_bytes(void)
@@ -718,7 +802,7 @@ index b2a89d1..ab0bfaa 100644
  static LONG CALLBACK mmio_handler(PEXCEPTION_POINTERS info)
  {
      uintptr_t fault_address;
-@@ -60,7 +74,10 @@ static LONG CALLBACK mmio_handler(PEXCEPTION_POINTERS info)
+@@ -72,7 +90,10 @@ static LONG CALLBACK mmio_handler(PEXCEPTION_POINTERS info)
              nv2a_mmio_write(gpu, 0x8700, buffer & ~0x11u, 4);
          }
      }
@@ -730,32 +814,21 @@ index b2a89d1..ab0bfaa 100644
          return nv2a_hook_handle_mmio(info->ContextRecord, fault_address,
                                       guest_address, is_write)
              ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
-@@ -108,6 +125,7 @@ void xbox_HostHardwareShutdown(void)
+@@ -120,9 +141,9 @@ void xbox_HostHardwareShutdown(void)
      }
  }
  
-+#if defined(_WIN32)
- static LRESULT CALLBACK graphics_wndproc(HWND window, UINT message,
-                                          WPARAM wparam, LPARAM lparam)
+-#if defined(XBOXRECOMP_SDL3)
+-/* The SDL3 GPU renderer opens its own window and device with the pushbuffer
+- * executor; there is no D3D8 device to make. */
++#if !defined(HOST_D3D8_DEVICE)
++/* The SDL3 GPU renderer, or an including project's own, opens its window and
++ * device with the pushbuffer executor; there is no D3D8 device to make. */
+ int xbox_HostGraphicsInit(const char *window_title)
  {
-@@ -163,6 +181,15 @@ int xbox_HostGraphicsInit(const char *window_title)
-     }
-     fprintf(stderr, "graphics: D3D8/D3D11 device initialized\n");
- 
-+#else
-+int xbox_HostGraphicsInit(const char *window_title)
-+{
-+    DWORD old_protect;
-+
-+    /* The window and device belong to the NV2A backend (nv2a_d3d_init); the
-+     * host's part is the register model and the PVIDEO trap. */
-+    (void)window_title;
-+#endif
-     nv2a_hook_init(g_xbox_mem_offset);
-     /* PVIDEO accesses must execute register semantics, including STOP. */
-     if (!VirtualProtect((void *)((uintptr_t)g_xbox_mem_offset + PVIDEO_PAGE),
+     DWORD old_protect;
 diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
-index caef326..ebd922a 100644
+index 4b84b4f..c3b19cf 100644
 --- a/src/input/CMakeLists.txt
 +++ b/src/input/CMakeLists.txt
 @@ -1,13 +1,20 @@
@@ -777,32 +850,65 @@ index caef326..ebd922a 100644
 +    target_include_directories(xbox_input PRIVATE ${XBOX_INPUT_BACKEND_INCLUDES})
 +    target_link_libraries(xbox_input PUBLIC platform ${XBOX_INPUT_BACKEND_LIBRARIES})
  else()
-     find_package(SDL2 REQUIRED)
-     target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2)
+     include(Sdl3)
+     target_link_libraries(xbox_input PUBLIC platform SDL3::SDL3)
 diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
-index 330a5a3..56568bb 100644
+index ce171f2..623949a 100644
 --- a/src/input/xinput_device.c
 +++ b/src/input/xinput_device.c
-@@ -23,12 +23,16 @@ void xbox_InputSetKeyboardDrivingProbe(XBOX_KEYBOARD_DRIVING_PROBE probe)
+@@ -9,6 +9,7 @@
+  * The keyboard, RECOMP_PADMAP and packet logic are shared; only reading
+  * the host pad differs:
+  *   _WIN32 -> Windows XInput
++ *   macOS  -> the port's XInput over the GameController framework
+  *   other  -> SDL3 gamepads, read into the same XINPUT_STATE
+  */
+ 
+@@ -24,9 +25,14 @@ void xbox_InputSetKeyboardHook(XBOX_KEYBOARD_HOOK hook)
+     s_keyboard_hook = hook;
  }
  
- /* ======================================================================== */
 -#if defined(_WIN32)
 +#if defined(_WIN32) || defined(__APPLE__)
- /* ====================  XInput backend  ================================== */
- /* ======================================================================== */
 +/* macOS: the same XInput calls, over the GameController framework
 + * (mac/include/xinput.h and mac/src/input/gc_xinput.m in the port). */
- 
  #include <xinput.h>
 +#if defined(_WIN32)
  #pragma comment(lib, "xinput.lib")
 +#endif
++#define XBOX_HOST_XINPUT 1
+ #define host_pad_state XInputGetState
+ #else
+ #include <SDL3/SDL.h>
+@@ -477,7 +483,7 @@ static void pad_buttons(const XINPUT_GAMEPAD *g, XBOX_GAMEPAD *out)
  
- static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
- static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
+ void xbox_InputInit(void)
+ {
+-#if !defined(_WIN32)
++#if !defined(XBOX_HOST_XINPUT)
+     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD))
+         fprintf(stderr, "[INPUT] SDL gamepad init failed: %s\n", SDL_GetError());
+ #endif
+@@ -566,7 +572,7 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
+ {
+     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
+         return ERROR_DEVICE_NOT_CONNECTED;
+-#if defined(_WIN32)
++#if defined(XBOX_HOST_XINPUT)
+     {
+         XINPUT_VIBRATION xi_vib;
+         xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
+@@ -595,7 +601,7 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
+ {
+     if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
+         return ERROR_DEVICE_NOT_CONNECTED;
+-#if defined(_WIN32)
++#if defined(XBOX_HOST_XINPUT)
+     {
+         XINPUT_CAPABILITIES xi_caps;
+         DWORD result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
 diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
-index 75c5484..08d0c8e 100644
+index 0c5c422..c57c1cb 100644
 --- a/src/kernel/CMakeLists.txt
 +++ b/src/kernel/CMakeLists.txt
 @@ -44,6 +44,11 @@ if(WIN32)
@@ -818,10 +924,10 @@ index 75c5484..08d0c8e 100644
      # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
      find_package(OpenSSL REQUIRED)
 diff --git a/src/kernel/kernel.h b/src/kernel/kernel.h
-index e6d7182..3a5168a 100644
+index c03ffd5..a921124 100644
 --- a/src/kernel/kernel.h
 +++ b/src/kernel/kernel.h
-@@ -808,6 +808,7 @@ int     xbox_IrqlCurrent(void);
+@@ -806,6 +806,7 @@ int     xbox_IrqlCurrent(void);
  int     xbox_IrqlRaisedCount(void);
  int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
  void    xbox_IrqlLeaveInterrupt(int saved);
@@ -830,10 +936,10 @@ index e6d7182..3a5168a 100644
  /* Total crossings of the DISPATCH boundary, and who is holding it up.
   * A depth that is non-zero while this stops moving is stuck, not busy. */
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 899f180..2346185 100644
+index 45ba396..f306e67 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
-@@ -53,14 +53,8 @@
+@@ -54,14 +54,8 @@
   * xbox_memory_layout.h and must match the definitions there -- a plain extern
   * here binds to the TLS template rather than the calling thread's copy, which
   * reads as every register being zero. */
@@ -850,7 +956,7 @@ index 899f180..2346185 100644
  extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
  extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
-index 98092ac..f759f41 100644
+index d407d6c..2f41597 100644
 --- a/src/kernel/kernel_hal.c
 +++ b/src/kernel/kernel_hal.c
 @@ -54,7 +54,7 @@ int xbox_IrqlCurrent(void)
@@ -902,81 +1008,10 @@ index 98092ac..f759f41 100644
   * KfRaiseIrql - Raises IRQL to the specified level.
   * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).
 diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
-index b67e08c..281bd1e 100644
+index 43dc760..f20a731 100644
 --- a/src/kernel/kernel_path.c
 +++ b/src/kernel/kernel_path.c
-@@ -541,6 +541,70 @@ static void mkdir_p(const char* path)
-         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "mkdir %s: %s", tmp, strerror(errno));
- }
- 
-+/*
-+ * The raw disk device, \Device\Harddisk0\Partition0, as on Win32: an image
-+ * file carrying the retail partition table at sector 4, which XAPI's
-+ * utility-drive mount reads to find X:, Y: and Z:. Without it the open fails
-+ * and the title boots to the dashboard ("no hard disk").
-+ */
-+#include <fcntl.h>
-+
-+#define XBOX_PART_TABLE_OFFSET 0x800
-+#define XBOX_PART_IN_USE       0x80000000u
-+
-+static void xbox_write_partition_table(const char *path)
-+{
-+    static const struct { const char *name; uint32_t start, size; } parts[] = {
-+        { "XBOX_PART_X",  0x00000400, 0x00177000 },  /* X: cache      */
-+        { "XBOX_PART_Y",  0x00177400, 0x00177000 },  /* Y: cache      */
-+        { "XBOX_PART_Z",  0x002EE400, 0x00177000 },  /* Z: cache      */
-+        { "XBOX_PART_C",  0x00465400, 0x000FA000 },  /* C: system     */
-+        { "XBOX_PART_E",  0x0055F400, 0x00465400 },  /* E: game/save  */
-+    };
-+    unsigned char sector[512];
-+    size_t i;
-+    int fd = open(path, O_WRONLY | O_CREAT, 0644);
-+
-+    if (fd < 0)
-+        return;
-+    memset(sector, 0, sizeof(sector));
-+    memcpy(sector, "****PARTINFO****", 16);
-+    for (i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
-+        unsigned char *e = sector + 48 + i * 32;   /* 16 magic + 32 reserved */
-+        uint32_t v[4] = { XBOX_PART_IN_USE, parts[i].start, parts[i].size, 0 };
-+        size_t n = strlen(parts[i].name);
-+        memset(e, ' ', 16);
-+        memcpy(e, parts[i].name, n < 16 ? n : 16);
-+        memcpy(e + 16, v, sizeof(v));
-+    }
-+    if (pwrite(fd, sector, sizeof(sector), XBOX_PART_TABLE_OFFSET) != (ssize_t)sizeof(sector))
-+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "partition table %s: %s", path, strerror(errno));
-+    close(fd);
-+}
-+
-+/* "\Device\Harddisk0\PartitionN" exactly -> <save>/PartitionN.img (see the
-+ * Win32 twin above). Unlike Win32, a trailing separator stays a directory
-+ * open: XAPI opens "Partition1\" as the root of E: with FILE_DIRECTORY_FILE,
-+ * which open(2) cannot satisfy on an image file. */
-+static BOOL xbox_partition_device_path(const char *xbox_path, char *out, DWORD n)
-+{
-+    static const char *prefix = "\\Device\\Harddisk0\\Partition";
-+    int len = match_prefix(xbox_path, prefix);
-+    int digit;
-+    const char *rest;
-+
-+    if (!len)
-+        return FALSE;
-+    digit = xbox_path[len];
-+    if (digit < '0' || digit > '9')
-+        return FALSE;
-+    rest = xbox_path + len + 1;
-+    if (*rest != '\0')
-+        return FALSE;
-+    snprintf(out, n, "%s/Partition%c.img", s_save_dir, digit);
-+    return TRUE;
-+}
-+
- void xbox_path_init(const char* game_dir, const char* save_dir)
- {
-     s_explicit_save_root = save_dir && save_dir[0];
-@@ -557,6 +621,12 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
+@@ -567,6 +567,12 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
      if (s_explicit_save_root) {
          snprintf(s_save_dir, sizeof(s_save_dir), "%s", save_dir);
      } else {
@@ -989,7 +1024,7 @@ index b67e08c..281bd1e 100644
          /* XDG base-directory spec: $XDG_DATA_HOME or ~/.local/share */
          const char* xdg = getenv("XDG_DATA_HOME");
          if (xdg && xdg[0]) {
-@@ -566,16 +636,53 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
+@@ -576,10 +582,20 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
              snprintf(s_save_dir, sizeof(s_save_dir), "%s/.local/share/xboxrecomp",
                       (home && home[0]) ? home : ".");
          }
@@ -998,12 +1033,6 @@ index b67e08c..281bd1e 100644
  
      strip_trailing_slash(s_game_dir);
      strip_trailing_slash(s_save_dir);
--    if (s_explicit_save_root) {
--        char dir[MAX_PATH];
--        snprintf(dir, sizeof(dir), "%s/UDATA", s_save_dir);
--        mkdir_p(dir);
--        snprintf(dir, sizeof(dir), "%s/TDATA", s_save_dir);
--        mkdir_p(dir);
 +    /* Absolute, so a relative save root keeps meaning the same place. */
 +    if (s_save_dir[0] != '/') {
 +        char cwd[MAX_PATH], full[MAX_PATH];
@@ -1013,63 +1042,23 @@ index b67e08c..281bd1e 100644
 +        }
 +    }
 +
-+    /* The save-side directories and the partition images, as on Win32: a
-+     * title creating a file under T:/U:/Z: needs the parent to exist, and one
-+     * that opens a partition device reads it as a disk. */
-+    {
-+        static const char *subs[] = { "TitleData", "UserData", "Cache",
-+                                      "SystemData", "UDATA", "TDATA" };
-+        static const unsigned long long part_sectors[6] = {
-+            0, 0x00465400ull, 0x000FA000ull, 0x00177000ull, 0x00177000ull, 0x00177000ull,
-+        };
-+        char path[MAX_PATH];
-+        int i;
-+
-+        mkdir_p(s_save_dir);
-+        for (i = 0; i < (int)(sizeof(subs) / sizeof(subs[0])); i++) {
-+            if (i >= 4 && !s_explicit_save_root) continue;
-+            snprintf(path, sizeof(path), "%s/%s", s_save_dir, subs[i]);
-+            mkdir_p(path);
-+        }
-+        snprintf(path, sizeof(path), "%s/Partition0.img", s_save_dir);
-+        xbox_write_partition_table(path);
-+        /* Sized to the table's geometry; APFS leaves the unwritten extent
-+         * sparse, so the 750 MB cache partitions cost nothing until used. */
-+        for (i = 1; i <= 5; i++) {
-+            struct stat st;
-+            int fd;
-+            snprintf(path, sizeof(path), "%s/Partition%d.img", s_save_dir, i);
-+            fd = open(path, O_RDWR | O_CREAT, 0644);
-+            if (fd < 0) continue;
-+            if (fstat(fd, &st) == 0 && (unsigned long long)st.st_size < part_sectors[i] * 512ull)
-+                if (ftruncate(fd, (off_t)(part_sectors[i] * 512ull)) != 0)
-+                    xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "size %s: %s", path, strerror(errno));
-+            close(fd);
-+        }
-     }
- 
-     s_initialized = TRUE;
-@@ -602,6 +709,11 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
-             return xbox_translate_path(linked, host_path_buf, buf_size);
-     }
- 
-+    if (xbox_partition_device_path(xbox_path, host_path_buf, buf_size)) {
-+        XBOX_TRACE(XBOX_LOG_PATH, "%s -> partition image", xbox_path);
-+        return TRUE;
-+    }
-+
-     for (int i = 0; i < PATH_RULE_COUNT; i++) {
-         skip = match_prefix(xbox_path, s_rules[i].prefix);
-         if (skip) {
-@@ -620,6 +732,8 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
-     return TRUE;
- 
- translate:
-+    if (g_xbox_path_hook)
-+        g_xbox_path_hook(xbox_path);
+     /* The save-side directories and the partition devices, as the Win32
+      * backend makes them (see there for why each must exist). */
      {
-         char remainder_posix[MAX_PATH];
-         snprintf(remainder_posix, sizeof(remainder_posix), "%s", remainder);
+@@ -691,8 +707,12 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
+     }
+ 
+     {
++        /* Unlike Win32, a trailing separator stays a directory open: XAPI
++         * opens "Partition1\" as the root of E: with FILE_DIRECTORY_FILE,
++         * which open(2) cannot satisfy on an image file. */
+         int index = xbox_partition_device_index(xbox_path);
+-        if (index >= 0) {
++        size_t n = strlen(xbox_path);
++        if (index >= 0 && xbox_path[n - 1] != '\\' && xbox_path[n - 1] != '/') {
+             snprintf(host_path_buf, buf_size, "%s/Partition%d.img", s_save_dir, index);
+             XBOX_TRACE(XBOX_LOG_PATH, "%s -> partition image", xbox_path);
+             return TRUE;
 diff --git a/src/kernel/kernel_rtl.c b/src/kernel/kernel_rtl.c
 index 03f016f..a78ecc2 100644
 --- a/src/kernel/kernel_rtl.c
@@ -1105,10 +1094,10 @@ index 4fd7692..7a4f999 100644
      /* Set log level from environment variable if present */
      const char* log_env = getenv("XBOX_LOG_LEVEL");
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index 0741761..4c5c497 100644
+index ca579d6..1b0d4d7 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
-@@ -237,6 +237,7 @@ typedef struct {
+@@ -265,6 +265,7 @@ typedef struct {
      int      valid;
      /* Raw registers the D3D11 path needs as well. */
      uint32_t format_raw, address_raw, control0, border, palette_len;
@@ -1116,7 +1105,7 @@ index 0741761..4c5c497 100644
      float    bump_mat[4], bump_scale, bump_offset;
  } Texture;
  
-@@ -2632,6 +2633,7 @@ static void d3d_fill_state(NvD3DState *st)
+@@ -2712,6 +2713,7 @@ static void d3d_fill_state(NvD3DState *st)
          o->format = t->format_raw;
          o->color = t->color;
          o->width = t->width; o->height = t->height;
@@ -1124,7 +1113,7 @@ index 0741761..4c5c497 100644
          o->pitch = t->pitch;
          o->levels = t->levels;
          o->cube = (uint32_t)t->cube;
-@@ -3415,6 +3417,12 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -3510,6 +3512,12 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          t->color = (param >> 8) & 0xFF;
          t->cube = (param >> 2) & 1;
          t->levels = (param >> 16) & 0xF;
@@ -1214,7 +1203,7 @@ index 0b2d723..0823731 100644
  /* A run that recurses produces trace lines without limit, and the useful
   * window is rarely the first few thousand. The budget stops a diagnostic from
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 95035e6..b23a796 100644
+index 67bcb37..73696f7 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
 @@ -16,6 +16,7 @@
@@ -1225,7 +1214,7 @@ index 95035e6..b23a796 100644
  #include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
-@@ -363,6 +364,10 @@ static volatile LONG g_nv2a_dma_sync;
+@@ -436,6 +437,10 @@ static volatile LONG g_nv2a_dma_sync;
  void xbox_Nv2aDmaPublish(uint32_t put_va, uint32_t value)
  {
      volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
@@ -1236,7 +1225,7 @@ index 95035e6..b23a796 100644
      if (!regs || put_va != XBOX_NV2A_BASE + NV2A_USER_DMA_PUT) {
          /* Software channels keep exactly the original guest store, including
           * its normal fault behavior if the supplied address is invalid. */
-@@ -463,6 +468,58 @@ static void ac97_clear_reset_bits(void)
+@@ -537,6 +542,58 @@ static void ac97_clear_reset_bits(void *page)
      }
  }
  
@@ -1284,7 +1273,7 @@ index 95035e6..b23a796 100644
 +        return EXCEPTION_CONTINUE_SEARCH;
 +    ok = mmio_emulate(ep->ContextRecord, (uint32_t)(fault - base), NULL,
 +                      ac97_page_rd, ac97_page_wr);
-+    ac97_clear_reset_bits();
++    ac97_clear_reset_bits(g_ac97_page);
 +    VirtualProtect((LPVOID)base, (SIZE_T)getpagesize(), PAGE_READONLY, &old);
 +    if (!ok)
 +        fprintf(stderr, "  AC97: undecoded store %08X\n",
@@ -1295,7 +1284,7 @@ index 95035e6..b23a796 100644
  static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
  {
      DWORD code = ep->ExceptionRecord->ExceptionCode;
-@@ -500,6 +557,7 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
+@@ -583,6 +640,7 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
      }
      return EXCEPTION_CONTINUE_SEARCH;
  }
@@ -1303,7 +1292,7 @@ index 95035e6..b23a796 100644
  
  /* Arm the trap. Called once the MCPX aperture exists, and only alongside the
   * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
-@@ -1291,6 +1349,25 @@ static int64_t nv2a_ack_hitch_checkpoint(int64_t frequency, int64_t begin,
+@@ -1424,6 +1482,25 @@ static int64_t nv2a_ack_hitch_checkpoint(int64_t frequency, int64_t begin,
      return now.QuadPart;
  }
  
@@ -1329,7 +1318,7 @@ index 95035e6..b23a796 100644
  static DWORD WINAPI nv2a_ack_thread(LPVOID param)
  {
      extern int nv2a_d3d_writeback_busy(void);
-@@ -1372,6 +1449,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -1505,6 +1582,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
              static uint32_t last_put;
              DWORD now_ms = GetTickCount();
              uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
@@ -1338,7 +1327,7 @@ index 95035e6..b23a796 100644
              if (put != last_put || (now_ms - last_put_ms) > 2000) {
                  int consumed = 1;
                  /* Survey the segment the title just submitted, once. */
-@@ -1445,7 +1524,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -1578,7 +1657,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  s_scan_incomplete = !consumed;
                  if (!consumed) {
                      /* Retry next tick, allowing clocks/presentation to run. */
@@ -1347,7 +1336,7 @@ index 95035e6..b23a796 100644
                      s_get_held = 1;
                      s_get_held_value = put;
                      s_get_held_notify = s_notify_executed;
-@@ -1559,7 +1638,6 @@ uint32_t g_xbox_code_hi = 0;
+@@ -1692,7 +1771,6 @@ uint32_t g_xbox_code_hi = 0;
  /* Global registers for recompiled code (via recomp_types.h) */
  /* Each guest thread's TIB. The first thread uses the one the loader built;
   * a spawned thread gets its own from xbox_AllocThreadTib(). */
@@ -1355,7 +1344,7 @@ index 95035e6..b23a796 100644
  
  /* The shape of the TLS block the loader built, so a new thread can be
   * given one just like it: where the initialised image data starts, how
-@@ -1567,8 +1645,12 @@ RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
+@@ -1700,8 +1778,12 @@ RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
   * at is. Zero total means the image had no TLS directory. */
  static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
  
@@ -1370,7 +1359,7 @@ index 95035e6..b23a796 100644
  
  #ifdef RECOMP_ABI_CHECK
  /* Report a lifted function that returned without restoring ebx/esi/edi.
-@@ -1630,9 +1712,6 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+@@ -1763,9 +1845,6 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  #endif
  
  /* SEH frame pointer bridge (see recomp_types.h for explanation) */
@@ -1380,7 +1369,7 @@ index 95035e6..b23a796 100644
  
  /* Set once at startup. The generated code reads it at the ret of every
   * --force-return function, so it has to be cheap and it has to default to
-@@ -1641,13 +1720,8 @@ RECOMP_TLS int g_fp_top = 0;
+@@ -1774,13 +1853,8 @@ RECOMP_TLS int g_fp_top = 0;
  int g_force_return = 0;
  /* x87 control and status. The reset default masks every exception and
   * rounds to nearest, which is what the CRT expects before _control87. */
@@ -1394,7 +1383,7 @@ index 95035e6..b23a796 100644
  
  /* ---- non-local jumps ---------------------------------------------------
   *
-@@ -1841,6 +1915,46 @@ static void watch_report(void)
+@@ -1974,6 +2048,46 @@ static void watch_report(void)
      fflush(stderr);
  }
  
@@ -1441,7 +1430,7 @@ index 95035e6..b23a796 100644
  static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
  {
      DWORD code = ep->ExceptionRecord->ExceptionCode;
-@@ -1872,6 +1986,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
+@@ -2005,6 +2119,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
      }
      return EXCEPTION_CONTINUE_SEARCH;
  }
@@ -1449,7 +1438,7 @@ index 95035e6..b23a796 100644
  
  /* The target, which may be reached through pointers that do not exist yet.
   *
-@@ -1966,7 +2081,7 @@ static int watch_arm(uint32_t va)
+@@ -2099,7 +2214,7 @@ static int watch_arm(uint32_t va)
                                         + g_watch_va);
      /* The page holding the guest dword, in host terms. */
      g_watch_page = (void *)(((uintptr_t)((const uint8_t *)g_memory_offset
@@ -1458,7 +1447,7 @@ index 95035e6..b23a796 100644
      g_watch_veh = AddVectoredExceptionHandler(1, watch_veh);
      if (!g_watch_veh
              || !VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old)) {
-@@ -2146,7 +2261,6 @@ RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
+@@ -2279,7 +2394,6 @@ RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
  RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
  /* Last frame established by `mov ebp, esp`. Read by frameless functions
   * that address their caller's frame through ebp. */
@@ -1466,7 +1455,7 @@ index 95035e6..b23a796 100644
  
  /* EFLAGS.DF. Zero means the string instructions walk forwards, which is the
   * ABI's resting state and what almost every one of them does -- so this is
-@@ -2155,7 +2269,6 @@ RECOMP_TLS uint32_t g_ebp = 0;
+@@ -2288,7 +2402,6 @@ RECOMP_TLS uint32_t g_ebp = 0;
   * `std; repne scasb`, and memmove goes backwards when its regions overlap the
   * wrong way. Thread-local, because `std` and the `cld` that undoes it can land
   * in different lifted bodies of the same guest routine. */
@@ -1474,11 +1463,23 @@ index 95035e6..b23a796 100644
  
  /* ICALL trace ring buffer */
  volatile uint32_t g_icall_trace[16] = {0};
+@@ -2981,6 +3094,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+ 
+     /* Set the global offset for recompiled code MEM macros */
+     g_xbox_mem_offset = g_memory_offset;
++#if !defined(_WIN32)
++    /* Guest RAM stays mapped for the whole run (a guest free returns heap
++     * blocks or zeroes them; it never unmaps). */
++    w32_set_resident_range((const void *)g_memory_offset, g_memory_size);
++#endif
+ 
+     /*
+      * Initialize the Xbox stack for recompiled code.
 diff --git a/src/kernel/xbox_memory_layout.h b/src/kernel/xbox_memory_layout.h
-index 66ec47a..746fd15 100644
+index d595f9e..d3ec04b 100644
 --- a/src/kernel/xbox_memory_layout.h
 +++ b/src/kernel/xbox_memory_layout.h
-@@ -416,7 +416,7 @@ typedef union RecompXmm {
+@@ -433,7 +433,7 @@ typedef union RecompXmm {
  #define XBOX_KPCR_IRQL_OFFSET       0x24u
  #define XBOX_KPCR_DPC_ACTIVE_OFFSET 0x58u
  #define XBOX_TIB_MAIN       0x00004000
@@ -1488,22 +1489,22 @@ index 66ec47a..746fd15 100644
  
  #define XBOX_STACK_BASE     0x00780000
 diff --git a/src/net/nvnet.c b/src/net/nvnet.c
-index c6cb31e..dcdffdd 100644
+index 438e616..54a5533 100644
 --- a/src/net/nvnet.c
 +++ b/src/net/nvnet.c
-@@ -39,9 +39,7 @@ extern recomp_func_t recomp_lookup(uint32_t xbox_va);
- extern int  xbox_worker_stack_alloc(void);
- extern void xbox_worker_stack_free(int slot);
+@@ -39,9 +39,7 @@
+ typedef void (*recomp_func_t)(void);
+ extern recomp_func_t recomp_lookup(uint32_t xbox_va);
  extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
--extern __declspec(thread) uint32_t g_eax, g_ecx, g_edx, g_esp;
--extern __declspec(thread) uint32_t g_ebx, g_esi, g_edi;
--extern __declspec(thread) uint32_t g_fs_base;
+-extern XBOX_THREAD_LOCAL uint32_t g_eax, g_ecx, g_edx, g_esp;
+-extern XBOX_THREAD_LOCAL uint32_t g_ebx, g_esi, g_edi;
+-extern XBOX_THREAD_LOCAL uint32_t g_fs_base;
 +#include "../kernel/recomp_thread_state.h"
- extern uint32_t xbox_AllocThreadTib(void);
  
  #define NIC_BASE    0xFEF00000u
+ #define NIC_SIZE    0x1000u     /* the page; the registers are the first 0x400 */
 diff --git a/src/nv2a/nv2a_mmio_hook.c b/src/nv2a/nv2a_mmio_hook.c
-index 86e09cc..81d95b3 100644
+index bb294d6..7b7e3ed 100644
 --- a/src/nv2a/nv2a_mmio_hook.c
 +++ b/src/nv2a/nv2a_mmio_hook.c
 @@ -8,6 +8,7 @@
@@ -1518,8 +1519,8 @@ index 86e09cc..81d95b3 100644
   * (regardless of whether the MMIO hook is active). Keep its definition
   * outside the Win32 guard. */
  
--#if defined(_WIN32)
-+#if defined(_WIN32) || (defined(__APPLE__) && defined(__aarch64__))
+-#if defined(_WIN32) || defined(__x86_64__)
++#if defined(_WIN32) || defined(__x86_64__) || (defined(__APPLE__) && defined(__aarch64__))
  
  static SRWLOCK g_pvideo_lock = SRWLOCK_INIT;
  
@@ -1527,7 +1528,7 @@ index 86e09cc..81d95b3 100644
      ReleaseSRWLockExclusive(&g_pvideo_lock);
  }
  
-+#if defined(_WIN32)
++#if defined(_WIN32) || defined(__x86_64__)
  /* ============================================================
   * x86-64 register access helpers
   * ============================================================ */
@@ -1574,11 +1575,17 @@ index 86e09cc..81d95b3 100644
      return false;
  }
  
--#else /* !_WIN32 -- SIGSEGV-based MMIO trapping deferred to main.c port */
-+#else /* no MMIO trapping on this host */
+-#else /* no x86-64 instruction decoder for this host */
++#else /* no instruction decoder for this host */
  
  bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4])
  { (void)regs; return false; }
+@@ -464,4 +498,4 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+ bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
+ { (void)fault_addr; (void)fault_xbox_va; return false; }
+ 
+-#endif /* _WIN32 || __x86_64__ */
++#endif /* _WIN32 || __x86_64__ || arm64 Darwin */
 diff --git a/src/platform/CMakeLists.txt b/src/platform/CMakeLists.txt
 index 503aad1..17e8290 100644
 --- a/src/platform/CMakeLists.txt
@@ -1593,22 +1600,22 @@ index 503aad1..17e8290 100644
          ${XBOXRECOMP_SRC_DIR}
          ${CMAKE_CURRENT_SOURCE_DIR}
 diff --git a/src/platform/mmio_decode.h b/src/platform/mmio_decode.h
-index c0dd9e0..4889218 100644
+index 5bfeb2b..bddba4b 100644
 --- a/src/platform/mmio_decode.h
 +++ b/src/platform/mmio_decode.h
 @@ -28,13 +28,13 @@
  
  #include <stdint.h>
  
--#if defined(_WIN32)
--#include <windows.h>
+-#if defined(_WIN32) || defined(__x86_64__)
+-#include "xbox_winnt.h"
 -
  /* Service one register access. dev is passed straight back to the callbacks. */
  typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
  typedef void     (*mmio_write_fn)(void *dev, uint32_t off, uint64_t val, int size);
  
-+#if defined(_WIN32)
-+#include <windows.h>
++#if defined(_WIN32) || defined(__x86_64__)
++#include "xbox_winnt.h"
 +
  static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
  {
@@ -1617,7 +1624,7 @@ index c0dd9e0..4889218 100644
      }
  }
  
--#endif /* _WIN32 */
+-#endif /* _WIN32 || __x86_64__ */
 +#elif defined(__APPLE__) && defined(__aarch64__)
 +/*
 + * arm64: the access is one A64 load or store, and the instruction set makes
@@ -1844,7 +1851,7 @@ index c0dd9e0..4889218 100644
 +    return *(const uint32_t *)(uintptr_t)ctx->ss->__pc;
 +}
 +
-+#endif /* _WIN32 / arm64 Darwin */
++#endif /* _WIN32 || __x86_64__ / arm64 Darwin */
  #endif /* MMIO_DECODE_H */
 diff --git a/src/platform/posix_veh.c b/src/platform/posix_veh.c
 new file mode 100644
@@ -2012,10 +2019,10 @@ index 0000000..5a4604b
 +
 +#endif /* __APPLE__ && __aarch64__ */
 diff --git a/src/platform/win32_compat.c b/src/platform/win32_compat.c
-index 350c8f6..9419960 100644
+index 110bf48..0821f5a 100644
 --- a/src/platform/win32_compat.c
 +++ b/src/platform/win32_compat.c
-@@ -167,6 +167,8 @@ VOID AcquireSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_rdlock(srw_lazy_in
+@@ -174,6 +174,8 @@ VOID AcquireSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_rdlock(srw_lazy_in
  VOID ReleaseSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_unlock(srw_lazy_init(lock)); }
  VOID AcquireSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_wrlock(srw_lazy_init(lock)); }
  VOID ReleaseSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_unlock(srw_lazy_init(lock)); }
@@ -2024,238 +2031,26 @@ index 350c8f6..9419960 100644
  
  /* ===================================================================== */
  /* One-time initialisation                                               */
-@@ -280,6 +282,7 @@ typedef struct w32_object {
-     int             exited;
+@@ -450,6 +452,7 @@ struct w32_object {
+     int             thread_termination_requested;
      DWORD           exit_code;
      int             suspend_count;
 +    int             running;        /* past the CREATE_SUSPENDED gate */
      pthread_cond_t  gate;
      LPTHREAD_START_ROUTINE start;
      LPVOID          start_param;
-@@ -323,10 +326,98 @@ DWORD GetCurrentThreadId(void)
-     return t_tid;
- }
- 
-+BOOL GetComputerNameA(char *buf, LPDWORD size)
-+{
-+    if (!buf || !size || *size == 0)
-+        return FALSE;
-+    if (gethostname(buf, *size) != 0) {
-+        buf[0] = '\0';
-+        return FALSE;
-+    }
-+    buf[*size - 1] = '\0';
-+    *size = (DWORD)strlen(buf);
-+    return TRUE;
-+}
-+
- DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
- HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
- HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
- 
-+/* What makes a HANDLE one of ours. Win32 answers ERROR_INVALID_HANDLE for a
-+ * value that names no object; here a HANDLE is a pointer, and the kernel HLE
-+ * does pass values that are not -- a guest dispatcher object's address when
-+ * no shadow event exists, or a raw guest VA. Dereferencing one either locks
-+ * a "mutex" made of guest data or faults outright, so each entry point
-+ * resolves through obj_of, which looks the value up in a registry of live
-+ * objects (as the Win32 handle table would) without touching it. */
-+static pthread_mutex_t s_reg_lock = PTHREAD_MUTEX_INITIALIZER;
-+static uintptr_t *s_reg;                  /* open addressing; 0 empty, 1 removed */
-+static size_t s_reg_cap, s_reg_used, s_reg_live;
-+
-+static size_t reg_slot(uintptr_t p, size_t cap)
-+{
-+    return (size_t)(((uint64_t)(p >> 4) * 0x9E3779B97F4A7C15ull) >> 20) & (cap - 1);
-+}
-+
-+static void reg_grow(void)
-+{
-+    size_t cap = s_reg_cap ? s_reg_cap * 2 : 1024, i;
-+    uintptr_t *t = (uintptr_t *)calloc(cap, sizeof *t);
-+    if (!t) abort();
-+    for (i = 0; i < s_reg_cap; i++)
-+        if (s_reg[i] > 1) {
-+            size_t j = reg_slot(s_reg[i], cap);
-+            while (t[j]) j = (j + 1) & (cap - 1);
-+            t[j] = s_reg[i];
-+        }
-+    free(s_reg);
-+    s_reg = t;
-+    s_reg_cap = cap;
-+    s_reg_used = s_reg_live;
-+}
-+
-+static void reg_add(const void *o)
-+{
-+    size_t j;
-+    pthread_mutex_lock(&s_reg_lock);
-+    if ((s_reg_used + 1) * 2 > s_reg_cap) reg_grow();
-+    j = reg_slot((uintptr_t)o, s_reg_cap);
-+    while (s_reg[j] > 1) j = (j + 1) & (s_reg_cap - 1);
-+    if (!s_reg[j]) s_reg_used++;
-+    s_reg[j] = (uintptr_t)o;
-+    s_reg_live++;
-+    pthread_mutex_unlock(&s_reg_lock);
-+}
-+
-+static size_t reg_find_locked(uintptr_t p)
-+{
-+    size_t j;
-+    if (!s_reg_cap) return (size_t)-1;
-+    for (j = reg_slot(p, s_reg_cap); s_reg[j]; j = (j + 1) & (s_reg_cap - 1))
-+        if (s_reg[j] == p) return j;
-+    return (size_t)-1;
-+}
-+
-+static void reg_remove(const void *o)
-+{
-+    size_t j;
-+    pthread_mutex_lock(&s_reg_lock);
-+    j = reg_find_locked((uintptr_t)o);
-+    if (j != (size_t)-1) { s_reg[j] = 1; s_reg_live--; }
-+    pthread_mutex_unlock(&s_reg_lock);
-+}
-+
-+static w32_object *obj_of(HANDLE h)
-+{
-+    size_t j;
-+    if (!h || h == INVALID_HANDLE_VALUE || (uintptr_t)h < 0x10000u || ((uintptr_t)h & 7u))
-+        return NULL;
-+    pthread_mutex_lock(&s_reg_lock);
-+    j = reg_find_locked((uintptr_t)h);
-+    pthread_mutex_unlock(&s_reg_lock);
-+    return j == (size_t)-1 ? NULL : (w32_object *)h;
-+}
-+
- static w32_object *obj_alloc(w32_kind kind)
- {
-     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
-@@ -335,6 +426,7 @@ static w32_object *obj_alloc(w32_kind kind)
-     pthread_mutex_init(&o->lock, NULL);
-     pthread_cond_init(&o->cond, NULL);
-     pthread_cond_init(&o->gate, NULL);
-+    reg_add(o);
-     return o;
- }
- 
-@@ -342,6 +434,7 @@ static void obj_release(w32_object *o)
- {
-     if (InterlockedDecrement(&o->refcount) > 0)
-         return;
-+    reg_remove(o);
-     if (o->kind == K_FILE) {
-         if (o->fd >= 0) close(o->fd);
-         free(o->file_path);
-@@ -367,13 +460,13 @@ HANDLE w32_open_handle(int fd, const char *host_path)
- 
- int w32_handle_fd(HANDLE h)
- {
--    w32_object *o = (w32_object *)h;
-+    w32_object *o = obj_of(h);
-     return (o && o->kind == K_FILE) ? o->fd : -1;
- }
- 
- const char *w32_handle_path(HANDLE h)
- {
--    w32_object *o = (w32_object *)h;
-+    w32_object *o = obj_of(h);
-     return (o && o->kind == K_FILE) ? o->file_path : NULL;
- }
- 
-@@ -382,7 +475,11 @@ BOOL CloseHandle(HANDLE h)
-     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
-         h == INVALID_HANDLE_VALUE)
-         return TRUE;
--    obj_release((w32_object *)h);
-+    if (!obj_of(h)) {
-+        SetLastError(ERROR_INVALID_HANDLE);
-+        return FALSE;
-+    }
-+    obj_release(obj_of(h));
-     return TRUE;
- }
- 
-@@ -394,7 +491,8 @@ BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
-     if (src == PSEUDO_CURRENT_THREAD)  src = GetCurrentThread();
-     if (src == PSEUDO_CURRENT_PROCESS) { *dst = src; return TRUE; }
-     if (src == PSEUDO_CURRENT_THREAD || !src) { *dst = src; return TRUE; }
--    w32_object *o = (w32_object *)src;
-+    w32_object *o = obj_of(src);
-+    if (!o) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-     InterlockedIncrement(&o->refcount);
-     *dst = src;
-     if (options & DUPLICATE_CLOSE_SOURCE)
-@@ -514,7 +612,11 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
- {
-     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
-         return WAIT_OBJECT_0;
--    return wait_single((w32_object *)h, ms);
-+    if (!obj_of(h)) {
-+        SetLastError(ERROR_INVALID_HANDLE);
-+        return WAIT_FAILED;
-+    }
-+    return wait_single(obj_of(h), ms);
- }
- 
- DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
-@@ -586,7 +688,7 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
- 
- BOOL SetEvent(HANDLE h)
- {
--    w32_object *o = (w32_object *)h;
-+    w32_object *o = obj_of(h);
-     if (!o || o->kind != K_EVENT) return FALSE;
-     pthread_mutex_lock(&o->lock);
-     o->signaled = 1;
-@@ -597,7 +699,7 @@ BOOL SetEvent(HANDLE h)
- 
- BOOL ResetEvent(HANDLE h)
- {
--    w32_object *o = (w32_object *)h;
-+    w32_object *o = obj_of(h);
-     if (!o || o->kind != K_EVENT) return FALSE;
-     pthread_mutex_lock(&o->lock);
-     o->signaled = 0;
-@@ -607,7 +709,7 @@ BOOL ResetEvent(HANDLE h)
- 
- BOOL PulseEvent(HANDLE h)
- {
--    w32_object *o = (w32_object *)h;
-+    w32_object *o = obj_of(h);
-     if (!o || o->kind != K_EVENT) return FALSE;
-     pthread_mutex_lock(&o->lock);
-     o->signaled = 1;
-@@ -637,7 +739,7 @@ HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LP
- 
- BOOL ReleaseSemaphore(HANDLE h, LONG releaseCount, PLONG previousCount)
- {
--    w32_object *o = (w32_object *)h;
-+    w32_object *o = obj_of(h);
-     if (!o || o->kind != K_SEM) return FALSE;
-     pthread_mutex_lock(&o->lock);
-     if (previousCount) *previousCount = (LONG)o->sem_count;
-@@ -667,7 +769,7 @@ HANDLE CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCWSTR name)
- 
- BOOL ReleaseMutex(HANDLE h)
- {
--    w32_object *o = (w32_object *)h;
-+    w32_object *o = obj_of(h);
-     if (!o || o->kind != K_MUTEX) {
-         SetLastError(ERROR_INVALID_HANDLE);
-         return FALSE;
-@@ -701,6 +803,7 @@ static void *thread_trampoline(void *arg)
-     pthread_mutex_lock(&o->lock);
+@@ -1411,6 +1414,7 @@ static void *thread_trampoline(void *arg)
      while (o->suspend_count > 0)
          pthread_cond_wait(&o->gate, &o->lock);
+     pthread_cleanup_pop(0);
 +    o->running = 1;
      pthread_mutex_unlock(&o->lock);
  
      DWORD rc = o->start ? o->start(o->start_param) : 0;
-@@ -730,8 +833,15 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
- 
-     pthread_attr_t attr;
-     pthread_attr_init(&attr);
+@@ -1453,8 +1457,15 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
+         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+         return NULL;
+     }
 -    if (stackSize)
 -        pthread_attr_setstacksize(&attr, stackSize < 65536 ? 65536 : stackSize);
 +    /* Win32 commits stackSize inside a reservation of at least 1 MB; a
@@ -2270,21 +2065,7 @@ index 350c8f6..9419960 100644
  
      if (pthread_create(&o->thread, &attr, thread_trampoline, o) != 0) {
          pthread_attr_destroy(&attr);
-@@ -764,7 +874,7 @@ VOID ExitThread(DWORD exitCode)
- 
- BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
- {
--    w32_object *o = (w32_object *)h;
-+    w32_object *o = obj_of(h);
-     if (!o || o->kind != K_THREAD || !exitCode) return FALSE;
-     pthread_mutex_lock(&o->lock);
-     *exitCode = o->exited ? o->exit_code : STILL_ACTIVE;
-@@ -774,32 +884,52 @@ BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
- 
- DWORD ResumeThread(HANDLE h)
- {
--    w32_object *o = (w32_object *)h;
-+    w32_object *o = obj_of(h);
+@@ -1497,21 +1508,41 @@ DWORD ResumeThread(HANDLE h)
      if (!o || o->kind != K_THREAD) return (DWORD)-1;
      pthread_mutex_lock(&o->lock);
      DWORD prev = (DWORD)o->suspend_count;
@@ -2305,13 +2086,12 @@ index 350c8f6..9419960 100644
  {
 -    /* True mid-run suspension is not supported on POSIX; only the
 -     * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
--    w32_object *o = (w32_object *)h;
 +    /* Before the thread runs, the count holds it at the CREATE_SUSPENDED
 +     * gate. Once it runs, Darwin suspends it for real through its Mach
 +     * thread (a thread suspending itself releases the lock first, or its
 +     * resumer could never take it); elsewhere mid-run suspension is not
 +     * supported and only the count is kept. */
-+    w32_object *o = obj_of(h);
+     w32_object *o = obj_lookup(h);
      if (!o || o->kind != K_THREAD) return (DWORD)-1;
      pthread_mutex_lock(&o->lock);
      DWORD prev = (DWORD)o->suspend_count;
@@ -2330,94 +2110,53 @@ index 350c8f6..9419960 100644
      pthread_mutex_unlock(&o->lock);
      return prev;
  }
+@@ -1932,7 +1963,8 @@ static w32_view s_views[512];
+ static pthread_mutex_t s_views_lock = PTHREAD_MUTEX_INITIALIZER;
+ static uint64_t s_next_view_allocation_id = 1;
  
- BOOL TerminateThread(HANDLE h, DWORD exitCode)
+-static size_t vm_page_size(void)
++/* Not vm_page_size: Darwin's <mach/mach.h> declares a global of that name. */
++static size_t w32_page_size(void)
  {
--    w32_object *o = (w32_object *)h;
-+    w32_object *o = obj_of(h);
-     if (!o || o->kind != K_THREAD) return FALSE;
-     pthread_cancel(o->thread);
-     pthread_mutex_lock(&o->lock);
-@@ -813,14 +943,14 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
+     long value = sysconf(_SC_PAGESIZE);
+     return value > 0 ? (size_t)value : 4096;
+@@ -1940,7 +1972,7 @@ static size_t vm_page_size(void)
  
- BOOL SetThreadPriority(HANDLE h, int priority)
+ static int vm_round_size(SIZE_T size, size_t *rounded)
  {
--    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
-+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_of(h);
-     if (o && o->kind == K_THREAD) o->priority = priority;
-     return TRUE;   /* real RT priorities need privileges; tracked only */
- }
+-    size_t page = vm_page_size();
++    size_t page = w32_page_size();
+     if (!size || size > SIZE_MAX - (page - 1)) return 0;
+     *rounded = (size + page - 1) & ~(page - 1);
+     return 1;
+@@ -1950,7 +1982,7 @@ static int vm_reservation_range(void *address, SIZE_T size,
+                                void **base_out, size_t *size_out)
+ {
+     const uintptr_t granularity = 64 * 1024;
+-    uintptr_t page = (uintptr_t)vm_page_size();
++    uintptr_t page = (uintptr_t)w32_page_size();
+     uintptr_t start = (uintptr_t)address;
+     if (!size || size > UINTPTR_MAX - start) return 0;
+     uintptr_t lo = address ? start & ~(granularity - 1) : start;
+@@ -1966,7 +1998,7 @@ static int vm_reservation_range(void *address, SIZE_T size,
+ static int vm_normalize_range(void *address, SIZE_T size,
+                               void **base_out, size_t *size_out)
+ {
+-    uintptr_t page = (uintptr_t)vm_page_size();
++    uintptr_t page = (uintptr_t)w32_page_size();
+     uintptr_t start = (uintptr_t)address;
+     if (!size || size > UINTPTR_MAX - start) return 0;
+     uintptr_t lo = start & ~(page - 1);
+@@ -2012,7 +2044,7 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
+             SetLastError(ERROR_INVALID_ADDRESS);
+             return NULL;
+         }
+-        return (void *)((uintptr_t)address & ~(uintptr_t)(vm_page_size() - 1));
++        return (void *)((uintptr_t)address & ~(uintptr_t)(w32_page_size() - 1));
+     }
  
- int GetThreadPriority(HANDLE h)
- {
--    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
-+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_of(h);
-     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
- }
- 
-@@ -828,7 +958,7 @@ VOID SwitchToThread(void) { sched_yield(); }
- 
- DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
- {
--    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)thread;
-+    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_of(thread);
-     if (!o || o->kind != K_THREAD) return 0;
-     pthread_mutex_lock(&o->lock);
-     DWORD ok = 0;
-@@ -923,7 +1053,7 @@ BOOL CreateTimerQueueTimer(PHANDLE newTimer, HANDLE timerQueue,
- BOOL ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG period)
- {
-     (void)timerQueue;
--    w32_object *o = (w32_object *)timer;
-+    w32_object *o = obj_of(timer);
-     if (!o || o->kind != K_TIMER) return FALSE;
-     o->timer_due    = dueTime;
-     o->timer_period = period;
-@@ -933,7 +1063,7 @@ BOOL ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG
- BOOL DeleteTimerQueueTimer(HANDLE timerQueue, HANDLE timer, HANDLE completionEvent)
- {
-     (void)timerQueue;
--    w32_object *o = (w32_object *)timer;
-+    w32_object *o = obj_of(timer);
-     if (!o || o->kind != K_TIMER) return FALSE;
-     o->timer_cancel = 1;
-     if (completionEvent) SetEvent(completionEvent);
-@@ -980,7 +1110,7 @@ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR
- BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
-                       PTIMERAPCROUTINE completion, PVOID arg, BOOL resume)
- {
--    w32_object *o = (w32_object *)h;
-+    w32_object *o = obj_of(h);
-     (void)completion; (void)arg; (void)resume;
-     if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) return FALSE;
-     pthread_mutex_lock(&o->lock);
-@@ -1012,7 +1142,7 @@ BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
- 
- BOOL CancelWaitableTimer(HANDLE h)
- {
--    w32_object *o = (w32_object *)h;
-+    w32_object *o = obj_of(h);
-     if (!o || o->kind != K_WAITABLE_TIMER) return FALSE;
-     pthread_mutex_lock(&o->lock);
-     o->waitable_triggered = 0;
-@@ -1189,8 +1319,15 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
- 
- BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
- {
-+    /* Win32 rounds the range out to whole pages; mprotect refuses an
-+     * unaligned start. Arm64 Darwin pages are 16 KB, so a 4 KB request
-+     * protects the page that holds it. */
-+    uintptr_t mask = (uintptr_t)getpagesize() - 1u;
-+    uintptr_t start = (uintptr_t)address & ~mask;
-+    uintptr_t end = ((uintptr_t)address + size + mask) & ~mask;
-+
-     if (oldProtect) *oldProtect = PAGE_READWRITE;
--    return mprotect(address, size, prot_from_page(newProtect)) == 0;
-+    return mprotect((void *)start, end - start, prot_from_page(newProtect)) == 0;
- }
- 
- /* ===================================================================== */
-@@ -1239,20 +1376,31 @@ VOID GetLocalTime(LPSYSTEMTIME st)
+     if (address) {
+@@ -2150,20 +2182,31 @@ VOID GetLocalTime(LPSYSTEMTIME st)
      fill_systemtime(st, &tm, ts.tv_nsec);
  }
  
@@ -2454,10 +2193,10 @@ index 350c8f6..9419960 100644
      return TRUE;
  }
  
-@@ -1450,8 +1598,10 @@ BOOL    TranslateMessage(const MSG *m) { (void)m; return TRUE; }
+@@ -2479,8 +2522,10 @@ BOOL    TranslateMessage(const MSG *m) { (void)m; return TRUE; }
  LRESULT DispatchMessageA(const MSG *m) { (void)m; return 0; }
  
- /* XInput stub: real gamepad is wired through input_compat (SDL2). */
+ /* XInput stub: real gamepads come through src/input (SDL3 gamepads). */
 +#if !defined(__APPLE__)   /* macOS: GameController (the port's gc_xinput.m) */
  DWORD XInputGetState(DWORD idx, XINPUT_STATE *state)
  { (void)idx; if (state) memset(state, 0, sizeof(*state)); return ERROR_DEVICE_NOT_CONNECTED; }
@@ -2465,43 +2204,131 @@ index 350c8f6..9419960 100644
  
  BOOL TerminateProcess(HANDLE process, UINT exitCode)
  {
-@@ -1640,7 +1790,7 @@ HANDLE CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
- LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
-                        SIZE_T count, LPVOID baseAddr)
+@@ -2577,7 +2622,7 @@ int WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
+ static int view_register(void *addr, size_t len, DWORD allocation_protect,
+                          DWORD type, DWORD page_state, int private_allocation)
  {
--    w32_object *o = (w32_object *)mapping;
-+    w32_object *o = obj_of(mapping);
-     if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
- 
-     off_t  off = ((off_t)offHigh << 32) | offLow;
-@@ -1912,8 +2062,13 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
-     /* TODO: on Windows this does not return; SEH dispatch unimplemented. */
+-    size_t page_count = len / vm_page_size();
++    size_t page_count = len / w32_page_size();
+     if (!page_count || page_count > SIZE_MAX / sizeof(DWORD)) return 0;
+     DWORD *pages = (DWORD *)malloc(page_count * sizeof(*pages));
+     if (!pages) return 0;
+@@ -2614,7 +2659,7 @@ static int view_find_locked(const void *addr, size_t len, int require_private,
+                             size_t *count_out)
+ {
+     uintptr_t p = (uintptr_t)addr;
+-    size_t page = vm_page_size();
++    size_t page = w32_page_size();
+     if ((p % page) || (len % page) || len > UINTPTR_MAX - p) return 0;
+     for (int i = 0; i < 512; i++) {
+         w32_view *v = &s_views[i];
+@@ -2694,7 +2739,7 @@ static int view_decommit(void *address, size_t size)
+         for (size_t i = 0; i < count; i++) {
+             DWORD page = v->pages[first + i];
+             if ((page & MEM_COMMIT) == MEM_COMMIT)
+-                mprotect((char *)base + i * vm_page_size(), vm_page_size(),
++                mprotect((char *)base + i * w32_page_size(), w32_page_size(),
+                          prot_from_page(page & 0xFF));
+         }
+         pthread_mutex_unlock(&s_views_lock);
+@@ -2706,7 +2751,7 @@ static int view_decommit(void *address, size_t size)
+     for (size_t i = 0; i < count; i++) {
+         DWORD page = v->pages[first + i];
+         if ((page & MEM_COMMIT) == MEM_COMMIT)
+-            mprotect((char *)base + i * vm_page_size(), vm_page_size(),
++            mprotect((char *)base + i * w32_page_size(), w32_page_size(),
+                      prot_from_page(page & 0xFF));
+     }
+     pthread_mutex_unlock(&s_views_lock);
+@@ -2791,7 +2836,7 @@ static int view_release(void *address, SIZE_T size)
+ static int view_query(const void *addr, MEMORY_BASIC_INFORMATION *buffer)
+ {
+     uintptr_t p = (uintptr_t)addr;
+-    size_t page = vm_page_size();
++    size_t page = w32_page_size();
+     int found = 0;
+     pthread_mutex_lock(&s_views_lock);
+     for (int i = 0; i < 512; i++) {
+@@ -2839,8 +2884,8 @@ BOOL w32_release_reserved_region(LPVOID address, SIZE_T size)
+ {
+     int index, free_slot = -1;
+     size_t first, count;
+-    if (!address || !size || ((uintptr_t)address % vm_page_size()) ||
+-        (size % vm_page_size())) {
++    if (!address || !size || ((uintptr_t)address % w32_page_size()) ||
++        (size % w32_page_size())) {
+         SetLastError(ERROR_INVALID_PARAMETER);
+         return FALSE;
+     }
+@@ -2882,19 +2927,19 @@ BOOL w32_release_reserved_region(LPVOID address, SIZE_T size)
+     if (left_count && right_count) {
+         w32_view right = *v;
+         right.addr = (char *)address + size;
+-        right.len = right_count * vm_page_size();
++        right.len = right_count * w32_page_size();
+         right.page_count = right_count;
+         right.pages = right_pages;
+-        v->len = left_count * vm_page_size();
++        v->len = left_count * w32_page_size();
+         v->page_count = left_count;
+         s_views[free_slot] = right;
+     } else if (left_count) {
+-        v->len = left_count * vm_page_size();
++        v->len = left_count * w32_page_size();
+         v->page_count = left_count;
+     } else if (right_count) {
+         memmove(v->pages, v->pages + first + count, right_count * sizeof(DWORD));
+         v->addr = (char *)address + size;
+-        v->len = right_count * vm_page_size();
++        v->len = right_count * w32_page_size();
+         v->page_count = right_count;
+     } else {
+         free(v->pages);
+@@ -3491,7 +3536,8 @@ ULONG RemoveVectoredExceptionHandler(PVOID h)
+     pthread_mutex_unlock(&s_veh_lock);
+     return found;
  }
- 
-+#if !(defined(__APPLE__) && defined(__aarch64__))
+-#else
++#elif !(defined(__APPLE__) && defined(__aarch64__))
 +/* arm64 Darwin dispatches these from SIGSEGV/SIGBUS (posix_veh.c). */
  PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
- { (void)First; (void)Handler; return NULL; }   /* TODO: wire to sigaction */
- ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 1; }
-+LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER f)
-+{ (void)f; return NULL; }
-+#endif
+ { (void)First; (void)Handler; return NULL; }   /* MMIO decoding is x86-64 only */
+ ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 0; }
+@@ -3552,12 +3598,29 @@ USHORT CaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash
+     return (USHORT)out;
+ }
  
- #endif /* !_WIN32 */
++static uintptr_t s_resident_base;
++static SIZE_T s_resident_size;
++
++void w32_set_resident_range(const void *base, SIZE_T size)
++{
++    s_resident_base = (uintptr_t)base;
++    s_resident_size = size;
++}
++
+ BOOL ReadProcessMemory(HANDLE process, LPCVOID address, LPVOID buffer, SIZE_T size,
+                        SIZE_T *read)
+ {
+     ssize_t got = -1;
++    uintptr_t a = (uintptr_t)address;
+     (void)process;
+     if (read) *read = 0;
++    /* Diagnostics probe guest objects this way every frame. */
++    if (s_resident_base && a >= s_resident_base && size <= s_resident_size &&
++        a - s_resident_base <= s_resident_size - size) {
++        memcpy(buffer, address, size);
++        if (read) *read = size;
++        return TRUE;
++    }
+ #if defined(__linux__)
+     {
+         struct iovec local = { buffer, size }, remote = { (void *)address, size };
 diff --git a/src/platform/win32_compat.h b/src/platform/win32_compat.h
-index 1703647..1a775c5 100644
+index 4c5b297..da2cae5 100644
 --- a/src/platform/win32_compat.h
 +++ b/src/platform/win32_compat.h
-@@ -66,6 +66,8 @@ extern "C" {
- #define PAGE_EXECUTE           0x10u
- #define PAGE_EXECUTE_READ      0x20u
- #define PAGE_EXECUTE_READWRITE 0x40u
-+#define PAGE_EXECUTE_WRITECOPY 0x80u
-+#define PAGE_GUARD             0x100u
- 
- /* Code-page ids accepted by MultiByteToWideChar (only UTF8/ACP are honoured) */
- #define CP_ACP    0u
-@@ -106,6 +108,7 @@ VOID InitializeSRWLock(PSRWLOCK lock);
+@@ -108,6 +108,7 @@ VOID InitializeSRWLock(PSRWLOCK lock);
  VOID AcquireSRWLockShared(PSRWLOCK lock);
  VOID ReleaseSRWLockShared(PSRWLOCK lock);
  VOID AcquireSRWLockExclusive(PSRWLOCK lock);
@@ -2509,58 +2336,26 @@ index 1703647..1a775c5 100644
  VOID ReleaseSRWLockExclusive(PSRWLOCK lock);
  
  /* ---- One-time initialisation ------------------------------------------- */
-@@ -162,6 +165,7 @@ DWORD  ResumeThread(HANDLE h);
- DWORD  SuspendThread(HANDLE h);
- BOOL   TerminateThread(HANDLE h, DWORD exitCode);
- DWORD  GetCurrentThreadId(void);
-+BOOL   GetComputerNameA(char *buf, LPDWORD size);
- HANDLE GetCurrentThread(void);
- HANDLE GetCurrentProcess(void);
- DWORD  GetCurrentProcessId(void);
-@@ -305,6 +309,16 @@ int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
- #define VK_DOWN      0x28
- #define VK_INSERT    0x2D
- #define VK_DELETE    0x2E
-+#define VK_NUMPAD0   0x60
-+#define VK_NUMPAD1   0x61
-+#define VK_NUMPAD2   0x62
-+#define VK_NUMPAD3   0x63
-+#define VK_NUMPAD4   0x64
-+#define VK_NUMPAD5   0x65
-+#define VK_NUMPAD6   0x66
-+#define VK_NUMPAD7   0x67
-+#define VK_NUMPAD8   0x68
-+#define VK_NUMPAD9   0x69
- #define VK_MULTIPLY  0x6A
- #define VK_ADD       0x6B
- #define VK_SUBTRACT  0x6D
-@@ -438,7 +452,7 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
-  * 
-  * Note: GCC needs correct struct. This is from nxdk
-  * */
--#ifdef __linux__
-+#if defined(__linux__) || defined(__APPLE__)
- typedef struct _EXCEPTION_POINTERS
- {
-     PEXCEPTION_RECORD ExceptionRecord;
-@@ -450,6 +464,8 @@ typedef void *PEXCEPTION_POINTERS;
- typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(PEXCEPTION_POINTERS info);
- PVOID AddVectoredExceptionHandler(ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER Handler);
- ULONG RemoveVectoredExceptionHandler(PVOID Handle);
-+typedef LONG (*LPTOP_LEVEL_EXCEPTION_FILTER)(PEXCEPTION_POINTERS info);
-+LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter);
- 
- #define EXCEPTION_CONTINUE_SEARCH       0
- #define EXCEPTION_EXECUTE_HANDLER       1
+@@ -504,6 +505,10 @@ USHORT CaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash
+ /* This process only: a read that fails instead of faulting. */
+ BOOL ReadProcessMemory(HANDLE process, LPCVOID address, LPVOID buffer, SIZE_T size,
+                        SIZE_T *read);
++/* A range that stays mapped for the rest of the run (the guest's RAM): a
++ * ReadProcessMemory wholly inside it cannot fault, so it is a plain copy
++ * instead of a trip through the kernel. */
++void w32_set_resident_range(const void *base, SIZE_T size);
+ BOOL GetComputerNameA(LPSTR name, LPDWORD size);
+ int _putenv_s(const char *name, const char *value);
+ int strcpy_s(char *dst, size_t size, const char *src);
 diff --git a/src/platform/xbox_winnt.h b/src/platform/xbox_winnt.h
-index 8a1f9aa..1044089 100644
+index 7297d7f..927ed6c 100644
 --- a/src/platform/xbox_winnt.h
 +++ b/src/platform/xbox_winnt.h
-@@ -179,6 +179,21 @@ typedef struct ProcessorCONTEXT{
- 	IREG EIP;
- 	IREG EFlags;
- } *PCONTEXT;
-+#elif defined(__APPLE__) && defined(__aarch64__)
+@@ -153,6 +153,22 @@ typedef void             **PHANDLE, **LPHANDLE;
+ typedef void              *HMODULE, *HINSTANCE, *HKEY, *HLOCAL, *HGLOBAL;
+ typedef void              *HWND, *HDC, *HBITMAP, *HICON, *HMENU, *HCURSOR;
+ 
++#if defined(__APPLE__) && defined(__aarch64__)
 +/* arm64 Darwin: the faulting thread's state, live. `ss` points into the
 + * signal frame's mcontext, so a handler that services an access and moves
 + * the PC writes straight through to the resumed thread (posix_veh.c).
@@ -2575,11 +2370,20 @@ index 8a1f9aa..1044089 100644
 +    uint32_t esr;       /* exception syndrome (data aborts: WnR is bit 6) */
 +    uint32_t EFlags;
 +} CONTEXT, *PCONTEXT;
- #else
- typedef void              *PCONTEXT;
- #endif
++#else
+ /* PCONTEXT: the x86-64 registers a vectored exception handler reads and
+  * changes, with the Windows CONTEXT field names. win32_compat.c fills it from
+  * the signal's ucontext and writes it back when a handler continues. */
+@@ -162,6 +178,7 @@ typedef struct _CONTEXT {
+     uint64_t Rip;
+     uint32_t EFlags;
+ } CONTEXT, *PCONTEXT;
++#endif
+ /* Xbox/UTF-16 wide char is 16-bit, unlike the 32-bit Linux wchar_t. */
+ typedef uint16_t           WCHAR, *PWCHAR, *LPWSTR, *PWSTR;
+ typedef const uint16_t    *LPCWSTR, *PCWSTR;
 diff --git a/src/usb/ohci.c b/src/usb/ohci.c
-index bb135aa..bbc676b 100644
+index 63400b1..70941ad 100644
 --- a/src/usb/ohci.c
 +++ b/src/usb/ohci.c
 @@ -11,6 +11,7 @@
@@ -2601,7 +2405,7 @@ index bb135aa..bbc676b 100644
  extern uint32_t xbox_AllocThreadTib(void);
  
  /* The vector XPP takes for USB0. HalGetInterruptVector(1) returns 1 here, and
-@@ -645,6 +644,36 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
+@@ -657,6 +656,36 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
           * engine-rev rumble on the Crash countdown and then paused with the
           * pad unresponsive. */
          moved = len;
@@ -2638,38 +2442,29 @@ index bb135aa..bbc676b 100644
          if (endpoint == 0) {
              g_setup_pending = 0;
              s_n_out_ep0++;
-@@ -1284,7 +1313,7 @@ void xbox_OhciInit(void)
+@@ -1296,7 +1325,7 @@ void xbox_OhciInit(void)
      ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
      ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
  
--#if defined(_WIN32)
-+#if defined(_WIN32) || (defined(__APPLE__) && defined(__aarch64__))
+-#if defined(_WIN32) || defined(__x86_64__)
++#if defined(_WIN32) || defined(__x86_64__) || (defined(__APPLE__) && defined(__aarch64__))
      /* The registers have to fault to be answered. The MCPX aperture is mapped
       * as plain committed memory, so both blocks are made inaccessible here and
       * the title's VEH routes the faults back to xbox_OhciHandleMmio.
-@@ -1320,7 +1349,7 @@ void xbox_OhciInit(void)
-             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
-     fflush(stderr);
- 
--#if defined(_WIN32)
-+#if defined(_WIN32) || (defined(__APPLE__) && defined(__aarch64__))
-     {
-         HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
-         if (th)
-@@ -1348,7 +1377,7 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
+@@ -1358,7 +1387,7 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
  
  int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
  {
--#if defined(_WIN32)
-+#if defined(_WIN32) || (defined(__APPLE__) && defined(__aarch64__))
+-#if defined(_WIN32) || defined(__x86_64__)
++#if defined(_WIN32) || defined(__x86_64__) || (defined(__APPLE__) && defined(__aarch64__))
      OhciController *hc = hc_for(xbox_va);
      int ok;
  
-@@ -1357,11 +1386,16 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
+@@ -1367,11 +1396,16 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
      ok = mmio_emulate((PCONTEXT)ctx, xbox_va - hc->base, hc,
                        ohci_read, ohci_write);
      if (!ok && hc->decode_fail++ < 20) {
-+#if defined(_WIN32)
++#if defined(_WIN32) || defined(__x86_64__)
          const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
          fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: "
                          "%02X %02X %02X %02X %02X %02X\n",
@@ -2683,140 +2478,56 @@ index bb135aa..bbc676b 100644
      }
      return ok;
 diff --git a/src/video/CMakeLists.txt b/src/video/CMakeLists.txt
-index a6ccb51..fee5dd9 100644
+index 67d06ee..50ef993 100644
 --- a/src/video/CMakeLists.txt
 +++ b/src/video/CMakeLists.txt
-@@ -1,9 +1,18 @@
- # Shared FMV player: Media Foundation decode onto a D3D8 texture.
-+# XBOX_VIDEO_BACKEND_SOURCES, set by an including project, replace the D3D11
-+# renderer (nv2a_d3d11.c) with a host renderer implementing nv2a_d3d11.h, and
-+# XBOX_VIDEO_BACKEND_INCLUDES / _LIBRARIES go with them (the macOS port's
-+# Metal renderer and window).
-+if(XBOX_VIDEO_BACKEND_SOURCES)
-+    set(xbox_video_backend ${XBOX_VIDEO_BACKEND_SOURCES})
-+else()
-+    set(xbox_video_backend nv2a_d3d11.c)
-+endif()
- add_library(xbox_video STATIC
-     video_player.c
-     video_pump.c
-     fb_present.c
--    nv2a_d3d11.c
-+    ${xbox_video_backend}
-     spike_sampler.c
- )
- target_include_directories(xbox_video PUBLIC
-@@ -11,6 +20,10 @@ target_include_directories(xbox_video PUBLIC
-     ${CMAKE_CURRENT_SOURCE_DIR}/..
- )
- target_link_libraries(xbox_video PUBLIC xbox_d3d8)
-+if(XBOX_VIDEO_BACKEND_SOURCES)
+@@ -25,6 +25,12 @@ if(XBOXRECOMP_RENDERER STREQUAL "D3D11")
+     # nv2a_d3d11.c compiles the parts, in order, at run time.
+     target_sources(xbox_video PRIVATE fb_window_win32.c nv2a_d3d11.c)
+     xbr_embed_nv2a_hlsl(xbox_video)
++elseif(XBOXRECOMP_RENDERER STREQUAL "EXTERNAL")
++    # The including project's renderer and window (the macOS port's Metal
++    # renderer and AppKit window), implementing nv2a_d3d11.h and fb_present.h.
++    target_sources(xbox_video PRIVATE ${XBOX_VIDEO_BACKEND_SOURCES})
 +    target_include_directories(xbox_video PRIVATE ${XBOX_VIDEO_BACKEND_INCLUDES})
 +    target_link_libraries(xbox_video PUBLIC ${XBOX_VIDEO_BACKEND_LIBRARIES})
-+endif()
- if(WIN32)
-     target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32 dbghelp winmm)
- endif()
-diff --git a/src/video/fb_present.c b/src/video/fb_present.c
-index ee9185a..f7f980e 100644
---- a/src/video/fb_present.c
-+++ b/src/video/fb_present.c
-@@ -17,8 +17,14 @@
- #include <stdint.h>
- #include "fb_present.h"
- 
-+#if defined(_WIN32) || defined(__APPLE__)
-+/* macOS: the scan-out and PVIDEO tracking below is shared; the window, keys
-+ * and mouse are mac/src/video/fb_window_macos.m in the port. */
- #if defined(_WIN32)
- #include <windows.h>
-+#else
-+#include "platform/xbox_winnt.h"
-+#endif
- #include <stdio.h>
- #include "platform/recomp_profile.h"
- #include <stdlib.h>
-@@ -30,6 +36,7 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
- extern bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4]);
- extern void nv2a_hook_pvideo_consume(unsigned bank);
- 
-+#if defined(_WIN32)
- static volatile LONG s_fb_running;
- static void (*s_close_handler)(void);
- static volatile HWND s_hwnd;
-@@ -50,6 +57,7 @@ int xbox_FramebufferHostInputCaptured(void)
- {
-     return s_host_overlay.capture && s_host_overlay.capture();
- }
-+#endif
- static uint32_t      s_fb_va, s_fb_pitch;
- /* Set by the first flip: from then on flips decide what is shown, except for a
-  * buffer the title points the display at and draws into with the CPU. */
-@@ -74,6 +82,7 @@ static uint32_t      s_pvideo_serial;
- static volatile LONG s_pvideo_capture_count;
- static DWORD         s_pvideo_next_capture_tick;
- 
-+#if defined(_WIN32)
- HWND xbox_FramebufferWindowHandle(void)
- {
-     return s_hwnd;
-@@ -83,6 +92,7 @@ void xbox_FramebufferSetCloseHandler(void (*handler)(void))
- {
-     s_close_handler = handler;
- }
-+#endif
- 
- /* Optional per-submission thumbnails for detecting corruption between
-  * screenshots: each record is a 160x120 BGRA image of the submitted frame.
-@@ -316,6 +326,7 @@ int xbox_FramebufferScanSource(uint32_t *va, uint32_t *pitch)
-     return 0;
- }
- 
-+#if defined(_WIN32)
- /* Which keys are down, for the pad stand-in in src/input.
-  *
-  * GetAsyncKeyState looked like the cheaper way to ask and does not work
-@@ -609,6 +620,7 @@ void xbox_FramebufferWindowStart(void)
-     else
-         InterlockedExchange(&s_fb_running, 0);
- }
-+#endif /* _WIN32 window */
- 
- #else
- void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
+ else()
+     # Each SDL3 GPU shader is compiled ahead of time from its compile unit
+     # (shaders/sdlgpu/) to SPIR-V (Vulkan) and, on Windows, DXIL (Direct3D 12),
 diff --git a/src/video/fb_present.h b/src/video/fb_present.h
-index 161a080..4a38af0 100644
+index 16b1257..8835172 100644
 --- a/src/video/fb_present.h
 +++ b/src/video/fb_present.h
-@@ -8,13 +8,15 @@
- 
- #include <stdint.h>
- 
-+/* Register before window startup. Called on its message thread when the user
-+ * closes the display; the title owns stopping its guest workers. */
-+void xbox_FramebufferSetCloseHandler(void (*handler)(void));
-+int xbox_FramebufferHostInputCaptured(void);
-+
- #if defined(_WIN32)
- #include <windows.h>
+@@ -26,9 +26,14 @@ void xbox_FramebufferSdlHints(void);
+ typedef HCURSOR XboxCursor;
  /* The window to present into, or NULL until it exists. */
  HWND xbox_FramebufferWindowHandle(void);
--/* Register before window startup. Called on its message thread when the user
-- * closes the display; the title owns stopping its guest workers. */
--void xbox_FramebufferSetCloseHandler(void (*handler)(void));
- 
- /* Optional host UI. Register before starting the window/render threads.
-  * Message delivery and rendering run on different threads; the client owns
-@@ -26,7 +28,6 @@ typedef struct {
- } XboxHostOverlay;
- void xbox_FramebufferSetHostOverlay(const XboxHostOverlay *overlay);
- void xbox_FramebufferRenderHostOverlay(void *device, void *context, void *target);
--int xbox_FramebufferHostInputCaptured(void);
++#elif defined(__APPLE__)
++/* An including project's AppKit window (the macOS port's
++ * fb_window_macos.m): an NSCursor. No Win32 types here, so the header stays
++ * includable from Objective-C. */
++typedef void *XboxCursor;
  #endif
  
- /* A buffer the display reads straight from guest memory because the title is
+-#if defined(XBOXRECOMP_SDL3) || defined(_WIN32)
++#if defined(XBOXRECOMP_SDL3) || defined(_WIN32) || defined(__APPLE__)
+ /* Register before window startup. Called on the window thread for client
+  * cursor selection; NULL result hides it. Cursor ownership stays with caller. */
+ void xbox_FramebufferSetCursorHandler(XboxCursor (*handler)(void));
+@@ -49,8 +54,10 @@ typedef struct {
+     void (*render)(void *window, void *device, void *context, void *target);
+ #if defined(XBOXRECOMP_SDL3)
+     int (*event)(const union SDL_Event *event);
+-#else
++#elif defined(_WIN32)
+     int (*message)(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
++#else
++    int (*message)(void *window, unsigned message, uintptr_t wparam, intptr_t lparam);
+ #endif
+     int (*capture)(void);
+ } XboxHostOverlay;
 diff --git a/src/video/nv2a_d3d11.h b/src/video/nv2a_d3d11.h
-index 8721bc6..1f9739c 100644
+index 22704f1..d23248d 100644
 --- a/src/video/nv2a_d3d11.h
 +++ b/src/video/nv2a_d3d11.h
 @@ -23,6 +23,7 @@ typedef struct {

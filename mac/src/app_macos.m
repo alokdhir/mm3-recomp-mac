@@ -309,7 +309,8 @@ static void start_stall_watch(void)
 /* Mac defaults, each overridable from the environment: the picture takes
  * the window's shape (upstream fixes 16:10), and the game renders 1440 lines
  * -- 2560x1440 at 16:9 -- however large the window, the size that looks
- * right on a Retina desktop without paying for 5K. */
+ * right on a Retina desktop without paying for 5K -- and the game pauses
+ * while another app is in front. */
 static void mac_defaults(void)
 {
     if (!getenv("RECOMP_ASPECT")) setenv("RECOMP_ASPECT", "auto", 1);
@@ -327,6 +328,8 @@ static void mac_defaults(void)
         setenv("RECOMP_MSAA", n, 1);
     }
     if (!getenv("RECOMP_ANISO")) setenv("RECOMP_ANISO", "16", 1);
+    /* In the background the game holds and goes quiet, as a Mac app should. */
+    if (!getenv("RECOMP_PAUSE_UNFOCUSED")) setenv("RECOMP_PAUSE_UNFOCUSED", "1", 1);
 }
 
 /* Whether another process holds dir/.running (a copy of the game on it). */

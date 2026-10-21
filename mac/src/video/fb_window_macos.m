@@ -1,10 +1,11 @@
 /*
  * fb_window_macos.m -- the framebuffer window on macOS. See fb_window_macos.h.
  *
- * Mirrors the Win32 window in xboxrecomp's fb_present.c: opened when the
- * title first shows a picture and RECOMP_FB_WINDOW is set, keys remembered
- * as virtual-key codes, the pointer as a fraction of the client area, the
- * title bar showing FPS, fullscreen on F11, Cmd+F or Cmd+Return, and
+ * The window module beside xboxrecomp's fb_present.c, as fb_window_win32.c
+ * and fb_window_sdl.c are (see fb_window.h): opened when the title first
+ * shows a picture and RECOMP_FB_WINDOW is set, keys remembered as
+ * virtual-key codes, the pointer as a fraction of the client area, the title
+ * bar showing FPS, fullscreen on F11, Cmd+F or Cmd+Return, and
  * RECOMP_PAUSE_UNFOCUSED holding the game while another app is in front.
  */
 #import <Cocoa/Cocoa.h>
@@ -18,40 +19,34 @@
 
 extern float nv2a_d3d_display_aspect(void);
 
-static void (*s_close_handler)(void);
+/* fb_window.h's shared state, declared here rather than included: its Win32
+ * vocabulary (BOOL above all) collides with Objective-C's. Written by the
+ * main thread, read by the USB/input threads a byte at a time; a press seen
+ * a frame late is indistinguishable from a later one. */
+extern volatile unsigned char fbw_key_down[256];
+extern volatile float fbw_mouse_x, fbw_mouse_y;
+extern volatile int32_t fbw_mouse_moves;
+extern volatile int32_t fbw_inactive;
+extern void (*fbw_close_handler)(void);
+extern int fbw_title_due(uint16_t *out, size_t count);
+
 static _Atomic int s_started;
 static CAMetalLayer *_Atomic s_layer;
 static _Atomic unsigned s_pix_w, s_pix_h;
-static _Atomic int s_inactive;
 static NSWindow *s_window;
 
-/* Written by the main thread, read by the USB/input threads a byte at a
- * time; a press seen a frame late is indistinguishable from a later one. */
-static volatile unsigned char s_key_down[256];
-static volatile float s_mouse_x, s_mouse_y;
-static _Atomic int s_mouse_moves;
-
-static uint16_t s_title[48] = { 'M', 'i', 'd', 't', 'o', 'w', 'n', ' ', 'M', 'a', 'd', 'n', 'e', 's', 's', ' ', '3' };
-static _Atomic long s_flips;
-static _Atomic long s_frame_draws;
-
-void xbox_FramebufferSetCloseHandler(void (*handler)(void))
+void *fbw_native_window(void)
 {
-    s_close_handler = handler;
+    return (void *)s_window;
 }
 
 /* Quit from the menu or Cmd+Q: the same as closing the window. */
 void xbox_FramebufferRequestClose(void)
 {
-    if (s_close_handler)
-        s_close_handler();
+    if (fbw_close_handler)
+        fbw_close_handler();
     else
         exit(0);
-}
-
-int xbox_FramebufferHostInputCaptured(void)
-{
-    return 0;
 }
 
 void *xbox_FramebufferMetalLayer(void)
@@ -82,47 +77,6 @@ int xbox_FramebufferScreenSize(unsigned *w, unsigned *h)
     *w = (unsigned)sw;
     *h = (unsigned)sh;
     return *w && *h;
-}
-
-int xbox_FramebufferKeyDown(int vk)
-{
-    if ((unsigned)vk > 255)
-        return 0;
-    return s_key_down[vk] != 0;
-}
-
-int xbox_FramebufferMouse(float *x, float *y)
-{
-    *x = s_mouse_x;
-    *y = s_mouse_y;
-    return atomic_load(&s_mouse_moves);
-}
-
-int xbox_FramebufferPaused(void)
-{
-    static int on = -1;
-    if (on < 0)
-        on = getenv("RECOMP_PAUSE_UNFOCUSED") && atoi(getenv("RECOMP_PAUSE_UNFOCUSED")) != 0;
-    return on && atomic_load(&s_inactive);
-}
-
-void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
-{
-    int i;
-    for (i = 0; i < max_chars && i < 47 && name[i]; i++)
-        s_title[i] = name[i];
-    s_title[i] = 0;
-}
-
-void xbox_FramebufferNoteFlip(uint32_t draws)
-{
-    atomic_fetch_add(&s_flips, 1);
-    atomic_store(&s_frame_draws, (long)draws);
-}
-
-void xbox_FramebufferWindowFrameStats(uint32_t draws)
-{
-    xbox_FramebufferNoteFlip(draws);
 }
 
 /* A macOS virtual key code as the Win32 virtual-key code for the same key;
@@ -184,10 +138,10 @@ static int vk_from_keycode(unsigned short k)
 static void set_key(int vk, int down)
 {
     if (vk <= 0 || vk > 255) return;
-    s_key_down[vk] = (unsigned char)(down != 0);
-    if (vk == 0xA0 || vk == 0xA1) s_key_down[0x10] = s_key_down[0xA0] | s_key_down[0xA1];
-    if (vk == 0xA2 || vk == 0xA3) s_key_down[0x11] = s_key_down[0xA2] | s_key_down[0xA3];
-    if (vk == 0xA4 || vk == 0xA5) s_key_down[0x12] = s_key_down[0xA4] | s_key_down[0xA5];
+    fbw_key_down[vk] = (unsigned char)(down != 0);
+    if (vk == 0xA0 || vk == 0xA1) fbw_key_down[0x10] = fbw_key_down[0xA0] | fbw_key_down[0xA1];
+    if (vk == 0xA2 || vk == 0xA3) fbw_key_down[0x11] = fbw_key_down[0xA2] | fbw_key_down[0xA3];
+    if (vk == 0xA4 || vk == 0xA5) fbw_key_down[0x12] = fbw_key_down[0xA4] | fbw_key_down[0xA5];
     if (getenv("RECOMP_KEY_TRACE") && down) {
         static unsigned n;
         if (n++ < 40) fprintf(stderr, "  [KEY] down vk=0x%02X\n", (unsigned)vk);
@@ -196,7 +150,7 @@ static void set_key(int vk, int down)
 
 static void clear_keys(void)
 {
-    memset((void *)s_key_down, 0, sizeof s_key_down);
+    memset((void *)fbw_key_down, 0, sizeof fbw_key_down);
 }
 
 /* The keyboard as it physically is, from the window server: after a menu
@@ -309,7 +263,7 @@ static NSCursor *blank_cursor(void)
     default: return;
     }
     /* Both sides held, one let go: the flag stays set; trust the key code. */
-    if (down && s_key_down[vk]) down = 0;
+    if (down && fbw_key_down[vk]) down = 0;
     /* Command goes to the menus. Keys pressed or released while it is held
      * reach the menu, not this view (a ⌘⇧S save took the arrows' key-ups
      * with it and left steering dead), so start every chord from nothing. */
@@ -325,21 +279,21 @@ static NSCursor *blank_cursor(void)
     NSPoint p = [self convertPoint:[e locationInWindow] fromView:nil];
     NSRect b = [self bounds];
     if (b.size.width > 0 && b.size.height > 0) {
-        s_mouse_x = (float)(p.x / b.size.width);
-        s_mouse_y = (float)(1.0 - p.y / b.size.height);   /* top-left origin, as Win32 */
-        atomic_fetch_add(&s_mouse_moves, 1);
+        fbw_mouse_x = (float)(p.x / b.size.width);
+        fbw_mouse_y = (float)(1.0 - p.y / b.size.height);   /* top-left origin, as Win32 */
+        __atomic_fetch_add(&fbw_mouse_moves, 1, __ATOMIC_RELAXED);
     }
 }
 
 - (void)mouseMoved:(NSEvent *)e { [self notePointer:e]; }
 - (void)mouseDragged:(NSEvent *)e { [self notePointer:e]; }
 - (void)rightMouseDragged:(NSEvent *)e { [self notePointer:e]; }
-- (void)mouseDown:(NSEvent *)e { s_key_down[0x01] = 1; }
-- (void)mouseUp:(NSEvent *)e { s_key_down[0x01] = 0; }
-- (void)rightMouseDown:(NSEvent *)e { s_key_down[0x02] = 1; }
-- (void)rightMouseUp:(NSEvent *)e { s_key_down[0x02] = 0; }
-- (void)otherMouseDown:(NSEvent *)e { s_key_down[0x04] = 1; }
-- (void)otherMouseUp:(NSEvent *)e { s_key_down[0x04] = 0; }
+- (void)mouseDown:(NSEvent *)e { fbw_key_down[0x01] = 1; }
+- (void)mouseUp:(NSEvent *)e { fbw_key_down[0x01] = 0; }
+- (void)rightMouseDown:(NSEvent *)e { fbw_key_down[0x02] = 1; }
+- (void)rightMouseUp:(NSEvent *)e { fbw_key_down[0x02] = 0; }
+- (void)otherMouseDown:(NSEvent *)e { fbw_key_down[0x04] = 1; }
+- (void)otherMouseUp:(NSEvent *)e { fbw_key_down[0x04] = 0; }
 
 @end
 
@@ -350,8 +304,8 @@ static NSCursor *blank_cursor(void)
 
 - (BOOL)windowShouldClose:(NSWindow *)w
 {
-    if (s_close_handler)
-        s_close_handler();
+    if (fbw_close_handler)
+        fbw_close_handler();
     return NO;          /* the handler ends the process */
 }
 
@@ -402,19 +356,12 @@ static NSSize initial_size(void)
 
 static void update_title(void)
 {
-    static long f0;
-    static CFAbsoluteTime t0;
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    long f = atomic_load(&s_flips);
-    int n = 0;
-    NSString *name, *title;
-    while (n < 47 && s_title[n]) n++;
-    name = [NSString stringWithCharacters:(const unichar *)s_title length:(NSUInteger)n];
-    title = [NSString stringWithFormat:@"%@ | FPS: %.1f | draws: %ld", name,
-             t0 ? (f - f0) / (now - t0) : 0.0, atomic_load(&s_frame_draws)];
-    [s_window setTitle:title];
-    t0 = now;
-    f0 = f;
+    uint16_t text[128];
+    size_t n = 0;
+    if (!fbw_title_due(text, sizeof text / sizeof text[0]))
+        return;
+    while (text[n]) n++;
+    [s_window setTitle:[NSString stringWithCharacters:(const unichar *)text length:n]];
 }
 
 static void open_window(void)
@@ -443,9 +390,9 @@ static void open_window(void)
         [s_window toggleFullScreen:nil];
     [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) { update_title(); }];
     [[NSNotificationCenter defaultCenter] addObserverForName:NSApplicationDidResignActiveNotification
-        object:nil queue:nil usingBlock:^(NSNotification *n) { atomic_store(&s_inactive, 1); clear_keys(); }];
+        object:nil queue:nil usingBlock:^(NSNotification *n) { __atomic_store_n(&fbw_inactive, 1, __ATOMIC_RELAXED); clear_keys(); }];
     [[NSNotificationCenter defaultCenter] addObserverForName:NSApplicationDidBecomeActiveNotification
-        object:nil queue:nil usingBlock:^(NSNotification *n) { atomic_store(&s_inactive, 0); }];
+        object:nil queue:nil usingBlock:^(NSNotification *n) { __atomic_store_n(&fbw_inactive, 0, __ATOMIC_RELAXED); }];
     fprintf(stderr, "  [FBWIN] framebuffer window open (%.0fx%.0f points)\n", size.width, size.height);
 }
 

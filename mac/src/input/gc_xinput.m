@@ -89,10 +89,29 @@ static uint8_t trigger(float v)
     return (uint8_t)(s > 255.0f ? 255.0f : s < 0.0f ? 0.0f : s);
 }
 
+/* Debug > Save Recent Frames from the pad, for a glitch seen mid-race: a
+ * left stick click, or Share on an Xbox Series controller. The game still
+ * sees the click. */
+extern void nv2a_metal_save_recent_frames(void);
+static int s_capture_held[MAX_PADS];
+
+static void capture_button(int slot, GCExtendedGamepad *g)
+{
+    int held = g.leftThumbstickButton.pressed;
+    if ([g isKindOfClass:[GCXboxGamepad class]] && ((GCXboxGamepad *)g).buttonShare.pressed)
+        held = 1;
+    if (held && !s_capture_held[slot]) {
+        fprintf(stderr, "[PAD] saving recent frames\n");
+        nv2a_metal_save_recent_frames();
+    }
+    s_capture_held[slot] = held;
+}
+
 /* Sample every element of pad slot's controller (on its handler queue). */
 static void sample(int slot, GCExtendedGamepad *g)
 {
     XiGamepad p;
+    capture_button(slot, g);
     memset(&p, 0, sizeof p);
     if (g.dpad.up.pressed) p.wButtons |= 0x0001;
     if (g.dpad.down.pressed) p.wButtons |= 0x0002;

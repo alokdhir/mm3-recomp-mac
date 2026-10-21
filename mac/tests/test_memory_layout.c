@@ -75,7 +75,7 @@ int main(void)
     size_t size;
     uint8_t *xbe = make_xbe(&size);
     uint32_t v;
-    int m, ok;
+    int ok;
 
     setenv("RECOMP_USB", "1", 0);
     xbox_SetMapSize(128u * 1024u * 1024u);
@@ -87,19 +87,10 @@ int main(void)
 
     CHECK(*VA(0x00011000) == 0xC0DEF00D, "section marker %08X", *VA(0x00011000));
 
-    /* Mirrors: a store through the base is visible in every mirror, and the
-     * other way round. The map is 128 MB; RAM is 64 MB. */
+    /* RAM is 64 MB with nothing mirrored above it: the slots up to the
+     * 128 MB map are reserved and fault, as on the console. */
     *VA(0x00200040) = 0x11223344;
-    for (m = 1; m <= 28; m++) {
-        uint32_t mirror = 0x00200040 + (uint32_t)m * 0x08000000u;
-        if (mirror >= 0x80000000u) break;
-        if (*VA(mirror) != 0x11223344) {
-            CHECK(0, "mirror %d (0x%08X) reads %08X", m, mirror, *VA(mirror));
-            break;
-        }
-    }
-    *VA(0x08200044) = 0x55667788;
-    CHECK(*VA(0x00200044) == 0x55667788, "write through mirror 1 not seen at base");
+    CHECK(*VA(0x00200040) == 0x11223344, "RAM store not read back");
 
     /* The contiguous window is writable, and the tiled aperture sees it. */
     *VA(0x80200040) = 0x99AABBCC;

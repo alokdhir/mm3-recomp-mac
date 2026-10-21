@@ -16,13 +16,13 @@ licence.
 
 3. Menu icons, then the package (a Python with NumPy, SciPy and Pillow):
 
-       cd third_party/mm3-recomp/tools/car-models
+       cd third_party/mm3-recomp/tools/car-tools/car-models
        python preview.py /tmp/p930/model.json --out /tmp/p930/icons --name "Porsche 930 Turbo" --icons
        python build_package.py /tmp/p930/model.json \
          "$HOME/Library/Application Support/Midtown Madness 3/CarPackages/porsche930" \
          --car-id 9009 --icons /tmp/p930/icons
 
-4. Point the car at the package in `third_party/mm3-recomp/tools/car-mods/cars.local.json`
+4. Point the car at the package in `third_party/mm3-recomp/tools/car-tools/car-mods/cars.local.json`
    (`"model_package"`; `"hidden": true` keeps a slot without a model out of
    the menus), quit the game, then
    `python prepare.py --game-dir <repo>/game_files --apply` and copy

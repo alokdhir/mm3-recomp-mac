@@ -12,6 +12,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODULES=(
     "mm3-recomp:third_party/mm3-recomp"
     "xboxrecomp:third_party/mm3-recomp/tools/xboxrecomp"
+    "car-tools:third_party/mm3-recomp/tools/car-tools"
 )
 
 case "${1:-}" in
@@ -19,7 +20,8 @@ save)
     for m in "${MODULES[@]}"; do
         name="${m%%:*}" dir="$ROOT/${m#*:}"
         git -C "$dir" add -N . >/dev/null
-        git -C "$dir" diff --binary HEAD -- . ':(exclude)tools/xboxrecomp' ':(exclude)game_files' \
+        git -C "$dir" diff --binary HEAD -- . ':(exclude)tools/xboxrecomp' ':(exclude)tools/car-tools' \
+            ':(exclude)game_files' \
             > "$ROOT/patches/$name.patch"
         git -C "$dir" reset -q
         echo "patches/$name.patch: $(grep -c '^diff --git' "$ROOT/patches/$name.patch") files"

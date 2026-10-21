@@ -886,3 +886,47 @@ fragment float4 y16d_ps_ms(float4 p [[position]], depth2d_ms<float> Y16Z [[textu
     int zx = max(0, (int)floor((q.x + 0.5) * 0.5 - cc.ccol.z));
     return y16d_of(Y16Z.read(uint2(zx, q.y), 0), cc);
 }
+
+/* MM3's native depth fog (nv2a_metal_fog_draw), after the title's
+ * distance_fog.hlsl: extended-distance air and the destination-alpha mask
+ * the horizon panorama composes through. band: start, 1/(end-start), depth
+ * to world, sky fill; colour: rgb, mask pass; sky: screen-space plane, rate.
+ * Depth is stored as on the console, raw/zmax (see ub_map), so z * band.z
+ * is world distance. */
+struct FogConsts { float4 band; float4 colour; float4 sky; };
+
+vertex PosOnly fog_vs(uint id [[vertex_id]])
+{
+    float2 p = float2((id << 1) & 2, id & 2);
+    PosOnly o;
+    o.pos = float4(p * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+
+static float4 fog_of(float z, float2 p, constant FogConsts &c)
+{
+    if (c.colour.a > 0) {
+        float a = z >= 0.99999 ? 1 : 0;
+        if (c.sky.w > 0) {
+            float t = saturate(dot(float3(p, 1), c.sky.xyz) * c.sky.w);
+            a *= t * t * (3 - 2 * t);
+        }
+        return float4(0, 0, 0, a);
+    }
+    if (z >= 0.99999) return float4(c.colour.rgb, c.band.w);
+    float x = saturate((z * c.band.z - c.band.x) * c.band.y);
+    return float4(c.colour.rgb, 1.0 - exp2(-6.643856 * x * x));
+}
+
+fragment float4 fog_ps(float4 p [[position]], depth2d<float> Depth [[texture(0)]],
+                       constant FogConsts &c [[buffer(0)]])
+{
+    return fog_of(Depth.read(uint2(p.xy)), p.xy, c);
+}
+
+fragment float4 fog_ps_ms(float4 p [[position]], uint sample [[sample_id]],
+                          depth2d_ms<float> Depth [[texture(0)]],
+                          constant FogConsts &c [[buffer(0)]])
+{
+    return fog_of(Depth.read(uint2(p.xy), sample), p.xy, c);
+}

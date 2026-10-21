@@ -87,7 +87,7 @@ its recipe in [`tools/car-import/recipes`](tools/car-import/recipes):
 Unzip each download where its recipe's `source` points (under
 `~/Downloads`), then follow [`tools/car-import/README.md`](tools/car-import/README.md):
 export with Blender, build the package, point the slot at it in
-`third_party/mm3-recomp/tools/car-mods/cars.local.json`, and apply.
+`third_party/mm3-recomp/tools/car-tools/car-mods/cars.local.json`, and apply.
 `scripts/workshop.sh` opens Car Workshop (ratings, physics, gearing,
 speedometer) and copies the applied data into the app.
 

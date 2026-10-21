@@ -79,6 +79,12 @@ static int64_t qpc(void)
 {
     return (int64_t)clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 }
+
+/* Where a slow frame's time went (see hitch_report): renderer work that can
+ * hold the executor, and with it the title, which waits on the GPU. */
+enum { HITCH_PSO, HITCH_GPU, HITCH_SYNC, HITCH_DRAWABLE, HITCH_N };
+static int64_t s_hitch[HITCH_N];
+#define HITCH(slot, stmt) do { int64_t h0_ = qpc(); stmt; s_hitch[slot] += qpc() - h0_; } while (0)
 #define QPC_FREQ 1000000000LL
 
 /* RECOMP_D3D_PROFILE: per-frame cost of each stage, printed once a second. */
@@ -109,10 +115,10 @@ static _Atomic uint64_t s_prof_gpu_ns;
 /* Render passes and blit encoders opened, and what broke a pass for a blit:
  * on a tile-based GPU each break stores and reloads the targets. */
 enum { BRK_UPLOAD, BRK_FEEDBACK, BRK_CHAIN, BRK_MIPS, BRK_WRITEBACK, BRK_PRESENT, BRK_CLEAR,
-       BRK_Y16, BRK_SPAN, BRK_OTHER, BRK_COUNT };
+       BRK_Y16, BRK_SPAN, BRK_HOST, BRK_OTHER, BRK_COUNT };
 static const char *const s_brk_name[BRK_COUNT] = {
     "upload", "feedback", "chain", "mips", "writeback", "present", "clear", "y16", "span",
-    "other" };
+    "host", "other" };
 /* A pass of its own (clear, Y16 view, span blit) is about to end the open one. */
 #define NOTE_OWN_PASS(cause) do { s_prof_passes++; if (s_enc) s_prof_brk[cause]++; } while (0)
 static uint64_t s_prof_passes, s_prof_blits, s_prof_brk[BRK_COUNT];
@@ -310,16 +316,10 @@ void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks)
     if (hooks) s_overlay = *hooks;
 }
 
-/* nv2a_d3d_set_depth_view_remap: x = scale, y = knee (see y16d_ps). */
+/* Depth view remap: x = scale, y = knee (see y16d_ps). Retired upstream
+ * with the native fog pass; scale 1 leaves depth as stored. */
 static float s_zview_remap[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
 static int s_depth_hazed;               /* depth read as Y16 this frame */
-
-void nv2a_d3d_set_depth_view_remap(float scale, float knee)
-{
-    if (!(scale >= 1.0f) || !(knee > 0.0f && knee <= 1.0f)) { scale = 1.0f; knee = 1.0f; }
-    s_zview_remap[1] = knee;
-    s_zview_remap[0] = scale;
-}
 
 /* The aspect the image is rendered at, never narrower than the title's
  * 4:3: RECOMP_ASPECT (e.g. 16:9, 21:9, 1.6, 4:3), else the game window's
@@ -519,7 +519,7 @@ static void submit(int wait)
         s_vb_gen++;
     }
     if (wait && s_last_commit)
-        [s_last_commit waitUntilCompleted];
+        HITCH(HITCH_GPU, [s_last_commit waitUntilCompleted]);
 }
 
 static id<MTLBlitCommandEncoder> blit_encoder_for(int cause)
@@ -681,7 +681,7 @@ static uint8_t *ring_alloc(Ring *r, size_t bytes, size_t align, size_t *off)
             if ([r->mark_cb[i] status] < MTLCommandBufferStatusCompleted) {
                 r->stalls++;
                 s_prof_ring_stalls++;
-                [r->mark_cb[i] waitUntilCompleted];
+                HITCH(HITCH_GPU, [r->mark_cb[i] waitUntilCompleted]);
             }
         } else {
             /* Nothing committed past that space this lap: the buffer being
@@ -1014,6 +1014,7 @@ static id<MTLRenderPipelineState> build_pso(MTLRenderPipelineDescriptor *d, NSEr
     double ms;
     if (s_archive) d.binaryArchives = @[ s_archive ];
     pso = [s_dev newRenderPipelineStateWithDescriptor:d error:err];
+    s_hitch[HITCH_PSO] += qpc() - t0;
     ms = (double)(qpc() - t0) * 1000.0 / (double)QPC_FREQ;
     if (ms > 10.0)
         fprintf(stderr, "[METAL] pipeline %s built in %.0f ms%s\n", [[d.fragmentFunction name] UTF8String], ms,
@@ -1831,7 +1832,7 @@ static void surface_sync(Surface *s, int force)
 {
     int64_t t0 = s_prof_on > 0 ? qpc() : 0;
     RECOMP_PROFILE_BEGIN("Metal surface sync");
-    surface_sync_impl(s, force);
+    HITCH(HITCH_SYNC, surface_sync_impl(s, force));
     RECOMP_PROFILE_END();
     if (s_prof_on > 0) s_prof[PROF_SYNC] += qpc() - t0;
 }
@@ -3219,54 +3220,24 @@ static uint32_t write_mask(const NvD3DState *st, Surface *s)
  * stored widened (its image already spans the wide screen). */
 static int s_draw_textured, s_draw_reads_wide;
 static uint32_t s_draw_tex_addr;
-static int s_flare_depth_test;
 static int s_draw_bspline;
-static uint32_t s_bspline_sf, s_bspline_df;
 
 extern const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *version))[4];
 extern const float (*nv2a_vsh_constants(uint32_t *version))[4];
 
-/* The title asks for lamp glows to be tested against scene depth as on
- * D3D11, but here that test hides every lamp glow (car lights, street lamps,
- * indicators). Their own occluder taps of the frame's alpha (Flares.psh,
- * averaged over the guest pixel by tapbox) decide visibility correctly, so
- * the depth test stays off unless MM3_FLARE_DEPTH=1. */
-void nv2a_d3d_set_flare_depth_test(int on)
-{
-    const char *e = getenv("MM3_FLARE_DEPTH");
-    s_flare_depth_test = on != 0 && e && atoi(e) != 0;
-}
-
+/* The title asks for lamp glows to be tested against scene depth
+ * (NvOverlayHooks.force_depth_test), but here that test hides every lamp
+ * glow (car lights, street lamps, indicators). Their own occluder taps of the
+ * frame's alpha (Flares.psh, averaged over the guest pixel by tapbox) decide
+ * visibility correctly, so the depth test stays off unless MM3_FLARE_DEPTH=1. */
 static int flare_needs_depth(const NvD3DState *st)
 {
-    static int noted;
-    Surface *mask;
-    uint32_t address, reject = 0;
-    unsigned n;
-    /* 0x8421 is the native Flares program's four projective 2D stages. */
-    if (!s_flare_depth_test || !st->rc_seen || st->rc.stage_program != 0x8421u)
-        return 0;
-    address = phys(st->tex[0].addr);
-    if (!address || phys(st->tex[3].addr) == address) return 0;
-    mask = surface_find(address);
-    if (st->depth_test || st->depth_mask || !st->zeta_addr) reject |= 1u;
-    if (!st->blend_enable || st->blend_dfactor != 1u || st->blend_equation != 0x8006u)
-        reject |= 2u;
-    if (!mask || mask->w != st->clip_w || mask->h != st->clip_h) reject |= 4u;
-    /* MM3 Flares/Flares.psh: t0..t2 sample the screen visibility mask;
-     * t3 samples the lamp texture. */
-    for (n = 0; n < 3; ++n) {
-        const NvD3DTexture *t = &st->tex[n];
-        if (phys(t->addr) != address || t->cube || t->color != 0x12u ||
-            ((t->filter >> 24) & 15u) != 2u)
-            reject |= 8u;
-    }
-    if (reject) return 0;
-    if (!noted) {
-        fprintf(stderr, "[METAL] lamp visibility sprites use scene depth\n");
-        noted = 1;
-    }
-    return 1;
+    static int opted = -1;
+    Surface *source;
+    if (opted < 0) opted = getenv("MM3_FLARE_DEPTH") && atoi(getenv("MM3_FLARE_DEPTH")) != 0;
+    if (!opted || !s_overlay.force_depth_test) return 0;
+    source = surface_find(phys(st->tex[0].addr));
+    return s_overlay.force_depth_test(st, source ? source->w : 0, source ? source->h : 0);
 }
 
 /* A swizzled render target sampled as a mipmapped texture: titles render
@@ -3590,14 +3561,10 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         else ds->tex[n] = view;
         ds->smp[n] = sampler(t, levels, reduce, !rt && !zt && smooth_magnification(),
                              &pc->lod_bias[n]);
-        /* The title opts in its 256x256 DXT5 horizon panorama, magnified
-         * across the skyline through destination alpha. */
-        if (n == 0 && !rt && !t->cube && kind == K_DXT && t->color == 0x0F &&
-            t->width == 256 && t->height == 256 && levels > 4 &&
-            (((t->filter >> 16) & 0xFF) == 2 || ((t->filter >> 16) & 0xFF) == 4 ||
-             ((t->filter >> 16) & 0xFF) == 6) && ((t->filter >> 24) & 0xF) != 1 &&
-            s_bspline_sf && !st->depth_test && st->blend_enable &&
-            st->blend_sfactor == s_bspline_sf && st->blend_dfactor == s_bspline_df)
+        /* The title opts in its horizon panorama, magnified across the
+         * skyline through destination alpha (NvOverlayHooks.cubic_filter_0). */
+        if (n == 0 && !t->cube && !texture_is_volume(t) && s_overlay.cubic_filter_0 &&
+            s_overlay.cubic_filter_0(st, rt != NULL, (uint32_t)levels))
             s_draw_bspline = 1;
         pc->tex_info[n][0] = (t->control0 >> 2) & 1;
         pc->tex_info[n][1] = t->filter >> 28;
@@ -3870,12 +3837,6 @@ int nv2a_d3d_menu_rects(NvMenuRect *out, int max, float present[4])
     return n;
 }
 
-void nv2a_d3d_set_bspline_blend(uint32_t sfactor, uint32_t dfactor)
-{
-    s_bspline_sf = sfactor;
-    s_bspline_df = dfactor;
-}
-
 /* One rect per triangle: either half of an axis-aligned quad spans the
  * whole quad, so batched quads come apart without knowing how they pair. */
 static void note_menu_rects(const float (*pos)[4], const uint32_t *idx, uint32_t ni, uint32_t lo)
@@ -4136,6 +4097,140 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
     }
 }
 
+/* Ordered host drawing (nv2a_d3d11.h): the title's own pass on the current
+ * colour target, reading its depth. The handles are the device, the open
+ * command buffer, the colour target (the MSAA one when multisampled; it
+ * resolves into the surface as the client's pass ends) and the depth
+ * texture. The client opens and ends its own encoder; the next draw opens a
+ * new one on the bound targets. */
+static id<MTLTexture> s_host_resolve;   /* the colour target's resolve, or nil */
+/* Frames with a host pass, to report one that lost it (a sky flash). */
+static int s_host_drawn, s_host_drawn_prev;
+
+int nv2a_d3d_host_draw(const NvD3DState *st,
+                       int (*draw)(const NvHostTarget *, void *), void *user)
+{
+    Surface *s = NULL; Depth *d = NULL; uint32_t gw, gh;
+    NvHostTarget target;
+    int result, bound;
+    if (!st || !draw || !nv2a_d3d_init())
+        return 0;
+    bound = bind_targets(st, 1, &s, &d, &gw, &gh);
+    if (!bound || !s || !d || s->iw != d->iw || s->ih != d->ih || (!!s->ms != (d->samples > 1))) {
+        static unsigned told;
+        if (told++ < 20)
+            fprintf(stderr, "[METAL] frame %u: host pass refused: bound %d colour %ux%u%s depth %ux%u x%u\n",
+                    s_frame, bound, s ? s->iw : 0, s ? s->ih : 0, s && s->ms ? " ms" : "",
+                    d ? d->iw : 0, d ? d->ih : 0, d ? d->samples : 0);
+        return 0;
+    }
+    target.device = s_dev;
+    target.context = cmd();
+    target.colour = surface_rt(s);
+    target.depth = d->tex;
+    target.width = s->iw;
+    target.height = s->ih;
+    target.depth_bits = d->zf == 1 ? 16u : 24u;
+    target.samples = d->samples;
+    NOTE_OWN_PASS(BRK_HOST);
+    end_encoders();
+    s_host_resolve = surface_rs(s);
+    result = draw(&target, user);
+    s_host_resolve = nil;
+    if (result) { s->gpu_dirty = 1; s->drawn++; s_host_drawn = 1; }
+    return result;
+}
+
+/* MM3's native depth fog (its render_fog.c calls this through
+ * nv2a_d3d_host_draw; the shader is fog_ps in nv2a.metal, after the title's
+ * distance_fog.hlsl). params: band (start, 1/(end-start), depth to world,
+ * sky fill), colour (rgb, mask pass), sky fade (screen-space plane, rate).
+ * The fog blends colour by its alpha and keeps destination alpha; with mask,
+ * a second pass writes only alpha: the sky, faded at its lower edge, for the
+ * horizon panorama's destination-alpha composition. */
+static id<MTLFunction> s_fn_fog_vs, s_fn_fog_ps[2];
+
+static id<MTLRenderPipelineState> fog_pipeline(MTLPixelFormat format, NSUInteger samples, int mask)
+{
+    static struct { MTLPixelFormat format; NSUInteger samples; int mask; id<MTLRenderPipelineState> pso; } cache[8];
+    static int used;
+    int i;
+    for (i = 0; i < used; i++)
+        if (cache[i].format == format && cache[i].samples == samples && cache[i].mask == mask)
+            return cache[i].pso;
+    if (!s_fn_fog_vs) {
+        s_fn_fog_vs = function(@"fog_vs");
+        s_fn_fog_ps[0] = function(@"fog_ps");
+        s_fn_fog_ps[1] = function(@"fog_ps_ms");
+    }
+    if (!s_fn_fog_vs || !s_fn_fog_ps[0] || !s_fn_fog_ps[1] || used == 8)
+        return nil;
+    @autoreleasepool {
+        MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
+        MTLRenderPipelineColorAttachmentDescriptor *a = d.colorAttachments[0];
+        NSError *err = nil;
+        d.vertexFunction = s_fn_fog_vs;
+        d.fragmentFunction = s_fn_fog_ps[samples > 1];
+        d.rasterSampleCount = samples;
+        a.pixelFormat = format;
+        if (mask) {
+            a.writeMask = MTLColorWriteMaskAlpha;
+        } else {
+            a.blendingEnabled = YES;
+            a.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+            a.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            a.rgbBlendOperation = MTLBlendOperationAdd;
+            a.sourceAlphaBlendFactor = MTLBlendFactorZero;
+            a.destinationAlphaBlendFactor = MTLBlendFactorOne;
+            a.alphaBlendOperation = MTLBlendOperationAdd;
+        }
+        cache[used].pso = build_pso(d, &err);
+        [d release];
+        if (!cache[used].pso) {
+            fprintf(stderr, "[METAL] fog pipeline: %s\n",
+                    err ? [[err localizedDescription] UTF8String] : "failed");
+            return nil;
+        }
+    }
+    cache[used].format = format;
+    cache[used].samples = samples;
+    cache[used].mask = mask;
+    return cache[used++].pso;
+}
+
+int nv2a_metal_fog_draw(const NvHostTarget *t, const float input[12], int mask)
+{
+    id<MTLTexture> colour = (id<MTLTexture>)t->colour, depth = (id<MTLTexture>)t->depth;
+    id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)t->context;
+    id<MTLRenderPipelineState> fog = fog_pipeline([colour pixelFormat], t->samples, 0);
+    id<MTLRenderPipelineState> alpha = mask ? fog_pipeline([colour pixelFormat], t->samples, 1) : nil;
+    id<MTLRenderCommandEncoder> e;
+    float params[12];
+    if (!fog || (mask && !alpha)) return 0;
+    memcpy(params, input, sizeof params);
+    {
+        MTLRenderPassDescriptor *d = pass_descriptor(colour, s_host_resolve, nil);
+        d.visibilityResultBuffer = nil;
+        stamp_render(d, "fog pass");
+        e = [cb renderCommandEncoderWithDescriptor:d];
+    }
+    [e setViewport:(MTLViewport){ 0, 0, (double)t->width, (double)t->height, 0, 1 }];
+    [e setScissorRect:(MTLScissorRect){ 0, 0, t->width, t->height }];
+    [e setDepthStencilState:s_ds_off];
+    [e setRenderPipelineState:fog];
+    [e setFragmentBytes:params length:sizeof params atIndex:0];
+    [e setFragmentTexture:depth atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    if (mask) {
+        params[7] = 1;
+        [e setRenderPipelineState:alpha];
+        [e setFragmentBytes:params length:sizeof params atIndex:0];
+        [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    }
+    [e endEncoding];
+    return 1;
+}
+
 void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color,
                     uint32_t zstencil, uint32_t x0, uint32_t y0,
                     uint32_t x1, uint32_t y1)
@@ -4261,7 +4356,7 @@ static int writeback_finish(int wait)
     if (!s_wb_pending)
         return 1;
     if (s_wb_cmd) {
-        if (wait) [s_wb_cmd waitUntilCompleted];
+        if (wait) HITCH(HITCH_GPU, [s_wb_cmd waitUntilCompleted]);
         else if ([s_wb_cmd status] < MTLCommandBufferStatusCompleted) return 0;
         [s_wb_cmd release];
         s_wb_cmd = nil;
@@ -4710,7 +4805,7 @@ static int present_kept(void)
     id<CAMetalDrawable> dr;
     if (!s_kept || !ensure_swapchain()) return 0;
     if ([s_kept width] != s_swap_w || [s_kept height] != s_swap_h) return 0;  /* resized since */
-    dr = [s_layer nextDrawable];
+    HITCH(HITCH_DRAWABLE, dr = [s_layer nextDrawable]);
     if (!dr) return 0;
     [blit_encoder_for(BRK_PRESENT) copyFromTexture:s_kept toTexture:[dr texture]];
     capture_backbuffer([dr texture]);
@@ -4721,16 +4816,17 @@ static int present_kept(void)
 }
 
 /* The last HIST_FRAMES game images (the guest surface each flip showed, at
- * half the internal resolution: 48 frames, 0.8 s at 60 Hz, covers the time
+ * half the internal resolution: 120 frames, 2 s at 60 Hz, covers the time
  * it takes to notice a flash and press the key), so a glitch too brief to
  * describe can be looked at:
  * nv2a_metal_save_recent_frames (Graphics > Save Recent Frames) writes them
  * as BMPs, oldest first, to ~/Library/Logs/Midtown Madness 3 Frames/<time>/. */
-#define HIST_FRAMES 48
+#define HIST_FRAMES 120
 static id<MTLTexture> s_hist[HIST_FRAMES];
 static uint32_t s_hist_frame[HIST_FRAMES];
 static int s_hist_next;
 static _Atomic int s_hist_save;
+static int s_hist_saved;            /* this frame wrote them: not a hitch */
 
 void nv2a_metal_save_recent_frames(void)
 {
@@ -4759,6 +4855,7 @@ static void history_save(void)
     struct tm tm;
     int i, n = 0;
     if (!atomic_exchange(&s_hist_save, 0) || !home) return;
+    s_hist_saved = 1;
     localtime_r(&now, &tm);
     snprintf(dir, sizeof dir, "%s/Library/Logs/Midtown Madness 3 Frames", home);
     mkdir(dir, 0755);
@@ -4797,7 +4894,8 @@ static void present_surface(Surface *s, FlipPacing *pacing)
         }
     }
     if (ensure_swapchain()) {
-        id<CAMetalDrawable> dr = [s_layer nextDrawable];
+        id<CAMetalDrawable> dr;
+        HITCH(HITCH_DRAWABLE, dr = [s_layer nextDrawable]);
         if (dr) {
             composite([dr texture], s_swap_w, s_swap_h, s, &pc, 1);
             history_keep(s);
@@ -5005,7 +5103,9 @@ static Surface *scan_surface(uint32_t va, uint32_t pitch)
     return s;
 }
 
-void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
+/* show 0: the frame is finished (written back, counted) but not put on
+ * screen -- an interpolating executor shows replays of it instead. */
+void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
 {
     Surface *s;
     FlipPacing pacing = { 0 };
@@ -5021,6 +5121,30 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
             s_mr_frame_n = 0;
         }
         s_depth_hazed = 0;
+        {   /* A flip long after the last one, mid-game: say where it went. */
+            static int64_t last;
+            int64_t now = qpc();
+            double ms = last ? (double)(now - last) * 1000.0 / (double)QPC_FREQ : 0;
+            if (ms > 50.0 && s_frame > 300 && !s_hist_saved) {
+                static unsigned told;
+                if (told++ < 100)
+                    fprintf(stderr, "[METAL] frame %u: %.0f ms since the last flip -- pipelines %.0f, "
+                            "GPU waits %.0f, surface sync %.0f, drawable %.0f ms; the rest is the title\n",
+                            s_frame, ms, s_hitch[HITCH_PSO] * 1000.0 / QPC_FREQ,
+                            s_hitch[HITCH_GPU] * 1000.0 / QPC_FREQ, s_hitch[HITCH_SYNC] * 1000.0 / QPC_FREQ,
+                            s_hitch[HITCH_DRAWABLE] * 1000.0 / QPC_FREQ);
+            }
+            last = now;
+            s_hist_saved = 0;
+            memset(s_hitch, 0, sizeof s_hitch);
+        }
+        if (s_host_drawn_prev && !s_host_drawn) {
+            static unsigned told;
+            if (told++ < 50)
+                fprintf(stderr, "[METAL] frame %u: no host (fog) pass after a frame with one\n", s_frame);
+        }
+        s_host_drawn_prev = s_host_drawn;
+        s_host_drawn = 0;
         s = surface_find(phys(surface_addr));
         if (!s && pitch)
             s = scan_surface(surface_addr, pitch);
@@ -5030,7 +5154,8 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
             int64_t t0 = s_prof_on > 0 ? qpc() : 0, t1;
             writeback_surfaces();
             t1 = s_prof_on > 0 ? qpc() : 0;
-            present_surface(s, &pacing);
+            if (show)
+                present_surface(s, &pacing);
             if (s_prof_on > 0) {
                 s_prof[PROF_WRITEBACK] += t1 - t0;
                 s_prof[PROF_PRESENT] += qpc() - t1 - pacing.ticks;
@@ -5038,7 +5163,8 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
         }
         /* A missing surface or drawable still completes exactly one paced
          * guest flip. */
-        pace_flip(&pacing);
+        if (show)
+            pace_flip(&pacing);
         RECOMP_PROFILE_FRAME();
         prof_report();
         pass_log_frame();
@@ -5049,6 +5175,11 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
         texpack_apply_toggle();
         s_frame++;
     }
+}
+
+void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
+{
+    nv2a_d3d_flip_present(surface_addr, pitch, 1);
 }
 
 void nv2a_metal_pass_log_flush(void)
@@ -5070,6 +5201,18 @@ void nv2a_d3d_repeat_frame(void)
     atomic_store(&s_repeat, 1);
     while (atomic_load(&s_repeat))
         sched_yield();
+}
+
+/* Upstream draws frames between the title's own by replaying its recorded
+ * GPU commands (nv2a_pb_replay), which this renderer does not do yet: the
+ * interpolation is left off, so a request is the console-rate path -- the
+ * frame the title just drew is already shown, and a frame without one shows
+ * the last image again. */
+void nv2a_d3d_interp_frame(float t, int need_new)
+{
+    (void)t;
+    if (!need_new)
+        nv2a_d3d_repeat_frame();
 }
 
 void nv2a_d3d_tick(void)

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Car Workshop on the Mac: the extra-car editor (mm3-recomp tools/car-mods)
+# Car Workshop on the Mac: the extra-car editor (mm3-car-tools car-mods)
 # on this repo's game_files. Its Save & Apply installs into game_files; when
 # the window closes, changed game data is copied into the installed app
 # (Contents/Resources/game_files) and the app re-signed.
@@ -18,7 +18,7 @@ if pgrep -x mm3_recomp >/dev/null; then
 fi
 STATE="$ROOT/game_files/.mm3-car-mods/state.json"
 before=$(stat -f %m "$STATE" 2>/dev/null || echo 0)
-(cd third_party/mm3-recomp/tools/car-mods && "$PY" editor.py --game-dir "$ROOT/game_files" "$@")
+(cd third_party/mm3-recomp/tools/car-tools/car-mods && "$PY" editor.py --game-dir "$ROOT/game_files" "$@")
 after=$(stat -f %m "$STATE" 2>/dev/null || echo 0)
 if [ "$after" != "$before" ] && [ -d "$APP/Contents/Resources/game_files" ]; then
     echo "Copying the applied car data into $APP"

@@ -33,7 +33,6 @@ set(MM3_PLATFORM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/mac/include" CACHE ST
 set(MM3_PLATFORM_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/app_macos.m"
     "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/mac_win32_extras.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/mm3_asset_cache_posix.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/mac/src/mm3_launcher_macos.c"
     CACHE STRING "" FORCE)
 set(MM3_PLATFORM_LIBRARIES "-framework Cocoa" "-framework IOKit" CACHE STRING "" FORCE)

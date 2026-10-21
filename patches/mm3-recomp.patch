@@ -1,58 +1,72 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 4353ace..8be3c7d 100644
+index a1ecc4b..411ef32 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -25,7 +25,9 @@ endif()
+@@ -3,8 +3,11 @@ project(mm3_recomp C CXX)
  
- # The audio DSP programs MM3 runs, saved there by the game (src/main.c) and
- # recompiled to C by each build; derived from the user's game like src/recomp/gen.
+ # The recompiled game code uses x86 SIMD intrinsics for the guest's MMX/SSE,
+ # and the runtime traps hardware registers by decoding x86-64 instructions,
+-# so the host must be x86-64 (Windows, Linux or an Intel Mac).
+-if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
++# so the host must be x86-64 (Windows, Linux or an Intel Mac) -- or an Apple
++# Silicon Mac, where the including project (the macOS port) supplies those
++# intrinsics over NEON and traps registers by decoding A64 instead.
++if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND
++   NOT (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$"))
+     message(FATAL_ERROR "MM3 needs an x86-64 host; this is ${CMAKE_SYSTEM_PROCESSOR}")
+ endif()
+ 
+@@ -40,7 +43,9 @@ endif()
+ # The audio DSP programs MM3 runs, saved there by the game (src/main.c; setup.py
+ # captures them from a short run) and recompiled to C by each build; derived
+ # from the user's game like src/recomp/gen.
 -set(XBOXRECOMP_DSP_PROGRAM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/game_files/dsp")
 +if(NOT DEFINED XBOXRECOMP_DSP_PROGRAM_DIR)
 +    set(XBOXRECOMP_DSP_PROGRAM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/game_files/dsp")
 +endif()
  add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
- if(MSVC AND MM3_DSP_AUTO_INLINE)
-     # RelWithDebInfo defaults to /Ob1, which leaves small non-inline interpreter
-@@ -37,6 +39,14 @@ if(MSVC AND MM3_DSP_AUTO_INLINE)
+ # MM3 VP-only playback was measured about 10 dB above GP output (-10.7 vs
+ # -20.7 dBFS in a race). Keep its existing calibration outside the runtime.
+@@ -55,6 +60,21 @@ if(MSVC AND MM3_DSP_AUTO_INLINE)
  endif()
  
  
-+# Platform-specific sources and libraries. A non-Windows host (the macOS port)
-+# supplies its launcher, overlay and window through MM3_PLATFORM_SOURCES and
-+# MM3_PLATFORM_LIBRARIES from the including project.
-+set(MM3_PLATFORM_SOURCES "" CACHE STRING "Host sources replacing the Win32 launcher and overlay")
++# Platform-specific sources and libraries. A host with its own renderer and
++# window (XBOXRECOMP_RENDERER=EXTERNAL: the macOS port) supplies its launcher,
++# overlay and window through MM3_PLATFORM_SOURCES, MM3_PLATFORM_LIBRARIES and
++# MM3_PLATFORM_INCLUDE_DIRS from the including project, in place of the RmlUi
++# launcher and ImGui overlay.
++set(MM3_PLATFORM_SOURCES "" CACHE STRING "Host sources replacing the launcher and overlay")
 +set(MM3_PLATFORM_LIBRARIES "" CACHE STRING "Host libraries for MM3_PLATFORM_SOURCES")
 +set(MM3_PLATFORM_INCLUDE_DIRS "" CACHE STRING "Host include directories (a windows.h shim)")
++if(XBOXRECOMP_RENDERER STREQUAL "EXTERNAL")
++    set(MM3_EXTERNAL_HOST ON)
++else()
++    set(MM3_EXTERNAL_HOST OFF)
++endif()
 +
-+if(WIN32)
++if(NOT MM3_EXTERNAL_HOST)
  # Settings launcher (src/mm3_launcher.cpp): RmlUi on its Win32/D3D11 backend,
+ # or with the SDL3 GPU renderer its SDL3 platform and SDL GPU renderer;
  # FreeType for its fonts. Static, fetched once at configure time.
- include(FetchContent)
-@@ -71,6 +81,7 @@ add_library(mm3_imgui STATIC
-     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp)
+@@ -138,6 +158,7 @@ add_library(mm3_imgui STATIC
+     ${MM3_IMGUI_BACKEND})
  target_include_directories(mm3_imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
- target_link_libraries(mm3_imgui PUBLIC d3d11 d3dcompiler dwmapi)
+ target_link_libraries(mm3_imgui PUBLIC ${MM3_IMGUI_BACKEND_LIBS})
 +endif()
  if(MM3_TRACY)
      foreach(profile_target xbox_kernel xbox_video)
          target_link_libraries(${profile_target} PRIVATE Tracy::TracyClient)
-@@ -93,12 +104,14 @@ set(MM3_RENAMED_FUNCTIONS
+@@ -160,6 +181,8 @@ set(MM3_RENAMED_FUNCTIONS
      sub_00170E5D sub_000145DC sub_001F02AD
      sub_0025968E                 # widescreen: wraps the projection-matrix builder
      sub_001DB6E8 sub_001F2A71 sub_001F443D  # skip intro: movie play, frame, skip check
 +    sub_000CF2DA                 # car lamps: no headlights by day
++    sub_0019531D sub_00296E94    # offline: network readiness, Xbox Live's dashboard hand-over
  )
  if(MM3_MOVIE_INPUT_TRACE)
      list(APPEND MM3_RENAMED_FUNCTIONS sub_0035BDC0)
- endif()
- if(MM3_OFFLINE_XNET)
--    list(APPEND MM3_RENAMED_FUNCTIONS sub_0019531D)
-+    list(APPEND MM3_RENAMED_FUNCTIONS sub_0019531D
-+         sub_00296E94)          # offline: Xbox Live's hand-over to the dashboard
- endif()
- if(MM3_FRONTEND_WATCH)
-     list(APPEND MM3_RENAMED_FUNCTIONS sub_000FA37E sub_0011935B sub_001253F4 sub_0008E420 sub_0008E3C0)
-@@ -156,6 +169,8 @@ list(REMOVE_DUPLICATES MM3_SEAM_FUNCTIONS)
+@@ -225,6 +248,8 @@ list(REMOVE_DUPLICATES MM3_SEAM_FUNCTIONS)
  include("${CMAKE_CURRENT_SOURCE_DIR}/scripts/mm3_race_guidance_seam.cmake")
  include("${CMAKE_CURRENT_SOURCE_DIR}/scripts/mm3_tree_contact_seam.cmake")
  list(APPEND MM3_SEAM_FUNCTIONS sub_0015BF5A sub_0015D2DD)
@@ -61,7 +75,7 @@ index 4353ace..8be3c7d 100644
  if(MM3_NATIVE_FENCE_WAIT)
      list(APPEND MM3_SEAM_FUNCTIONS sub_00344640)
      include("${CMAKE_CURRENT_SOURCE_DIR}/scripts/mm3_fence_wait_seam.cmake")
-@@ -265,6 +280,14 @@ foreach(distance_input IN LISTS distance_owners)
+@@ -342,6 +367,14 @@ foreach(distance_input IN LISTS distance_owners)
      if(owner_sub_0016AEDB STREQUAL distance_input)
          mm3_add_tree_mesh(distance_content)
      endif()
@@ -76,33 +90,25 @@ index 4353ace..8be3c7d 100644
      foreach(tree_owner sub_0015BF5A sub_0015D2DD)
          if(owner_${tree_owner} STREQUAL distance_input)
              mm3_add_tree_render(distance_content ${tree_owner})
-@@ -281,21 +304,30 @@ foreach(distance_input IN LISTS distance_owners)
+@@ -358,20 +391,26 @@ foreach(distance_input IN LISTS distance_owners)
      list(APPEND RECOMP_GEN_SOURCES "${distance_output}")
  endforeach()
  
-+if(WIN32)
-+    set(MM3_HOST_SOURCES
-+        src/mm3_launcher.cpp
-+        src/mm3.rc
-+        ${rmlui_SOURCE_DIR}/Backends/RmlUi_Platform_Win32.cpp
-+        ${rmlui_SOURCE_DIR}/Backends/RmlUi_Renderer_DX11.cpp
-+        ${rmlui_SOURCE_DIR}/Backends/RmlUi_Backend_Win32_DX11.cpp
-+        src/mods/debug_overlay.cpp
-+        src/recomp_trace_probe.c)
-+else()
++if(MM3_EXTERNAL_HOST)
 +    set(MM3_HOST_SOURCES ${MM3_PLATFORM_SOURCES})
++else()
++    set(MM3_HOST_SOURCES src/mm3_launcher.cpp ${MM3_RMLUI_BACKEND} src/mods/debug_overlay.cpp)
 +endif()
 +
  add_executable(${PROJECT_NAME}
      src/main.c
      src/mm3_asset_cache.c
 -    src/mm3_launcher.cpp
--    src/mm3.rc
--    ${rmlui_SOURCE_DIR}/Backends/RmlUi_Platform_Win32.cpp
--    ${rmlui_SOURCE_DIR}/Backends/RmlUi_Renderer_DX11.cpp
--    ${rmlui_SOURCE_DIR}/Backends/RmlUi_Backend_Win32_DX11.cpp
+-    ${MM3_RMLUI_BACKEND}
 +    ${MM3_HOST_SOURCES}
      src/mods/mods.c
+     src/mods/render_commands.c
+     src/mods/render_policy.c
 -    src/mods/debug_overlay.cpp
      src/mods/dev_tools.c
      src/mods/menu_mouse.c
@@ -110,68 +116,108 @@ index 4353ace..8be3c7d 100644
      src/mods/widescreen_hud.c
      src/mods/skip_intro.c
 +    src/mods/car_lamps.c
++    src/mods/offline.c
      src/mods/framerate.c
+     src/mods/keyboard_driving.c
      src/mm3_unresolved_stubs.c
-  src/mm3_memory_compat.c
-@@ -317,7 +349,6 @@ add_executable(${PROJECT_NAME}
+@@ -393,7 +432,6 @@ add_executable(${PROJECT_NAME}
   src/mods/widescreen.c
   src/mods/draw_distance.c
   src/mods/teleport.c
 - src/recomp_trace_probe.c
   ${RECOMP_GEN_SOURCES})
  
- set_property(SOURCE src/recomp_manual.c APPEND PROPERTY COMPILE_DEFINITIONS
-@@ -343,9 +374,15 @@ target_include_directories(${PROJECT_NAME} PRIVATE
+ if(WIN32)
+@@ -429,9 +467,14 @@ target_include_directories(${PROJECT_NAME} PRIVATE
      ${XBOXRECOMP_DIR}/include
      ${XBOXRECOMP_DIR}/src/video)
  
--target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp mm3_imgui RmlUi::RmlUi d3d11 dxgi d3dcompiler dwmapi xinput)
+-target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp mm3_imgui RmlUi::RmlUi
+-    ${MM3_RMLUI_BACKEND_LIBS} ${MM3_WIN32_LIBS})
 -target_include_directories(${PROJECT_NAME} PRIVATE ${rmlui_SOURCE_DIR}/Backends)
-+if(WIN32)
-+    target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp mm3_imgui RmlUi::RmlUi d3d11 dxgi d3dcompiler dwmapi xinput)
-+    target_include_directories(${PROJECT_NAME} PRIVATE ${rmlui_SOURCE_DIR}/Backends)
-+else()
++if(MM3_EXTERNAL_HOST)
 +    target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp ${MM3_PLATFORM_LIBRARIES})
 +    target_include_directories(${PROJECT_NAME} BEFORE PRIVATE ${MM3_PLATFORM_INCLUDE_DIRS})
++else()
++    target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp mm3_imgui RmlUi::RmlUi
++        ${MM3_RMLUI_BACKEND_LIBS} ${MM3_WIN32_LIBS})
++    target_include_directories(${PROJECT_NAME} PRIVATE ${rmlui_SOURCE_DIR}/Backends)
 +endif()
  
-+if(WIN32)
  # Focused offline checks; explicitly built, never part of the game build.
- foreach(check teleport dev_tools overlay input_capture)
-     if(check STREQUAL "overlay")
-@@ -362,11 +399,13 @@ foreach(check teleport dev_tools overlay input_capture)
-     endif()
- endforeach()
- target_link_libraries(mm3_overlay_contract PRIVATE mm3_imgui xinput)
-+endif()
+ # Each one links the platform layer, which supplies the <platform/xbox_winnt.h>
+@@ -472,9 +515,12 @@ if(WIN32)
+ endif()
  
- # MM3's CRT uses NtAllocateVirtualMemory reserve requests as heap-backed
- # buffers.  Keep the vendor runtime untouched: redirect its public reserve
- # seam to the existing Xbox heap on the ELF build used by this checkout.
+ # GNU linkers only: route recomp_trace_esp through src/recomp_trace_probe.c
+-# (an opt-in RECOMP_TRACE_EFD85 diagnostic).
 -if(NOT MSVC)
++# (an opt-in RECOMP_TRACE_EFD85 diagnostic). Apple's linker has no --wrap.
 +if(NOT MSVC AND NOT APPLE)
-+ target_sources(${PROJECT_NAME} PRIVATE src/recomp_trace_probe.c)
-  target_link_options(${PROJECT_NAME} PRIVATE
-   "-Wl,--wrap=xbox_ReserveAlloc"
-   "-Wl,--wrap=recomp_trace_esp")
-@@ -381,6 +420,7 @@ if(MSVC)
++    target_sources(${PROJECT_NAME} PRIVATE src/recomp_trace_probe.c)
+     target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--wrap=recomp_trace_esp")
++elseif(MSVC)
++    target_sources(${PROJECT_NAME} PRIVATE src/recomp_trace_probe.c)
+ endif()
+ 
+ if(MM3_RECOMP_ABI_CHECK)
+@@ -486,6 +532,7 @@ if(MSVC)
      target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
  endif()
  
-+if(WIN32)
- target_link_libraries(mm3_input_capture_contract PRIVATE xinput)
- target_include_directories(mm3_input_capture_contract PRIVATE ${XBOXRECOMP_DIR}/src)
- 
-@@ -395,3 +435,4 @@ target_link_libraries(mm3_launcher_settings_contract PRIVATE RmlUi::RmlUi d3d11
++if(NOT MM3_EXTERNAL_HOST)
+ add_executable(mm3_launcher_settings_contract EXCLUDE_FROM_ALL
+     tests/mm3_launcher_settings_contract.cpp src/mods/mods.c ${MM3_RMLUI_BACKEND})
+ target_include_directories(mm3_launcher_settings_contract PRIVATE src
+@@ -501,8 +548,13 @@ endif()
  if(MSVC)
      target_compile_options(mm3_launcher_settings_contract PRIVATE /UNDEBUG)
  endif()
 +endif()
+ 
+ # The distance enhancement belongs to this port, including host shaders.
++# An EXTERNAL renderer draws the fog itself (the macOS port's Metal
++# renderer); the hook it calls is still mm3_render_fog's.
+ target_sources(mm3_recomp PRIVATE src/mods/render_fog.c)
+-include(cmake/MM3RenderFog.cmake)
+-mm3_render_fog_shaders(mm3_recomp "${XBOXRECOMP_RENDERER}")
++if(NOT MM3_EXTERNAL_HOST)
++    include(cmake/MM3RenderFog.cmake)
++    mm3_render_fog_shaders(mm3_recomp "${XBOXRECOMP_RENDERER}")
++endif()
+diff --git a/mm3_runtime_entry_repairs.json b/mm3_runtime_entry_repairs.json
+index ac9f07a..9983fb6 100644
+--- a/mm3_runtime_entry_repairs.json
++++ b/mm3_runtime_entry_repairs.json
+@@ -19,6 +19,11 @@
+     "end": "0x0004C793",
+     "note": "Runtime array-destructor callback observed at 0x00012BAB while changing game modes. Convert this from ECX to EAX and tail-call the existing 0x0024D249 destructor."
+   },
++  {
++    "start": "0x0006726A",
++    "end": "0x0006727D",
++    "note": "Count-with-minimum leaf (mov eax,[eax]; add eax,4; call 0x4DBC7; at least 4; ret), EAX in, reached only as the tail jump of 0x135B2A (game vtable). As an unresolved stub it returned without computing EAX; with stubs stopping, starting a race aborted."
++  },
+   {
+     "start": "0x0009B4E2",
+     "end": "0x0009B4E7",
+@@ -190,6 +195,11 @@
+     "end": "0x00144EDE",
+     "note": "Shared successful graph-edge lookup epilogue, reached by 0x00144EDE from vtable method 0x00144EAE. Original POP EDI; POP ESI; RET 4 restores both saved registers and eight bytes missing from the unresolved stub. Without these pops the outer 0x001F6349 frame restores its registers from the wrong stack words."
+   },
++  {
++    "start": "0x00154018",
++    "end": "0x0015407E",
++    "note": "Function-local static getter: on first call constructs the object at 0x431A28 (vtable 0x3A85D4, registers its atexit cleanup 0x258566) and returns it in EAX. Reached only through the tail jump of the vtable thunk 0x15407E, called from 0x1EB6C7 at race start (the player's [edi+0xD8] object). As an unresolved stub it returned garbage EAX and never built the object."
++  },
+   {
+     "start": "0x00189153",
+     "end": "0x0018916E",
 diff --git a/scripts/generate_mm3.py b/scripts/generate_mm3.py
-index 2f88cd8..6937500 100644
+index c4c6061..212bc23 100644
 --- a/scripts/generate_mm3.py
 +++ b/scripts/generate_mm3.py
-@@ -34,7 +34,7 @@ GENERATOR_COMMIT = '967ec30f362dee229183b4e112e928cd41830484'
+@@ -33,7 +33,7 @@ GENERATOR_COMMIT = '34330f4ae0d2c7dcea1d1173c202f18620bd3291'
  def generator_dir():
      if os.environ.get('MM3_GENERATOR_DIR'):
          return Path(os.environ['MM3_GENERATOR_DIR']).resolve()
@@ -180,7 +226,7 @@ index 2f88cd8..6937500 100644
      if not (out / 'tools/recomp/__main__.py').exists():
          tar = subprocess.run(['git', '-C', str(REPO / 'tools/xboxrecomp'), 'archive', '--format=tar',
                                GENERATOR_COMMIT, 'tools'], check=True, capture_output=True).stdout
-@@ -52,7 +52,45 @@ def generator_dir():
+@@ -51,7 +51,45 @@ def generator_dir():
          text = lifter.read_text()
          if text.count(old) != 1:
              sys.exit('pinned lifter changed: fld tbyte patch does not apply')
@@ -410,50 +456,27 @@ index 0000000..5ee8a05
 +    else:
 +        sys.exit(__doc__)
 diff --git a/src/main.c b/src/main.c
-index 1b249b9..5537062 100644
+index d7c81b8..df530fb 100644
 --- a/src/main.c
 +++ b/src/main.c
-@@ -3,6 +3,11 @@
+@@ -3,6 +3,10 @@
  #include <stdbool.h>
  #include <stdint.h>
- #include <windows.h>
-+#if !defined(_WIN32)
+ #include "platform/xbox_winnt.h"
++#if defined(__APPLE__) && defined(__aarch64__)
 +#include <execinfo.h>
-+#include <signal.h>
 +#include <mach/arm/thread_status.h>
 +#endif
  
  #include <xbox/xboxrecomp.h>
  
-@@ -40,6 +45,7 @@ static void mm3_close_game(void)
-     ExitProcess(0);
- }
- 
-+#if defined(_WIN32)
- static BOOL WINAPI mm3_console_control(DWORD event)
- {
-     if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT &&
-@@ -48,6 +54,13 @@ static BOOL WINAPI mm3_console_control(DWORD event)
-     mm3_close_game();
-     return TRUE;
- }
-+#else
-+static void mm3_console_signal(int sig)
-+{
-+    (void)sig;
-+    mm3_close_game();
-+}
-+#endif
- int mm3_launcher(void);
- 
- /* Register the first XAPI worker before it can create background workers.
-@@ -77,6 +90,40 @@ void sub_00083A6C(void)
+@@ -77,6 +81,40 @@ void sub_00083A6C(void)
      sub_00083A6C_original();
  }
  
-+#if !defined(_WIN32)
-+/* arm64 Darwin: the same guest state as the Win32 report, with the host's
-+ * PC/SP/LR from the signal frame and a native backtrace. */
++#if defined(__APPLE__) && defined(__aarch64__)
++/* arm64 Darwin: the same guest state, with the host's PC/SP/LR from the
++ * signal frame and a native backtrace. */
 +static LONG mm3_crash_report(EXCEPTION_POINTERS *info)
 +{
 +    const EXCEPTION_RECORD *record = info ? info->ExceptionRecord : NULL;
@@ -488,7 +511,7 @@ index 1b249b9..5537062 100644
  static LONG WINAPI mm3_crash_report(EXCEPTION_POINTERS *info)
  {
      const EXCEPTION_RECORD *record = info ? info->ExceptionRecord : NULL;
-@@ -132,6 +179,7 @@ static LONG WINAPI mm3_crash_report(EXCEPTION_POINTERS *info)
+@@ -132,6 +170,7 @@ static LONG WINAPI mm3_crash_report(EXCEPTION_POINTERS *info)
      fflush(stderr);
      return EXCEPTION_CONTINUE_SEARCH;
  }
@@ -496,34 +519,6 @@ index 1b249b9..5537062 100644
  
  static int load_file(const char *path, void **data, size_t *size)
  {
-@@ -181,7 +229,12 @@ int main(void)
-     SetUnhandledExceptionFilter(mm3_crash_report);
-     xbox_FramebufferSetCloseHandler(mm3_close_game);
-     nv2a_d3d_set_flare_depth_test(1);
-+#if defined(_WIN32)
-     SetConsoleCtrlHandler(mm3_console_control, TRUE);
-+#else
-+    signal(SIGINT, mm3_console_signal);
-+    signal(SIGTERM, mm3_console_signal);
-+#endif
-     puts("MM3 static recompilation");
-     /* Profiles seed settings before the launcher; saved choices, including
-      * Auto resolution and window aspect, take precedence when Play exports them. */
-diff --git a/src/mm3_asset_cache.c b/src/mm3_asset_cache.c
-index 91ec457..fa6bc9e 100644
---- a/src/mm3_asset_cache.c
-+++ b/src/mm3_asset_cache.c
-@@ -1,3 +1,5 @@
-+#if defined(_WIN32)
-+/* POSIX hosts: mac/src/mm3_asset_cache_posix.c in the macOS port. */
- #include <stdio.h>
- #include <string.h>
- #include <wchar.h>
-@@ -199,3 +201,4 @@ close_files:
-             cache_error("cannot invalidate stale cached archive");
-     }
- }
-+#endif /* _WIN32 */
 diff --git a/src/mm3_custom_car_names.c b/src/mm3_custom_car_names.c
 index e950122..9bfa348 100644
 --- a/src/mm3_custom_car_names.c
@@ -560,7 +555,7 @@ index e950122..9bfa348 100644
      { "SID_CAR_MODEL_9013", "Regera" },
      { "SID_CAR_SHORT_9013", "Koenigsegg Regera" },
 diff --git a/src/mm3_recomp_types.h b/src/mm3_recomp_types.h
-index 6cfdcf2..4195253 100644
+index ad9daf2..0bd7fa2 100644
 --- a/src/mm3_recomp_types.h
 +++ b/src/mm3_recomp_types.h
 @@ -159,13 +159,10 @@ extern uint32_t g_xbox_code_hi;
@@ -749,6 +744,44 @@ index 6cfdcf2..4195253 100644
  /* fld tbyte: a whole little-endian x87 80-bit extended operand. The x87
   * stack is held as double, so this keeps a double's precision; reading it as
   * MEMF took the low four bytes of the significand as a float. */
+diff --git a/src/mm3_unresolved_stubs.c b/src/mm3_unresolved_stubs.c
+index 0c79e72..02401ec 100644
+--- a/src/mm3_unresolved_stubs.c
++++ b/src/mm3_unresolved_stubs.c
+@@ -5,21 +5,27 @@
+ 
+ /* Unresolved call targets (recomp_stubs_unresolved.c) are addresses the
+  * translation never generated. A stub returns without running the body,
+- * so each one reached at run time is a missing function. Stop before the
+- * generated stub guesses stack cleanup and pretends its body executed. */
++ * so each one reached at run time is a missing function -- or a call through
++ * a bad pointer. Upstream stops here; the macOS build logs each address once
++ * with its caller (for mm3_runtime_entry_repairs.json) and lets the stub
++ * return, as it always has: a stop costs the player the race. */
+ int mm3_stub_hit(uint32_t va)
+ {
++    static uint32_t seen[512];
++    static int n;
+     uint32_t caller = 0;
+     SIZE_T copied = 0;
+-#if defined(_WIN32)
++    int i;
++    for (i = 0; i < n; i++)
++        if (seen[i] == va) return 0;
++    if (n < 512) seen[n++] = va;
+     if (g_esp >= 0x10000u && g_esp <= 0x07FFFFFCu)
+         ReadProcessMemory(GetCurrentProcess(), (const void *)XBOX_PTR(g_esp),
+                           &caller, sizeof caller, &copied);
+-#endif
+-    fprintf(stderr, "[STUB] unresolved 0x%08X reached from 0x%08X (esp=0x%08X); stopping\n",
++    fprintf(stderr, "[STUB] unresolved 0x%08X reached from 0x%08X (esp=0x%08X); continuing\n",
+             va, copied == sizeof caller ? caller : 0, g_esp);
+     fflush(stderr);
+-    abort();
++    return 0;
+ }
+ 
+ /* RECOMP_DEAD_BRANCH (mm3_recomp_types.h): a conditional jump whose target
 diff --git a/src/mods/car_lamps.c b/src/mods/car_lamps.c
 new file mode 100644
 index 0000000..520204c
@@ -783,65 +816,127 @@ index 0000000..520204c
 +    sub_000CF2DA_original();
 +    MEM32(at) = mask;
 +}
+diff --git a/src/mods/draw_distance.c b/src/mods/draw_distance.c
+index 92cd0c1..899f6af 100644
+--- a/src/mods/draw_distance.c
++++ b/src/mods/draw_distance.c
+@@ -223,20 +223,43 @@ void sub_002256C7(void)
+ /* Replace the Xbox Fog.dma draw with an ordered native host fog pass.
+  * The camera supplies the W-buffer scale and sky colour, never a fog texture. */
+ extern void sub_000F8DCE_original(void);
++extern void sub_00344770(void);
++/* Room for the fog command in the push buffer, the way the title's own D3D
++ * asks for it: below the limit there is always room for this much (D3D
++ * keeps 0x188 bytes past it), and at the limit MakeSpace (0x344770,
++ * stdcall: the push size [0x352E00] and half of it) waits for the GPU and
++ * returns the new cursor. Giving up instead dropped the fog for that frame:
++ * the sky and the distance flashed bright. */
++static uint32_t fog_push_space(uint32_t device)
++{
++    uint32_t cursor = MEM32(device), size;
++    if (cursor < MEM32(device + 4)) return cursor;
++    {
++        static unsigned told;
++        if (told++ < 10) fprintf(stderr, "[MM3_DISTANCE] fog: push buffer full, making space\n");
++    }
++    size = MEM32(0x352E00);
++    g_esp -= 4; MEM32(g_esp) = size;
++    g_esp -= 4; MEM32(g_esp) = size >> 1;
++    g_esp -= 4; MEM32(g_esp) = 0;   /* return address; the callee's ret 8 pops all three */
++    sub_00344770();
++    return g_eax;
++}
++
+ void sub_000F8DCE(void)
+ {
+     if (!mm3_mod_on(MM3_MOD_DRAW_DISTANCE)) { sub_000F8DCE_original(); return; }
+-    uint32_t camera = MEM32(g_ecx+0xC), device = MEM32(0x351F48);
+-    uint32_t cursor = MEM32(device), limit = MEM32(device+4);
++    uint32_t camera = MEM32(g_ecx+0xC), device = MEM32(0x351F48), argb = MEM32(g_esp+4);
++    uint32_t cursor = device ? fog_push_space(device) : 0;
+     float depth_scale = MEMF(camera+0x1ED8), far_clip = MEMF(camera+0x1FB0);
+-    if (cursor && !(cursor&3) && limit >= cursor && limit-cursor >= MM3_FOG_WORDS*4) {
++    if (cursor && !(cursor&3)) {
+         MEM32(cursor) = MM3_FOG_HEADER; /* Eleven non-increasing NV097_NO_OPERATION parameters. */
+         MEM32(cursor+4) = MM3_FOG_TAG;
+         MEMF(cursor+8) = 1.f/depth_scale;
+         MEMF(cursor+12) = far_clip;
+         MEMF(cursor+16) = fminf(300.f,far_clip*.4f);
+         MEMF(cursor+20) = far_clip*.9f;
+-        MEM32(cursor+24) = MEM32(g_esp+4);
++        MEM32(cursor+24) = argb;
+         MEM32(cursor+28) = MM3_FOG_SKY_MASK | MM3_FOG_SKY_FILL | MM3_FOG_SKY_FADE; /* Sky mask and untextured distant air. */
+         /* World-up dotted with a camera ray: pitch/roll and projection follow
+          * the native cloud dome. Fade its lower edge over about nine degrees. */
 diff --git a/src/mods/framerate.c b/src/mods/framerate.c
-index 2d2bfc1..d1b1582 100644
+index daa9685..11ec346 100644
 --- a/src/mods/framerate.c
 +++ b/src/mods/framerate.c
-@@ -133,7 +133,8 @@ static int smooth(void)
- static void blend_pre(void);
- static void blend_post(void);
- 
--/* Ticks the last world update ran; -1 before the first. */
-+/* Ticks the last world update ran; -1 before the first and once a render
-+ * has used them. */
- static int s_ticks = -1;
- 
- /* The world update (edi the game, one argument, ret 4), with the console's
-@@ -169,6 +170,7 @@ void sub_001E7590(void)
-  * Restoring more of the globals (1600 words change per race render) put
-  * list counts out of step with their lists and crashed. */
+@@ -165,6 +165,7 @@ void sub_001E7590(void)
+  * interpolation, done on the matrices the title gave the GPU. Shown at how
+  * far the clock is into the next tick, it trails the world by one tick. */
  extern void sub_001EC8E6_original(void);
 +volatile unsigned mm3_game_progress;
  #define KEEP_LO 0x003C5680u   /* the render's queue counters only */
  #define KEEP_HI 0x003C57B0u
- static uint32_t s_keep_pre[(KEEP_HI - KEEP_LO) / 4], *s_keep_post;
-@@ -357,10 +359,17 @@ static void render_again(void)
+ static uint32_t s_keep_pre[(KEEP_HI - KEEP_LO) / 4];
+@@ -213,6 +214,7 @@ static void render_again(void)
  
  void sub_001EC8E6(void)
  {
 +    mm3_game_progress++;
      if (MEM32(g_esp) == 0x001E78AAu && mm3_mod_on(MM3_MOD_FRAMERATE)) {
-+        /* The ticks of the world update since the last render, used once. A
-+         * frame with none (the post-race and briefing screens, which skip it)
-+         * is drawn: a stale 0 kept those showing one image -- the briefing's
-+         * fade frozen almost black until A -- however long they ran. */
-+        int ticks = s_ticks;
-+        s_ticks = -1;
-         if (smooth()) {
-             blend_apply(s_alpha);
--            if (s_ticks == 0 && s_keep_idx) render_again(); else render_ticked();
-+            if (ticks == 0 && s_keep_idx) render_again(); else render_ticked();
-             blend_undo();
-             return;
-         }
-@@ -370,10 +379,10 @@ void sub_001EC8E6(void)
-         static int every = -1;
-         if (every < 0) every = getenv("MM3_RENDER_EVERY_FRAME") && atoi(getenv("MM3_RENDER_EVERY_FRAME")) == 1;
-         if (every) {
--            if (s_ticks == 0 && s_keep_idx) render_again(); else render_ticked();
-+            if (ticks == 0 && s_keep_idx) render_again(); else render_ticked();
-             return;
-         }
--        if (s_ticks == 0) {             /* not drawn: the last image again */
-+        if (ticks == 0) {               /* not drawn: the last image again */
-             g_esp += 12;
-             nv2a_d3d_repeat_frame();
-             return;
+         /* The ticks of the world update since the last render, used once. A
+          * frame with none (the post-race and briefing screens, which skip it)
+diff --git a/src/mods/menu_cursor.h b/src/mods/menu_cursor.h
+index 8163d43..8e09cbf 100644
+--- a/src/mods/menu_cursor.h
++++ b/src/mods/menu_cursor.h
+@@ -9,7 +9,7 @@ static int cursor_inside(float x, float y, const POINT *p, unsigned n)
+     return inside;
+ }
+ 
+-#if !defined(XBOXRECOMP_SDL3)
++#if defined(_WIN32) && !defined(XBOXRECOMP_SDL3)
+ static HCURSOR create_menu_cursor(void)
+ {
+     const POINT outline[] = {{1,1},{2,30},{10,24},{17,37},{24,33},{17,21},{29,19}};
+@@ -92,7 +92,7 @@ static HCURSOR create_menu_hand(void)
+     if (mask) DeleteObject(mask);
+     return hand;
+ }
+-#else
++#elif defined(XBOXRECOMP_SDL3)
+ /* SDL3: the same arrow pixels as a colour cursor. The hand is the system
+  * pointer; the Win32 build recolours the Windows hand instead. */
+ static XboxCursor create_menu_cursor(void)
+@@ -135,4 +135,8 @@ static XboxCursor create_menu_hand(void)
+ {
+     return SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
+ }
++#else
++/* A host window that draws its own pointer (the macOS port's): none here. */
++static XboxCursor create_menu_cursor(void) { return NULL; }
++static XboxCursor create_menu_hand(void) { return NULL; }
+ #endif
+diff --git a/src/mods/menu_mouse.c b/src/mods/menu_mouse.c
+index 1916906..019a38d 100644
+--- a/src/mods/menu_mouse.c
++++ b/src/mods/menu_mouse.c
+@@ -355,7 +355,7 @@ static int mouse_click(float x, float y)
+ void mm3_menu_mouse_init(void)
+ {
+     (void)enabled(); /* Cache environment settings before worker threads start. */
+-#if !defined(XBOXRECOMP_SDL3)
++#if defined(_WIN32) && !defined(XBOXRECOMP_SDL3)
+     /* Windows composites the themed pointer independently of guest frames. */
+     menu_cursor = create_menu_cursor();
+     if (!menu_cursor) menu_cursor = LoadCursorA(NULL, IDC_ARROW);
 diff --git a/src/mods/mods.h b/src/mods/mods.h
-index 08f2b7d..f6076b9 100644
+index 7fb1f1e..bd60292 100644
 --- a/src/mods/mods.h
 +++ b/src/mods/mods.h
-@@ -32,6 +32,10 @@ int mm3_mod_on(int mod);
+@@ -33,6 +33,10 @@ int mm3_mod_on(int mod);
  void mm3_mods_init(void);
  /* Every player update (gameplay only): mods that act during a race. */
  void mm3_mods_player_update(void);
@@ -853,34 +948,75 @@ index 08f2b7d..f6076b9 100644
  #ifdef __cplusplus
  }
 diff --git a/src/mods/offline.c b/src/mods/offline.c
-index 8950239..62fdf22 100644
---- a/src/mods/offline.c
+new file mode 100644
+index 0000000..919ea7c
+--- /dev/null
 +++ b/src/mods/offline.c
-@@ -35,3 +35,22 @@ void sub_0019531D(void)
-     g_eax = 1;
-     g_esp += 4; /* original cdecl ret, no arguments */
- }
+@@ -0,0 +1,47 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "recomp_types.h"
++
++/* Offline play. Upstream dropped its readiness bypass once the original
++ * path reached driving on its own; here that path still holds the boot
++ * screen about 20 s before giving up, so the Mac build keeps the bypass. */
++
++/* MM3's network object's readiness method masks bit 0x20 from
++ * XNetGetTitleXnAddr and returns whether any other bit is set; the
++ * initialization method at 0x195341 polls it every 100 ms. With networking
++ * off (RECOMP_NET unset or 0) report it ready at once. */
++extern void sub_0019531D_original(void);
++void sub_0019531D(void)
++{
++    static int reported;
++    static int bypass = -1;
++    if (bypass < 0) {
++        const char *mode = getenv("RECOMP_NET");
++        bypass = !mode || !*mode || !strcmp(mode, "0");
++    }
++    if (!bypass) {
++        sub_0019531D_original();
++        return;
++    }
++    if (!reported) {
++        reported = 1;
++        fprintf(stderr, "[MM3_OFFLINE] network readiness forced to 1\n");
++    }
++    g_eax = 1;
++    g_esp += 4; /* original cdecl ret, no arguments */
++}
 +
 +/* Xbox Live's hand-over to the dashboard (0x296E94, stdcall, 4 arguments).
 + * Sign In with no account sets one up there: it launches d:\dashupdate.xbe
 + * (XLaunchNewImage, 0x296BED) and, failing that, reboots to the dashboard
-+ * outright. With no dashboard either way quit the game. Offline, report the
++ * outright. With no dashboard either way quits the game, so report the
 + * hand-over as failed and stay in the game. */
 +#define XONLINE_E_FAIL 0x80004005u
-+extern void sub_00296E94_original(void);
 +void sub_00296E94(void)
 +{
-+    if (!mm3_mod_on(MM3_MOD_OFFLINE)) {
-+        sub_00296E94_original();
-+        return;
-+    }
-+    fprintf(stderr, "[MM3_OFFLINE] Xbox Live dashboard hand-over refused: no dashboard offline\n");
++    fprintf(stderr, "[MM3] Xbox Live dashboard hand-over refused: no dashboard\n");
 +    fflush(stderr);
 +    g_eax = XONLINE_E_FAIL;
 +    g_esp += 20; /* ret 16 */
 +}
+diff --git a/src/mods/render_fog.c b/src/mods/render_fog.c
+index c7f6e1a..d6394bb 100644
+--- a/src/mods/render_fog.c
++++ b/src/mods/render_fog.c
+@@ -6,6 +6,10 @@
+ #include "render_fog_sdlgpu.h"
+ #elif defined(_WIN32)
+ #include "render_fog_d3d11.h"
++#elif defined(__APPLE__)
++/* The macOS port's Metal renderer draws the same pass (nv2a_metal.m). */
++int nv2a_metal_fog_draw(const NvHostTarget *target, const float params[12], int mask);
++#define mm3_fog_draw nv2a_metal_fog_draw
+ #else
+ static int mm3_fog_draw(const NvHostTarget *target,const float params[12],int mask)
+ { (void)target; (void)params; (void)mask; return 0; }
 diff --git a/src/mods/skip_intro.c b/src/mods/skip_intro.c
-index 82db81a..9422c73 100644
+index 735f50a..3a4ddd0 100644
 --- a/src/mods/skip_intro.c
 +++ b/src/mods/skip_intro.c
 @@ -94,6 +94,7 @@ void sub_001F2A71(void)
@@ -891,48 +1027,8 @@ index 82db81a..9422c73 100644
  #ifdef MM3_MOVIE_INPUT_TRACE
      uint32_t action = g_eax, controller = g_ebx;
  #endif
-diff --git a/src/mods/teleport.c b/src/mods/teleport.c
-index 10408ff..af7f86e 100644
---- a/src/mods/teleport.c
-+++ b/src/mods/teleport.c
-@@ -297,6 +297,8 @@ int mm3_teleport_queue(float x, float z, float heading)
-     return accepted;
- }
- 
-+#if defined(_WIN32)
-+/* The debug teleport pipe and panel are Win32 tools. */
- static DWORD WINAPI pipe_thread(void *unused)
- {
-     char name[80];
-@@ -464,6 +466,8 @@ static DWORD WINAPI panel_thread(void *unused)
-     return 0;
- }
- 
-+#endif /* _WIN32 */
-+
- void mm3_debug_teleport_init(void)
- {
-     const char *opt = getenv("MM3_DEBUG_TELEPORT");
-@@ -471,6 +475,11 @@ void mm3_debug_teleport_init(void)
-     HANDLE thread;
-     int with_overlay = overlay && *overlay && strcmp(overlay, "0") != 0;   /* as mm3_mod_on */
-     if ((!opt || strcmp(opt, "1") != 0) && !with_overlay) return;
-+#if !defined(_WIN32)
-+    (void)thread;
-+    fprintf(stderr, "[MM3_TELEPORT] debug teleport tool is Windows-only\n");
-+    return;
-+#else
-     finished = CreateEventA(NULL, TRUE, FALSE, NULL);
-     if (!finished) return;
-     enabled = 1;
-@@ -480,4 +489,5 @@ void mm3_debug_teleport_init(void)
-     if (with_overlay) return;
-     thread = CreateThread(NULL, 0, panel_thread, NULL, 0, NULL);
-     if (thread) CloseHandle(thread);
-+#endif
- }
 diff --git a/src/recomp_manual.c b/src/recomp_manual.c
-index acdb9f0..faef753 100644
+index cb7c95a..7320b60 100644
 --- a/src/recomp_manual.c
 +++ b/src/recomp_manual.c
 @@ -2,8 +2,13 @@
@@ -947,10 +1043,10 @@ index acdb9f0..faef753 100644
 +#define _mm_sfence() __atomic_thread_fence(__ATOMIC_RELEASE)
 +#endif
  #include <string.h>
- #include <windows.h>
+ #include "platform/xbox_winnt.h"
  
 diff --git a/tests/test_car_editor.py b/tests/test_car_editor.py
-index ea1955a..fcac2c1 100644
+index 8fc2476..bd84576 100644
 --- a/tests/test_car_editor.py
 +++ b/tests/test_car_editor.py
 @@ -259,7 +259,7 @@ class CarEditorTest(unittest.TestCase):
@@ -963,7 +1059,7 @@ index ea1955a..fcac2c1 100644
              self.model.replace_car(index, restored)
          self.assertEqual(editor.factory.factory_physics_settings(self.model.config).count(b"\n"), 1)
 diff --git a/tests/test_car_mods.py b/tests/test_car_mods.py
-index 52f96f6..21771ed 100644
+index 58188a1..0ba4bbc 100644
 --- a/tests/test_car_mods.py
 +++ b/tests/test_car_mods.py
 @@ -369,7 +369,7 @@ class CarModsTest(unittest.TestCase):
@@ -1029,7 +1125,7 @@ index 52f96f6..21771ed 100644
          output = self.plan()
          self.assertEqual(len(output[MOD.FACTORY_PHYSICS_FILE].splitlines()), 1)
 diff --git a/tests/test_factory_specs.py b/tests/test_factory_specs.py
-index 8b20c8a..da974a6 100644
+index 65c38ae..74b88dd 100644
 --- a/tests/test_factory_specs.py
 +++ b/tests/test_factory_specs.py
 @@ -60,7 +60,7 @@ class FactorySpecsTest(unittest.TestCase):
@@ -1056,1532 +1152,3 @@ index 8b20c8a..da974a6 100644
          self.assertTrue(all(entry["notes"] and entry["sources"] for entry in specs.values()))
  
      def test_curve_interpolation_never_exceeds_verified_rated_power(self):
-diff --git a/tools/car-models/build_package.py b/tools/car-models/build_package.py
-index c8e1188..14a3c54 100644
---- a/tools/car-models/build_package.py
-+++ b/tools/car-models/build_package.py
-@@ -164,7 +164,10 @@ def build(source_path: Path, output: Path, car_id: int, *, y_offset=None,
-             # MM3's transparent car pass shades glass separately and does not
-             # retain the imported surface RGB. Bake source alpha over a dark
-             # base for this first visual port, preserving banners and details.
--            record['mode'] = 2
-+            # Retail exterior details use mode 2; textured paint (the
-+            # Koenigsegg's Lack_textur) is mode 0, drawn with the body
-+            # rather than after it. A source material may say which.
-+            record['mode'] = int(material.get('mode', 2))
-             textures.append((texture_path, texture_name))
-         else:
-             record['texture'], record['mode'] = 'No', 0
-@@ -188,12 +191,48 @@ def build(source_path: Path, output: Path, car_id: int, *, y_offset=None,
-         target.write_bytes(blob)
-         files.append(dict(archive=archive, path=path, source=source_name))
- 
-+    # The game draws the player's plate text with its own numberplate
-+    # material (+Cars\license.dds); a rear plate needs that record too.
-+    plate_material = None
-+    if source.get('plates'):
-+        if len(native_materials) >= 23:
-+            raise ValueError('No material slot left for the number plate')
-+        plate_material = len(native_materials)
-+        tint = source['plates'].get('color')
-+        plate_texture = '+Cars\\license.dds'
-+        if tint:
-+            # The plate draws its characters from the game's font atlas
-+            # (black glyphs on white, a blank cell for the background); a
-+            # copy with white turned to the plate colour, in this car's folder.
-+            import mm3view
-+            atlas = mm3view.load_image('Cars/License.cdds', data.read('Cars/License.cdds')).convert('RGB')
-+            px = np.asarray(atlas, dtype=float) / 255
-+            light = px.mean(axis=2, keepdims=True)
-+            coloured = Image.fromarray(np.uint8(np.clip(light * np.asarray(tint[:3]) * 255, 0, 255)))
-+            plate_path = output / 'baked-textures' / 'license_plate.png'
-+            plate_path.parent.mkdir(parents=True, exist_ok=True)
-+            coloured.save(plate_path)
-+            asset('Data_dvd.zip', f'Cars/{alias}/license_plate.cdds',
-+                  mm3_textures.image_to_cdds(plate_path, max_size=128))
-+            plate_texture = f'+Cars\\{alias}\\license_plate.dds'
-+        native_materials.append(dict(name='numberplate', texture=plate_texture,
-+                                     diffuse=[0, 0, 0, 255], mode=0))
-+    # Windows split out as GLASS_H take a see-through material like the
-+    # Koenigsegg's own "windows" record, in the donor's glass part.
-+    glass_material = None
-+    if any(mesh['name'] == 'GLASS_H' and mesh['triangles'] for mesh in source['meshes']):
-+        if len(native_materials) >= 23:
-+            raise ValueError('No material slot left for the windows')
-+        glass_material = len(native_materials)
-+        native_materials.append(dict(name='windows', texture=None, diffuse=[114, 127, 135, 89], mode=0))
-+        material_shading[glass_material] = mm3_model.source_material_shading({'name': 'glass'})
-     for suffix in ('', '_lod1'):
-         template = alias_paths(data.read(f'cars/{donor}{suffix}/body.cmp'), donor, alias)
-         blob, report = mm3_model.convert_exterior(template, source,
-             material_map=mapping, body_names=body_names,
-             source_transform=transform, flip_winding=True, keep_interior=False,
--            material_shading=material_shading)
-+            material_shading=material_shading, plate_material=plate_material,
-+            glass_material=glass_material)
-         blob, report['lights'] = mm3_lights.align_lights(blob, light_anchors,
-                                                            source_transform=transform)
-         asset('loose', f'Data/Shared/Cars/{alias}{suffix}/body.cmp', blob)
-diff --git a/tools/car-models/mm3_model.py b/tools/car-models/mm3_model.py
-index 44b7009..90d4fa8 100644
---- a/tools/car-models/mm3_model.py
-+++ b/tools/car-models/mm3_model.py
-@@ -425,6 +425,14 @@ def mesh_metadata(block: MeshBlock, version: int) -> dict:
-                 vertex_count=vertex_count, material_offsets=material_offsets)
- 
- 
-+def _all_materials_to(block: MeshBlock, version: int, slot: int) -> dict:
-+    """A material map sending every material the mesh uses to one slot."""
-+    meta = mesh_metadata(block, version)
-+    used = {struct.unpack_from("<I", block.payload, o)[0] for o in meta["material_offsets"]}
-+    used |= {block.payload[meta["vertex_offset"] + i * 24 + 12] // 11 for i in range(meta["vertex_count"])}
-+    return {m: slot for m in used}
-+
-+
- def remap_mesh_materials(block: MeshBlock, version: int,
-                          material_map: Mapping[int, int]) -> MeshBlock:
-     """Change retained interior material slots without changing its geometry."""
-@@ -661,7 +669,8 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
-                      source_transform=None, keep_interior=True,
-                      flip_winding=True, specular=MATTE_VERTEX_SHADING,
-                      material_palette_offsets=None,
--                     material_shading=None) -> tuple[bytes, dict]:
-+                     material_shading=None, plate_material=None,
-+                     glass_material=None) -> tuple[bytes, dict]:
-     """Replace body/wheels in a donor. Returns bytes and a conversion report.
- 
-     Visible meshes receive the imported geometry; a closed convex stencil proxy
-@@ -704,8 +713,20 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
-     geometry_parts = {"body": split_mesh_geometry(*body)}
-     geometry_parts.update({name: split_mesh_geometry(*global_meshes[source_name][:4])
-                            for name, source_name in wheel_names.items()})
-+    # GLASS_H, with glass_material: the windows go into the donor's own
-+    # glass_windows part, drawn in the game's see-through car glass pass.
-+    glass_map = {}
-+    if glass_material is not None and "GLASS_H" in source_meshes and source_meshes["GLASS_H"]["triangles"]:
-+        gp, gn, guv, gtri, _ = _neutral_world(source_meshes["GLASS_H"], transform)
-+        glass_map = {int(m): int(glass_material) for m in np.unique(gtri[:, 3])}
-+        geometry_parts["glass"] = split_mesh_geometry(gp, gn, guv, gtri)
-     all_positions = np.concatenate([body[0]] + [global_meshes[n][0] for n in wheel_names.values()])
--    report = dict(version=model.version, replaced=[], hidden=[], retained=[], shadows=[],
-+    # "plates": {"back": [x, y, z]} in the source's coordinates: keep the
-+    # donor's rear number plate (the game draws the player's plate text on
-+    # it) and move it there. Front plates stay hidden.
-+    plates = {key: (transform @ np.append(np.asarray(point, dtype=float), 1.0))[:3]
-+              for key, point in (source.get("plates") or {}).items() if key == "back"}
-+    report = dict(version=model.version, replaced=[], hidden=[], retained=[], shadows=[], plates={},
-                   split_meshes=[], wheel_pivots={}, bounds_min=all_positions.min(0).tolist(),
-                   bounds_max=all_positions.max(0).tolist())
-     found_body, found_wheels = False, set()
-@@ -717,7 +738,17 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
-     if shadow_template is None:
-         raise FormatError("Donor has no native stencil shadow template")
- 
--    def visit(node: Node, parent_matrix: np.ndarray, path: str, wheel=None):
-+    def plate_centre(node: Node) -> np.ndarray | None:
-+        """The centre of a plate node's first mesh, in the node's frame."""
-+        for child in node.children:
-+            for block in child.meshes:
-+                if block.payload and len(block.payload) >= 28:
-+                    b = native_bounds(np.array(struct.unpack_from("<6f", block.payload, 4)).reshape(2, 3))
-+                    centre = np.append(b.mean(0), 1.0)
-+                    return (child.relative_matrix() @ centre)[:3]
-+        return None
-+
-+    def visit(node: Node, parent_matrix: np.ndarray, path: str, wheel=None, plate=False):
-         nonlocal found_body
-         siblings = []
-         path += "/" + node.name
-@@ -729,6 +760,15 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
-             node.set_translation(pivot, relative_pivot)
-             current_matrix = parent_matrix @ node.relative_matrix()
-             report["wheel_pivots"][wheel] = pivot.tolist()
-+        if node.kind == 1 and node.name.lower() == "backnumber" and "back" in plates:
-+            local = plate_centre(node)
-+            if local is not None:
-+                now = (current_matrix @ np.append(local, 1.0))[:3]
-+                world = current_matrix[:3, 3] + (plates["back"] - now)
-+                node.set_translation(world, np.linalg.solve(parent_matrix[:3, :3], world - parent_matrix[:3, 3]))
-+                current_matrix = parent_matrix @ node.relative_matrix()
-+                report["plates"]["back"] = plates["back"].tolist()
-+                plate = True
-         if node.kind == 1 and (node.name.lower() in ("car", "body") or node.name in wheel_names):
-             points = (global_meshes[wheel_names[node.name]][0] if node.name in wheel_names
-                       else body[0] if node.name.lower() == "body" else all_positions)
-@@ -738,9 +778,15 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
-         if node.kind in (2, 6):
-             if not node.meshes:
-                 return []
--            retained = keep_interior and "lowdash" in path.lower()
-+            retained = (keep_interior and "lowdash" in path.lower()) or plate
-             if retained:
-                 report["retained"].append(path)
-+                if plate and plate_material is not None:
-+                    # The donor's plate material is appended to the imported
-+                    # set at plate_material; point every plate face there.
-+                    node.meshes = [remap_mesh_materials(block, model.version,
-+                                                        _all_materials_to(block, model.version, plate_material))
-+                                   if block.payload else block for block in node.meshes]
-                 if interior_material_map:
-                     node.meshes = [remap_mesh_materials(block, model.version, interior_material_map)
-                                    if block.payload else block for block in node.meshes]
-@@ -751,6 +797,9 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
-                 elif "/body/" in path.lower():
-                     parts = geometry_parts["body"]
-                     found_body = True
-+                elif "glass" in geometry_parts and "glass_windows" in path.lower():
-+                    parts = geometry_parts["glass"]
-+                    report["replaced"].append(path)
-                 else:
-                     p = np.zeros((3, 3)); n = np.tile((0, 1, 0), (3, 1))
-                     uv = np.zeros((3, 2)); tri = np.array([[0, 1, 2, 0]])
-@@ -790,10 +839,11 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
-                         name = f"mm3import_{target.name}_{wheel or 'body'}_{suffix}.dob"
-                         if directory:
-                             name = directory + "\\" + name
-+                        glass = "glass_windows" in path.lower() and "glass" in geometry_parts
-                         if shadow:
-                             complete = (global_meshes[wheel_names[wheel]][0] if wheel else body[0])
-                             shadowp = ((complete - current_matrix[:3, 3]) @
--                                       np.linalg.inv(current_matrix[:3, :3]).T) if part_index == 0 else []
-+                                       np.linalg.inv(current_matrix[:3, :3]).T) if part_index == 0 and not glass else []
-                             block = encode_shadow_mesh(name, shadowp, localn, tri,
-                                 original_mesh, model.version, flip_winding=flip_winding)
-                             new_meshes.append(block)
-@@ -805,14 +855,14 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
-                                 vertices=mesh_metadata(block, model.version)["vertex_count"]))
-                         else:
-                             new_meshes.append(encode_mesh(name, localp, localn, uv, tri,
--                                material_map, donor_block, model.version,
-+                                glass_map if glass else material_map, donor_block, model.version,
-                                 specular=specular, flip_winding=flip_winding,
-                                 material_palette_offsets=material_palette_offsets,
-                                 material_shading=material_shading))
-                     target.meshes = new_meshes
-         children = []
-         for child in node.children:
--            extras = visit(child, current_matrix, path, wheel)
-+            extras = visit(child, current_matrix, path, wheel, plate)
-             children.append(child)
-             children.extend(extras)
-         node.children = children
-diff --git a/tools/car-mods/cars.imported.json b/tools/car-mods/cars.imported.json
-index ecb589b..8349caa 100644
---- a/tools/car-mods/cars.imported.json
-+++ b/tools/car-mods/cars.imported.json
-@@ -40,7 +40,8 @@
-         "max_kmh": 360,
-         "max_mph": 240
-       },
--      "model_package": "../../out/car-models/packages/Panoz"
-+      "model_package": "../../out/car-models/packages/Panoz",
-+      "hidden": true
-     },
-     {
-       "id": 9005,
-@@ -67,7 +68,8 @@
-         "max_kmh": 360,
-         "max_mph": 240
-       },
--      "model_package": "../../out/car-models/packages/McLaren_F1"
-+      "model_package": "../../out/car-models/packages/McLaren_F1",
-+      "hidden": true
-     },
-     {
-       "id": 9006,
-@@ -94,23 +96,31 @@
-         "max_kmh": 380,
-         "max_mph": 240
-       },
--      "model_package": "../../out/car-models/packages/Form1"
-+      "model_package": "../../out/car-models/packages/Form1",
-+      "hidden": true
-     },
-     {
-       "id": 9009,
-       "alias": "Ford_GTcar",
-       "donor": "Koenigsegg",
--      "display_name": "Ford GT",
-+      "display_name": "Porsche 930 Turbo",
-       "ratings": {
--        "TOPSPEED": 8,
--        "ACCELERATION": 8,
--        "MASS": 6,
--        "HANDLING": 7,
--        "DURABILITY": 4
-+        "TOPSPEED": 6,
-+        "ACCELERATION": 6,
-+        "MASS": 4,
-+        "HANDLING": 5,
-+        "DURABILITY": 6
-       },
-       "physics": {
--        "Mass": 1520,
--        "TorqueScale": 1000
-+        "Mass": 1140,
-+        "TorqueScale": 550,
-+        "GearRatioVector": [
-+          -3.3,
-+          3.24,
-+          1.87,
-+          1.28,
-+          0.95
-+        ]
-       },
-       "colors": [
-         "#68b7d1",
-@@ -118,8 +128,8 @@
-         "#ad1828"
-       ],
-       "speedometer": {
--        "max_kmh": 380,
--        "max_mph": 240
-+        "max_kmh": 300,
-+        "max_mph": 180
-       },
-       "model_package": "../../out/car-models/packages/Ford_GTcar"
-     },
-@@ -127,17 +137,26 @@
-       "id": 9010,
-       "alias": "Senna_Road",
-       "donor": "Koenigsegg",
--      "display_name": "McLaren Senna",
-+      "display_name": "Aston Martin DBS",
-       "ratings": {
-         "TOPSPEED": 8,
--        "ACCELERATION": 9,
--        "MASS": 5,
--        "HANDLING": 8,
--        "DURABILITY": 3
-+        "ACCELERATION": 7,
-+        "MASS": 7,
-+        "HANDLING": 7,
-+        "DURABILITY": 6
-       },
-       "physics": {
--        "Mass": 1309,
--        "TorqueScale": 1000
-+        "Mass": 1695,
-+        "TorqueScale": 1070,
-+        "GearRatioVector": [
-+          -3.3,
-+          3.28,
-+          1.92,
-+          1.28,
-+          1.02,
-+          0.85,
-+          0.79
-+        ]
-       },
-       "colors": [
-         "#ff8526",
-@@ -145,8 +164,8 @@
-         "#d9e2e9"
-       ],
-       "speedometer": {
--        "max_kmh": 360,
--        "max_mph": 240
-+        "max_kmh": 340,
-+        "max_mph": 200
-       },
-       "model_package": "../../out/car-models/packages/Senna_Road"
-     },
-@@ -154,17 +173,26 @@
-       "id": 9011,
-       "alias": "Senna_GTR1",
-       "donor": "Koenigsegg",
--      "display_name": "McLaren Senna GTR",
-+      "display_name": "Porsche 911 GT3",
-       "ratings": {
-         "TOPSPEED": 8,
--        "ACCELERATION": 9,
-+        "ACCELERATION": 8,
-         "MASS": 5,
-         "HANDLING": 9,
--        "DURABILITY": 2
-+        "DURABILITY": 4
-       },
-       "physics": {
--        "Mass": 1270,
--        "TorqueScale": 1025
-+        "Mass": 1435,
-+        "TorqueScale": 1055,
-+        "GearRatioVector": [
-+          -3.3,
-+          3.35,
-+          2.13,
-+          1.54,
-+          1.2,
-+          0.95,
-+          0.75
-+        ]
-       },
-       "colors": [
-         "#efeff2",
-@@ -172,8 +200,8 @@
-         "#b32431"
-       ],
-       "speedometer": {
--        "max_kmh": 360,
--        "max_mph": 240
-+        "max_kmh": 340,
-+        "max_mph": 200
-       },
-       "model_package": "../../out/car-models/packages/Senna_GTR1"
-     },
-@@ -181,17 +209,24 @@
-       "id": 9012,
-       "alias": "FXXK_Racer",
-       "donor": "Koenigsegg",
--      "display_name": "Ferrari FXX K",
-+      "display_name": "Porsche 930 Turbo Red",
-       "ratings": {
--        "TOPSPEED": 8,
--        "ACCELERATION": 9,
--        "MASS": 6,
--        "HANDLING": 9,
--        "DURABILITY": 2
-+        "TOPSPEED": 6,
-+        "ACCELERATION": 6,
-+        "MASS": 4,
-+        "HANDLING": 5,
-+        "DURABILITY": 6
-       },
-       "physics": {
--        "Mass": 1590,
--        "TorqueScale": 1150
-+        "Mass": 1140,
-+        "TorqueScale": 550,
-+        "GearRatioVector": [
-+          -3.3,
-+          3.24,
-+          1.87,
-+          1.28,
-+          0.95
-+        ]
-       },
-       "colors": [
-         "#d2202c",
-@@ -199,8 +234,8 @@
-         "#e7e8ea"
-       ],
-       "speedometer": {
--        "max_kmh": 400,
--        "max_mph": 260
-+        "max_kmh": 300,
-+        "max_mph": 180
-       },
-       "model_package": "../../out/car-models/packages/FXXK_Racer"
-     },
-@@ -229,7 +264,8 @@
-         "max_kmh": 440,
-         "max_mph": 280
-       },
--      "model_package": "../../out/car-models/packages/Regera_GT1"
-+      "model_package": "../../out/car-models/packages/Regera_GT1",
-+      "hidden": true
-     },
-     {
-       "id": 9014,
-@@ -256,7 +292,8 @@
-         "max_kmh": 380,
-         "max_mph": 240
-       },
--      "model_package": "../../out/car-models/packages/AventadorX"
-+      "model_package": "../../out/car-models/packages/AventadorX",
-+      "hidden": true
-     }
-   ]
- }
-diff --git a/tools/car-mods/cars.json b/tools/car-mods/cars.json
-index b9526f6..3045359 100644
---- a/tools/car-mods/cars.json
-+++ b/tools/car-mods/cars.json
-@@ -39,7 +39,8 @@
-       "speedometer": {
-         "max_kmh": 360,
-         "max_mph": 240
--      }
-+      },
-+      "hidden": true
-     },
-     {
-       "id": 9005,
-@@ -65,7 +66,8 @@
-       "speedometer": {
-         "max_kmh": 360,
-         "max_mph": 240
--      }
-+      },
-+      "hidden": true
-     },
-     {
-       "id": 9006,
-@@ -91,23 +93,31 @@
-       "speedometer": {
-         "max_kmh": 380,
-         "max_mph": 240
--      }
-+      },
-+      "hidden": true
-     },
-     {
-       "id": 9009,
-       "alias": "Ford_GTcar",
-       "donor": "Koenigsegg",
--      "display_name": "Ford GT",
-+      "display_name": "Porsche 930 Turbo",
-       "ratings": {
--        "TOPSPEED": 8,
--        "ACCELERATION": 8,
--        "MASS": 6,
--        "HANDLING": 7,
--        "DURABILITY": 4
-+        "TOPSPEED": 6,
-+        "ACCELERATION": 6,
-+        "MASS": 4,
-+        "HANDLING": 5,
-+        "DURABILITY": 6
-       },
-       "physics": {
--        "Mass": 1520,
--        "TorqueScale": 1000
-+        "Mass": 1140,
-+        "TorqueScale": 550,
-+        "GearRatioVector": [
-+          -3.3,
-+          3.24,
-+          1.87,
-+          1.28,
-+          0.95
-+        ]
-       },
-       "colors": [
-         "#68b7d1",
-@@ -115,25 +125,34 @@
-         "#ad1828"
-       ],
-       "speedometer": {
--        "max_kmh": 380,
--        "max_mph": 240
-+        "max_kmh": 300,
-+        "max_mph": 180
-       }
-     },
-     {
-       "id": 9010,
-       "alias": "Senna_Road",
-       "donor": "Koenigsegg",
--      "display_name": "McLaren Senna",
-+      "display_name": "Aston Martin DBS",
-       "ratings": {
-         "TOPSPEED": 8,
--        "ACCELERATION": 9,
--        "MASS": 5,
--        "HANDLING": 8,
--        "DURABILITY": 3
-+        "ACCELERATION": 7,
-+        "MASS": 7,
-+        "HANDLING": 7,
-+        "DURABILITY": 6
-       },
-       "physics": {
--        "Mass": 1309,
--        "TorqueScale": 1000
-+        "Mass": 1695,
-+        "TorqueScale": 1070,
-+        "GearRatioVector": [
-+          -3.3,
-+          3.28,
-+          1.92,
-+          1.28,
-+          1.02,
-+          0.85,
-+          0.79
-+        ]
-       },
-       "colors": [
-         "#ff8526",
-@@ -141,25 +160,34 @@
-         "#d9e2e9"
-       ],
-       "speedometer": {
--        "max_kmh": 360,
--        "max_mph": 240
-+        "max_kmh": 340,
-+        "max_mph": 200
-       }
-     },
-     {
-       "id": 9011,
-       "alias": "Senna_GTR1",
-       "donor": "Koenigsegg",
--      "display_name": "McLaren Senna GTR",
-+      "display_name": "Porsche 911 GT3",
-       "ratings": {
-         "TOPSPEED": 8,
--        "ACCELERATION": 9,
-+        "ACCELERATION": 8,
-         "MASS": 5,
-         "HANDLING": 9,
--        "DURABILITY": 2
-+        "DURABILITY": 4
-       },
-       "physics": {
--        "Mass": 1270,
--        "TorqueScale": 1025
-+        "Mass": 1435,
-+        "TorqueScale": 1055,
-+        "GearRatioVector": [
-+          -3.3,
-+          3.35,
-+          2.13,
-+          1.54,
-+          1.2,
-+          0.95,
-+          0.75
-+        ]
-       },
-       "colors": [
-         "#efeff2",
-@@ -167,25 +195,32 @@
-         "#b32431"
-       ],
-       "speedometer": {
--        "max_kmh": 360,
--        "max_mph": 240
-+        "max_kmh": 340,
-+        "max_mph": 200
-       }
-     },
-     {
-       "id": 9012,
-       "alias": "FXXK_Racer",
-       "donor": "Koenigsegg",
--      "display_name": "Ferrari FXX K",
-+      "display_name": "Porsche 930 Turbo Red",
-       "ratings": {
--        "TOPSPEED": 8,
--        "ACCELERATION": 9,
--        "MASS": 6,
--        "HANDLING": 9,
--        "DURABILITY": 2
-+        "TOPSPEED": 6,
-+        "ACCELERATION": 6,
-+        "MASS": 4,
-+        "HANDLING": 5,
-+        "DURABILITY": 6
-       },
-       "physics": {
--        "Mass": 1590,
--        "TorqueScale": 1150
-+        "Mass": 1140,
-+        "TorqueScale": 550,
-+        "GearRatioVector": [
-+          -3.3,
-+          3.24,
-+          1.87,
-+          1.28,
-+          0.95
-+        ]
-       },
-       "colors": [
-         "#d2202c",
-@@ -193,8 +228,8 @@
-         "#e7e8ea"
-       ],
-       "speedometer": {
--        "max_kmh": 400,
--        "max_mph": 260
-+        "max_kmh": 300,
-+        "max_mph": 180
-       }
-     },
-     {
-@@ -221,7 +256,8 @@
-       "speedometer": {
-         "max_kmh": 440,
-         "max_mph": 280
--      }
-+      },
-+      "hidden": true
-     },
-     {
-       "id": 9014,
-@@ -247,7 +283,8 @@
-       "speedometer": {
-         "max_kmh": 380,
-         "max_mph": 240
--      }
-+      },
-+      "hidden": true
-     }
-   ]
- }
-diff --git a/tools/car-mods/driving_defaults.py b/tools/car-mods/driving_defaults.py
-index b667535..66a8164 100644
---- a/tools/car-mods/driving_defaults.py
-+++ b/tools/car-mods/driving_defaults.py
-@@ -14,15 +14,25 @@ TUNING = {
-     "Panoz": (980, 750),
-     "McLaren_F1": (1050, 800),
-     "Form1": (600, 420),
--    "Ford_GTcar": (1520, 1000),
--    "Senna_Road": (1309, 1000),
--    "Senna_GTR1": (1270, 1025),
--    "FXXK_Racer": (1590, 1150),
-+    "Ford_GTcar": (1140, 550),          # Porsche 930 Turbo
-+    "Senna_Road": (1695, 1070),         # Aston Martin DBS
-+    "Senna_GTR1": (1435, 1055),         # Porsche 911 GT3 (992)
-+    "FXXK_Racer": (1140, 550),          # Porsche 930 Turbo, Guards Red
-     "Regera_GT1": (1590, 1250),
-     "AventadorX": (1675, 1100),
- }
- 
- 
-+# The imported cars also carry their own gearbox: reverse, then forward ratios
-+# scaled from the donor's top gear for each car's real top speed.
-+GEARS = {
-+    "Ford_GTcar": [-3.3, 3.24, 1.87, 1.28, 0.95],
-+    "Senna_Road": [-3.3, 3.28, 1.92, 1.28, 1.02, 0.85, 0.79],
-+    "Senna_GTR1": [-3.3, 3.35, 2.13, 1.54, 1.2, 0.95, 0.75],
-+    "FXXK_Racer": [-3.3, 3.24, 1.87, 1.28, 0.95],
-+}
-+
-+
- def apply_preset(car: dict) -> dict:
-     """Reset driving only; preserve identity, model, paint, ratings and gauges."""
-     alias = car.get("alias")
-@@ -31,5 +41,7 @@ def apply_preset(car: dict) -> dict:
-     result = copy.deepcopy(car)
-     mass, torque = TUNING[alias]
-     result["physics"] = {"Mass": mass, "TorqueScale": torque}
-+    if alias in GEARS:
-+        result["physics"]["GearRatioVector"] = list(GEARS[alias])
-     result.pop("engine_profile", None)
-     return result
-diff --git a/tools/car-mods/factory_specs.json b/tools/car-mods/factory_specs.json
-index 49ca372..cae9260 100644
---- a/tools/car-mods/factory_specs.json
-+++ b/tools/car-mods/factory_specs.json
-@@ -374,57 +374,49 @@
-       }
-     },
-     "Ford_GTcar": {
--      "variant": "2017 Ford GT",
-+      "variant": "1975 Porsche 911 Turbo (930) 3.0",
-       "specification": {
--        "power_kw": 482.467817184,
--        "power_label": "647 SAE hp",
--        "torque_nm": 745.6998714,
--        "mass_kg": 1385,
--        "mass_basis": "Dry",
--        "top_speed_kmh": 347,
--        "zero_to_100_s": null,
--        "gear_count": 7,
--        "power_rpm": 6250,
--        "torque_rpm": 5900,
--        "zero_to_60_mph_s": "less than 3",
--        "redline_rpm": 7000,
--        "drivetrain": "Rear-wheel drive",
--        "engine": "3.5-litre twin-turbo V6",
-+        "power_kw": 191.0,
-+        "power_label": "260 PS (DIN)",
-+        "torque_nm": 343,
-+        "mass_kg": 1140,
-+        "mass_basis": "Kerb (DIN)",
-+        "top_speed_kmh": 250,
-+        "zero_to_100_s": 5.5,
-+        "gear_count": 4,
-+        "power_rpm": 5500,
-+        "torque_rpm": 4000,
-+        "zero_to_60_mph_s": null,
-+        "redline_rpm": 6800,
-+        "drivetrain": "Rear-wheel drive, rear engine",
-+        "engine": "3.0-litre turbocharged flat-six",
-         "gear_ratios": [
--          3.397,
--          2.186,
--          1.626,
--          1.285,
--          1.029,
--          0.839,
--          0.634
-+          2.25,
-+          1.304,
-+          0.893,
-+          0.656
-         ],
--        "final_drive": 3.667
-+        "final_drive": 4.0
-       },
-       "notes": [
--        "Imported source is explicitly the 2017 GT, not the earlier supercharged V8 model.",
--        "1,520 kg operating mass is a calibration allowance over the published 1,385 kg dry figure, not a certified curb weight.",
--        "Ford claims under three seconds to 97 km/h / 60 mph, not 0-100 km/h; 3.0 s to 100 is only a game target.",
--        "7,000 rpm is verified in the November 2017 same-generation owner manual (2018 model year). Net torque already includes turbo contribution; native TurboSize is zero."
-+        "Lionsharp Studios model; silver (slot 9009) and Guards Red (slot 9012) share these figures.",
-+        "4-speed 930 gearbox; the in-game installed tuning uses arcade units (Mass 1140, TorqueScale 550, 4 gears for ~250 km/h).",
-+        "Redline 6,800 rpm is approximate for the 3.0 Turbo."
-       ],
-       "sources": [
-         {
--          "title": "Ford GT May 2017 technical specifications",
--          "url": "https://media.ford.com/content/dam/fordmedia/Europe/documents/productReleases/FordGT/FordGT_2017_WEC_tech_specs_EU.pdf"
--        },
--        {
--          "title": "Ford GT owner manual, November 2017 edition, page 204",
--          "url": "https://www.fordservicecontent.com/Ford_Content/Catalog/owner_information/2018-Ford-GT-Owners-Manual-version-1_om-EN-US_12_2017.pdf"
-+          "title": "Porsche 911 Turbo (930) 3.0, Porsche AG model history",
-+          "url": "https://www.porsche.com/international/aboutporsche/porschehistory/"
-         }
-       ],
-       "calibration": {
--        "status": "Initial physics calibration; performance targets require in-game measurement",
--        "target_top_speed_kmh": 347,
--        "target_zero_to_100_s": 3,
--        "mass_kg": 1520,
--        "peak_torque_nm": 745.7,
--        "shift_rpm": 6700,
--        "reference_wheel_radius_m": 0.3515,
-+        "status": "Arcade tuning installed; this factory preset is an untested alternative",
-+        "target_top_speed_kmh": 250,
-+        "target_zero_to_100_s": 5.5,
-+        "mass_kg": 1140,
-+        "peak_torque_nm": 343,
-+        "shift_rpm": 6500,
-+        "reference_wheel_radius_m": 0.31,
-         "torque_curve": [
-           [
-             0,
-@@ -432,447 +424,428 @@
-           ],
-           [
-             800,
--            0.42
-+            0.3
-           ],
-           [
--            2000,
--            0.66
-+            2500,
-+            0.45
-           ],
-           [
-             3500,
--            0.9
-+            0.8
-           ],
-           [
--            5900,
-+            4000,
-             1
-           ],
-           [
--            6250,
--            0.988542024305
-+            5500,
-+            0.95
-           ],
-           [
--            7000,
--            0.82
-+            6800,
-+            0.75
-           ]
-         ],
-         "drag_coefficient_native": 0.46,
-         "assumptions": "Piecewise torque fractions, drag, tyre grip, brakes, shift timing, reverse ratio where unavailable, and menu ratings are game calibration, not manufacturer specifications. Runtime compensates geometry wheel radius in final drive; native TorqueScale uses Nm only with engine_profile=factory."
-       },
-       "physics": {
--        "Mass": 1520,
--        "TorqueScale": 745.7,
-+        "Mass": 1140,
-+        "TorqueScale": 343,
-         "TorqueScaleFactor": 1,
-         "TurboSize": 0,
-         "WheelDrive": 1,
--        "BrakeTorque": 6500,
--        "HandBrakeTorque": 3575,
-+        "BrakeTorque": 4500,
-+        "HandBrakeTorque": 2500,
-         "LatFrictionFactor": 1.5,
-         "AirKZZ": 0.46,
-         "AirKZY": 0.05,
--        "MaxTorqueRPM": 5900,
--        "MaxTurboTorqueRPM": 5900,
-+        "MaxTorqueRPM": 4000,
-+        "MaxTurboTorqueRPM": 4000,
-         "MinRPM": 800,
-         "MinRPMGearChange": 2200,
--        "CutRPM": 7000,
--        "MaxRPM": 7000,
-+        "CutRPM": 6800,
-+        "MaxRPM": 6800,
-         "TimeChangeGear": 0.08,
-         "TimeChangeGearFR": 0.3,
--        "WheelRatio": 3.667,
--        "WheelRadius": 0.3515,
-+        "WheelRatio": 4.0,
-+        "WheelRadius": 0.31,
-         "GearRatioVector": [
--          -3.5,
--          3.397,
--          2.186,
--          1.626,
--          1.285,
--          1.029,
--          0.839,
--          0.634
-+          -3.25,
-+          2.25,
-+          1.304,
-+          0.893,
-+          0.656
-         ],
-         "GearStatusDownGearFactor": 0.72,
--        "SteeringEndSpeed": 243
-+        "SteeringEndSpeed": 210
-       },
-       "ratings": {
--        "TOPSPEED": 8,
--        "ACCELERATION": 8,
--        "MASS": 6,
--        "HANDLING": 7,
--        "DURABILITY": 4
-+        "TOPSPEED": 6,
-+        "ACCELERATION": 6,
-+        "MASS": 4,
-+        "HANDLING": 5,
-+        "DURABILITY": 6
-       },
-       "speedometer": {
--        "max_kmh": 380,
--        "max_mph": 240
-+        "max_kmh": 300,
-+        "max_mph": 180
-       }
-     },
-     "Senna_Road": {
--      "variant": "2019 McLaren Senna",
-+      "variant": "2009 Aston Martin DBS (coupé, manual)",
-       "specification": {
--        "power_kw": 588,
--        "power_label": "800 PS / 588 kW",
--        "torque_nm": 800,
--        "mass_kg": 1309,
--        "mass_basis": "Fluids and 90% fuel; dry mass 1,198 kg",
--        "top_speed_kmh": 335,
--        "zero_to_100_s": 2.8,
--        "gear_count": 7,
--        "power_rpm": 7500,
--        "torque_rpm": "5500-6500",
--        "dry_mass_kg": 1198,
--        "redline_rpm": 8415,
--        "drivetrain": "Rear-wheel drive",
--        "gear_ratios": [
--          3.982,
--          2.612,
--          1.905,
--          1.479,
--          1.16,
--          0.906,
--          0.686
--        ],
--        "final_drive": 3.308
-+        "power_kw": 380.0,
-+        "power_label": "517 PS",
-+        "torque_nm": 570,
-+        "mass_kg": 1695,
-+        "mass_basis": "Kerb",
-+        "top_speed_kmh": 307,
-+        "zero_to_100_s": 4.3,
-+        "gear_count": 6,
-+        "power_rpm": 6500,
-+        "torque_rpm": 5750,
-+        "zero_to_60_mph_s": null,
-+        "redline_rpm": 7200,
-+        "drivetrain": "Rear-wheel drive, front-mid engine",
-+        "engine": "6.0-litre V12",
-+        "gear_ratios": null,
-+        "final_drive": null
-       },
-       "notes": [
--        "The owner's portal lists maximum engine speed 8,415 rpm; this is retained rather than silently replacing it with an 8,250 rpm figure.",
--        "Full-load torque shape between published endpoints, shift rpm, reverse gear, drag and tyre grip are game calibration."
-+        "Galaxy Car Showroom model (CC BY), slot 9010.",
-+        "Gear ratios and final drive not verified; the preset gearing is scaled for 307 km/h.",
-+        "Installed arcade tuning: Mass 1695, TorqueScale 1070, 6 gears for ~300 km/h."
-       ],
-       "sources": [
-         {
--          "title": "McLaren Senna manufacturer specification",
--          "url": "https://www.mclaren.com/cars/gl_en/ultimate-models/mclaren-senna"
--        },
--        {
--          "title": "McLaren Owners Handbook: Senna technical data",
--          "url": "https://owners.mclaren.com/"
-+          "title": "Aston Martin DBS (2007-2012), Aston Martin heritage",
-+          "url": "https://www.astonmartin.com/en/our-world/heritage"
-         }
-       ],
-       "calibration": {
--        "status": "Initial physics calibration; performance targets require in-game measurement",
--        "target_top_speed_kmh": 335,
--        "target_zero_to_100_s": 2.8,
--        "mass_kg": 1309,
--        "peak_torque_nm": 800,
--        "shift_rpm": 8000,
--        "reference_wheel_radius_m": 0.3485,
-+        "status": "Arcade tuning installed; this factory preset is an untested alternative",
-+        "target_top_speed_kmh": 307,
-+        "target_zero_to_100_s": 4.3,
-+        "mass_kg": 1695,
-+        "peak_torque_nm": 570,
-+        "shift_rpm": 7000,
-+        "reference_wheel_radius_m": 0.345,
-         "torque_curve": [
-           [
-             0,
--            0.25
-+            0.3
-           ],
-           [
--            850,
--            0.4
-+            800,
-+            0.45
-           ],
-           [
-             2500,
--            0.72
-+            0.75
-           ],
-           [
--            5500,
--            1
-+            4500,
-+            0.93
-           ],
-           [
--            6500,
-+            5750,
-             1
-           ],
-           [
--            7500,
--            0.935830129549
-+            6500,
-+            0.97
-           ],
-           [
--            8415,
--            0.78
-+            7200,
-+            0.85
-           ]
-         ],
--        "drag_coefficient_native": 0.58,
-+        "drag_coefficient_native": 0.46,
-         "assumptions": "Piecewise torque fractions, drag, tyre grip, brakes, shift timing, reverse ratio where unavailable, and menu ratings are game calibration, not manufacturer specifications. Runtime compensates geometry wheel radius in final drive; native TorqueScale uses Nm only with engine_profile=factory."
-       },
-       "physics": {
--        "Mass": 1309,
--        "TorqueScale": 800,
-+        "Mass": 1695,
-+        "TorqueScale": 570,
-         "TorqueScaleFactor": 1,
-         "TurboSize": 0,
-         "WheelDrive": 1,
--        "BrakeTorque": 7600,
--        "HandBrakeTorque": 4180,
--        "LatFrictionFactor": 1.7,
--        "AirKZZ": 0.58,
-+        "BrakeTorque": 6500,
-+        "HandBrakeTorque": 3575,
-+        "LatFrictionFactor": 1.5,
-+        "AirKZZ": 0.46,
-         "AirKZY": 0.05,
--        "MaxTorqueRPM": 6000,
--        "MaxTurboTorqueRPM": 6000,
--        "MinRPM": 850,
--        "MinRPMGearChange": 2500,
--        "CutRPM": 8415,
--        "MaxRPM": 8415,
-+        "MaxTorqueRPM": 5750,
-+        "MaxTurboTorqueRPM": 5750,
-+        "MinRPM": 800,
-+        "MinRPMGearChange": 2200,
-+        "CutRPM": 7200,
-+        "MaxRPM": 7200,
-         "TimeChangeGear": 0.08,
-         "TimeChangeGearFR": 0.3,
--        "WheelRatio": 3.308,
--        "WheelRadius": 0.3485,
-+        "WheelRatio": 3.71,
-+        "WheelRadius": 0.345,
-         "GearRatioVector": [
--          -3.9,
--          3.982,
--          2.612,
--          1.905,
--          1.479,
--          1.16,
--          0.906,
--          0.686
-+          -3.3,
-+          2.66,
-+          1.78,
-+          1.3,
-+          1.0,
-+          0.8,
-+          0.63
-         ],
-         "GearStatusDownGearFactor": 0.72,
--        "SteeringEndSpeed": 234
-+        "SteeringEndSpeed": 230
-       },
-       "ratings": {
-         "TOPSPEED": 8,
--        "ACCELERATION": 9,
--        "MASS": 5,
--        "HANDLING": 8,
--        "DURABILITY": 3
-+        "ACCELERATION": 7,
-+        "MASS": 7,
-+        "HANDLING": 7,
-+        "DURABILITY": 6
-       },
-       "speedometer": {
--        "max_kmh": 360,
--        "max_mph": 240
-+        "max_kmh": 340,
-+        "max_mph": 200
-       }
-     },
-     "Senna_GTR1": {
--      "variant": "2020 McLaren Senna GTR",
-+      "variant": "2021 Porsche 911 GT3 (992, PDK)",
-       "specification": {
--        "power_kw": 607,
--        "power_label": "825 PS / 607 kW",
--        "torque_nm": 800,
--        "mass_kg": 1188,
--        "mass_basis": "Dry; running mass not published",
--        "top_speed_kmh": null,
--        "zero_to_100_s": null,
-+        "power_kw": 375.0,
-+        "power_label": "510 PS",
-+        "torque_nm": 470,
-+        "mass_kg": 1435,
-+        "mass_basis": "Kerb (DIN), PDK",
-+        "top_speed_kmh": 318,
-+        "zero_to_100_s": 3.4,
-         "gear_count": 7,
--        "power_rpm": 7500,
--        "torque_rpm": "5500-6500",
--        "redline_rpm": 8250,
--        "drivetrain": "Rear-wheel drive",
--        "gear_ratios": [
--          3.982,
--          2.612,
--          1.905,
--          1.479,
--          1.16,
--          0.906,
--          0.686
--        ]
-+        "power_rpm": 8400,
-+        "torque_rpm": 6100,
-+        "zero_to_60_mph_s": null,
-+        "redline_rpm": 9000,
-+        "drivetrain": "Rear-wheel drive, rear engine",
-+        "engine": "4.0-litre naturally aspirated flat-six",
-+        "gear_ratios": null,
-+        "final_drive": null
-       },
-       "notes": [
--        "The handbook specifies seven ratios but does not verify a final drive; 3.308 is inferred from the road Senna and remains a calibration assumption.",
--        "1,270 kg operating mass is estimated from 1,188 kg dry. Reference tyre radius 0.3525 m is a calibration assumption.",
--        "No factory 0-100 or top speed was found. 2.7 s and 325 km/h are provisional targets for a high-downforce setup, not published facts."
-+        "Ddiaz Design model (from CSR2; personal use), slot 9011.",
-+        "7-speed PDK ratios not verified; the installed tuning uses 6 game gears for ~320 km/h.",
-+        "Installed arcade tuning: Mass 1435, TorqueScale 1055."
-       ],
-       "sources": [
-         {
--          "title": "McLaren Senna GTR owner manual, pages 82-84",
--          "url": "https://mclaren-web.s3.eu-west-2.amazonaws.com/files/Owner%20Manual%20-%20P15R%20-%20English.pdf"
-+          "title": "Porsche 911 GT3 (992) technical data, Porsche AG",
-+          "url": "https://www.porsche.com/international/models/911/911-gt3-models/911-gt3/"
-         }
-       ],
-       "calibration": {
--        "status": "Initial physics calibration; performance targets require in-game measurement",
--        "target_top_speed_kmh": 325,
--        "target_zero_to_100_s": 2.7,
--        "mass_kg": 1270,
--        "peak_torque_nm": 800,
--        "shift_rpm": 7900,
--        "reference_wheel_radius_m": 0.3525,
-+        "status": "Arcade tuning installed; this factory preset is an untested alternative",
-+        "target_top_speed_kmh": 318,
-+        "target_zero_to_100_s": 3.4,
-+        "mass_kg": 1435,
-+        "peak_torque_nm": 470,
-+        "shift_rpm": 8800,
-+        "reference_wheel_radius_m": 0.345,
-         "torque_curve": [
-           [
-             0,
--            0.25
-+            0.3
-           ],
-           [
--            1000,
--            0.42
-+            800,
-+            0.4
-           ],
-           [
--            2500,
--            0.73
-+            3000,
-+            0.78
-           ],
-           [
--            5500,
--            1
-+            5000,
-+            0.93
-           ],
-           [
--            6500,
-+            6100,
-             1
-           ],
-           [
--            7500,
--            0.966069538497
-+            8400,
-+            0.907
-           ],
-           [
--            8250,
--            0.84
-+            9000,
-+            0.8
-           ]
-         ],
--        "drag_coefficient_native": 0.67,
-+        "drag_coefficient_native": 0.46,
-         "assumptions": "Piecewise torque fractions, drag, tyre grip, brakes, shift timing, reverse ratio where unavailable, and menu ratings are game calibration, not manufacturer specifications. Runtime compensates geometry wheel radius in final drive; native TorqueScale uses Nm only with engine_profile=factory."
-       },
-       "physics": {
--        "Mass": 1270,
--        "TorqueScale": 800,
-+        "Mass": 1435,
-+        "TorqueScale": 470,
-         "TorqueScaleFactor": 1,
-         "TurboSize": 0,
-         "WheelDrive": 1,
--        "BrakeTorque": 8200,
--        "HandBrakeTorque": 4510,
--        "LatFrictionFactor": 1.95,
--        "AirKZZ": 0.67,
-+        "BrakeTorque": 6500,
-+        "HandBrakeTorque": 3575,
-+        "LatFrictionFactor": 1.5,
-+        "AirKZZ": 0.46,
-         "AirKZY": 0.05,
--        "MaxTorqueRPM": 6000,
--        "MaxTurboTorqueRPM": 6000,
--        "MinRPM": 1000,
--        "MinRPMGearChange": 2500,
--        "CutRPM": 8250,
--        "MaxRPM": 8250,
-+        "MaxTorqueRPM": 6100,
-+        "MaxTurboTorqueRPM": 6100,
-+        "MinRPM": 800,
-+        "MinRPMGearChange": 2200,
-+        "CutRPM": 9000,
-+        "MaxRPM": 9000,
-         "TimeChangeGear": 0.08,
-         "TimeChangeGearFR": 0.3,
--        "WheelRatio": 3.308,
--        "WheelRadius": 0.3525,
-+        "WheelRatio": 4.0,
-+        "WheelRadius": 0.345,
-         "GearRatioVector": [
--          -3.9,
--          3.982,
--          2.612,
--          1.905,
--          1.479,
--          1.16,
--          0.906,
--          0.686
-+          -3.3,
-+          3.75,
-+          2.38,
-+          1.72,
-+          1.34,
-+          1.11,
-+          0.96,
-+          0.84
-         ],
-         "GearStatusDownGearFactor": 0.72,
--        "SteeringEndSpeed": 227
-+        "SteeringEndSpeed": 250
-       },
-       "ratings": {
-         "TOPSPEED": 8,
--        "ACCELERATION": 9,
-+        "ACCELERATION": 8,
-         "MASS": 5,
-         "HANDLING": 9,
--        "DURABILITY": 2
-+        "DURABILITY": 4
-       },
-       "speedometer": {
--        "max_kmh": 360,
--        "max_mph": 240
-+        "max_kmh": 340,
-+        "max_mph": 200
-       }
-     },
-     "FXXK_Racer": {
--      "variant": "2015 Ferrari FXX K",
-+      "variant": "1975 Porsche 911 Turbo (930) 3.0, Guards Red",
-       "specification": {
--        "power_kw": 772.2736874999999,
--        "power_label": "1,050 CV combined; 860 CV combustion + 190 CV electric",
--        "torque_nm": null,
--        "mass_kg": null,
--        "mass_basis": "Not published in the verified source",
--        "top_speed_kmh": null,
--        "zero_to_100_s": null,
--        "gear_count": 7,
--        "ice_power_kw": 632.528925,
--        "ice_power_rpm": 9200,
--        "electric_power_kw": 139.7447625,
--        "torque_label": "more than 900 Nm combined; 750 Nm combustion at 6,500 rpm",
--        "redline_rpm": 9250,
--        "drivetrain": "Rear-wheel drive"
-+        "power_kw": 191.0,
-+        "power_label": "260 PS (DIN)",
-+        "torque_nm": 343,
-+        "mass_kg": 1140,
-+        "mass_basis": "Kerb (DIN)",
-+        "top_speed_kmh": 250,
-+        "zero_to_100_s": 5.5,
-+        "gear_count": 4,
-+        "power_rpm": 5500,
-+        "torque_rpm": 4000,
-+        "zero_to_60_mph_s": null,
-+        "redline_rpm": 6800,
-+        "drivetrain": "Rear-wheel drive, rear engine",
-+        "engine": "3.0-litre turbocharged flat-six",
-+        "gear_ratios": [
-+          2.25,
-+          1.304,
-+          0.893,
-+          0.656
-+        ],
-+        "final_drive": 4.0
-       },
-       "notes": [
--        "Factory total mass, ratios, final drive, 0-100 and maximum speed were not verified; 1,590 kg, selected seven ratios, 4.375 final drive, 2.8 s and 350 km/h are explicit calibration estimates.",
--        "The single normalized curve approximates combined combustion/electric output with a 950 Nm peak. It does not model battery charge, regeneration or deploy-duration limits.",
--        "Combined power is 1,050 CV, not 1,050 SAE hp. 9,250 rpm maximum is from the Ferrari brochure."
-+        "Lionsharp Studios model; silver (slot 9009) and Guards Red (slot 9012) share these figures.",
-+        "4-speed 930 gearbox; the in-game installed tuning uses arcade units (Mass 1140, TorqueScale 550, 4 gears for ~250 km/h).",
-+        "Redline 6,800 rpm is approximate for the 3.0 Turbo."
-       ],
-       "sources": [
-         {
--          "title": "Ferrari XX Programme and F1 Clienti brochure, page 8",
--          "url": "https://cdn.ferrari.com/cms/network/media/pdf/XXPROGRAMME_F1CLIENTI_Brochure_Ferrari.pdf"
--        },
--        {
--          "title": "Ferrari-issued FXX K launch release (preserved copy)",
--          "url": "https://www.allcarindex.com/blog/2014-ferrari-fxx-k"
-+          "title": "Porsche 911 Turbo (930) 3.0, Porsche AG model history",
-+          "url": "https://www.porsche.com/international/aboutporsche/porschehistory/"
-         }
-       ],
-       "calibration": {
--        "status": "Initial physics calibration; performance targets require in-game measurement",
--        "target_top_speed_kmh": 350,
--        "target_zero_to_100_s": 2.8,
--        "mass_kg": 1590,
--        "peak_torque_nm": 950,
--        "shift_rpm": 9000,
--        "reference_wheel_radius_m": 0.3575,
-+        "status": "Arcade tuning installed; this factory preset is an untested alternative",
-+        "target_top_speed_kmh": 250,
-+        "target_zero_to_100_s": 5.5,
-+        "mass_kg": 1140,
-+        "peak_torque_nm": 343,
-+        "shift_rpm": 6500,
-+        "reference_wheel_radius_m": 0.31,
-         "torque_curve": [
-           [
-             0,
--            0.35
-+            0.25
-           ],
-           [
--            1000,
--            0.55
-+            800,
-+            0.3
-+          ],
-+          [
-+            2500,
-+            0.45
-           ],
-           [
-             3500,
-             0.8
-           ],
-           [
--            6500,
-+            4000,
-             1
-           ],
-           [
--            8000,
-+            5500,
-             0.95
-           ],
-           [
--            9200,
--            0.843782964812
--          ],
--          [
--            9250,
--            0.835
-+            6800,
-+            0.75
-           ]
-         ],
--        "drag_coefficient_native": 0.74,
-+        "drag_coefficient_native": 0.46,
-         "assumptions": "Piecewise torque fractions, drag, tyre grip, brakes, shift timing, reverse ratio where unavailable, and menu ratings are game calibration, not manufacturer specifications. Runtime compensates geometry wheel radius in final drive; native TorqueScale uses Nm only with engine_profile=factory."
-       },
-       "physics": {
--        "Mass": 1590,
--        "TorqueScale": 950,
-+        "Mass": 1140,
-+        "TorqueScale": 343,
-         "TorqueScaleFactor": 1,
-         "TurboSize": 0,
-         "WheelDrive": 1,
--        "BrakeTorque": 8500,
--        "HandBrakeTorque": 4675,
--        "LatFrictionFactor": 1.95,
--        "AirKZZ": 0.74,
-+        "BrakeTorque": 4500,
-+        "HandBrakeTorque": 2500,
-+        "LatFrictionFactor": 1.5,
-+        "AirKZZ": 0.46,
-         "AirKZY": 0.05,
--        "MaxTorqueRPM": 6500,
--        "MaxTurboTorqueRPM": 6500,
--        "MinRPM": 1000,
--        "MinRPMGearChange": 3500,
--        "CutRPM": 9250,
--        "MaxRPM": 9250,
-+        "MaxTorqueRPM": 4000,
-+        "MaxTurboTorqueRPM": 4000,
-+        "MinRPM": 800,
-+        "MinRPMGearChange": 2200,
-+        "CutRPM": 6800,
-+        "MaxRPM": 6800,
-         "TimeChangeGear": 0.08,
-         "TimeChangeGearFR": 0.3,
--        "WheelRatio": 4.375,
--        "WheelRadius": 0.3575,
-+        "WheelRatio": 4.0,
-+        "WheelRadius": 0.31,
-         "GearRatioVector": [
--          -3.5,
--          3.08,
--          2.19,
--          1.626,
--          1.286,
--          1.028,
--          0.839,
--          0.693
-+          -3.25,
-+          2.25,
-+          1.304,
-+          0.893,
-+          0.656
-         ],
-         "GearStatusDownGearFactor": 0.72,
--        "SteeringEndSpeed": 245
-+        "SteeringEndSpeed": 210
-       },
-       "ratings": {
--        "TOPSPEED": 8,
--        "ACCELERATION": 9,
--        "MASS": 6,
--        "HANDLING": 9,
--        "DURABILITY": 2
-+        "TOPSPEED": 6,
-+        "ACCELERATION": 6,
-+        "MASS": 4,
-+        "HANDLING": 5,
-+        "DURABILITY": 6
-       },
-       "speedometer": {
--        "max_kmh": 400,
--        "max_mph": 260
-+        "max_kmh": 300,
-+        "max_mph": 180
-       }
-     },
-     "Regera_GT1": {
-diff --git a/tools/car-mods/prepare.py b/tools/car-mods/prepare.py
-index d3208b1..c15003a 100644
---- a/tools/car-mods/prepare.py
-+++ b/tools/car-mods/prepare.py
-@@ -75,10 +75,10 @@ IDENTITIES = {
-     9004: ("Panoz", "Viper", "Panoz GTR-1"),
-     9005: ("McLaren_F1", "Koenigsegg", "McLaren F1"),
-     9006: ("Form1", "Lotus", "Formula 1"),
--    9009: ("Ford_GTcar", "Koenigsegg", "Ford GT"),
--    9010: ("Senna_Road", "Koenigsegg", "McLaren Senna"),
--    9011: ("Senna_GTR1", "Koenigsegg", "McLaren Senna GTR"),
--    9012: ("FXXK_Racer", "Koenigsegg", "Ferrari FXX K"),
-+    9009: ("Ford_GTcar", "Koenigsegg", "Porsche 930 Turbo"),
-+    9010: ("Senna_Road", "Koenigsegg", "Aston Martin DBS"),
-+    9011: ("Senna_GTR1", "Koenigsegg", "Porsche 911 GT3"),
-+    9012: ("FXXK_Racer", "Koenigsegg", "Porsche 930 Turbo Red"),
-     9013: ("Regera_GT1", "Koenigsegg", "Koenigsegg Regera"),
-     9014: ("AventadorX", "Koenigsegg", "Lamborghini Aventador"),
- }
-@@ -108,7 +108,9 @@ def load_config(path: Path) -> dict:
-     seen_ids, seen_aliases = set(), set()
-     for car in config["cars"]:
-         required = {"id", "alias", "donor", "display_name", "ratings", "physics", "colors"}
--        exact_keys(car, required | {"speedometer", "model_package", "engine_profile"}, "car")
-+        exact_keys(car, required | {"speedometer", "model_package", "engine_profile", "hidden"}, "car")
-+        if not isinstance(car.get("hidden", False), bool):
-+            raise ValueError("hidden must be true or false")
-         if not required <= set(car):
-             raise ValueError("Each car requires id, alias, donor, display_name, ratings, physics, colors")
-         ident = car["id"]
-@@ -327,6 +329,10 @@ def tweak_variant(original: bytes, car: dict) -> bytes:
-     info = {"ID": car["id"], **car["ratings"], "PAINTJOBNAME": car["alias"]}
-     text = update_section(text, "CarInfo", info, {"LOCKED", "HIDDEN", "ADMITTANCE", "SKIN", "COLOR"})
-     colors = "".join(f"\tCOLOR\t\t{i} 0x{c[1:]} 0x{c[1:]}\r\n" for i, c in enumerate(car["colors"]))
-+    # A hidden car is left out of the menus the way retail hides its unused
-+    # cars: locked, hidden and with no admittance to unlock it.
-+    if car.get("hidden"):
-+        colors += "\tHIDDEN\r\n\tLOCKED\r\n"
-     text = text.replace("End(CarInfo)", colors + "End(CarInfo)", 1)
-     physics = dict(car["physics"])
-     if "GearRatioVector" in physics:

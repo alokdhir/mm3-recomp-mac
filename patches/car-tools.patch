@@ -1,0 +1,1529 @@
+diff --git a/car-models/build_package.py b/car-models/build_package.py
+index 46aa428..cfbbcac 100644
+--- a/car-models/build_package.py
++++ b/car-models/build_package.py
+@@ -166,7 +166,10 @@ def build(source_path: Path, output: Path, car_id: int, *, y_offset=None,
+             # MM3's transparent car pass shades glass separately and does not
+             # retain the imported surface RGB. Bake source alpha over a dark
+             # base for this first visual port, preserving banners and details.
+-            record['mode'] = 2
++            # Retail exterior details use mode 2; textured paint (the
++            # Koenigsegg's Lack_textur) is mode 0, drawn with the body
++            # rather than after it. A source material may say which.
++            record['mode'] = int(material.get('mode', 2))
+             textures.append((texture_path, texture_name))
+         else:
+             record['texture'], record['mode'] = 'No', 0
+@@ -190,12 +193,48 @@ def build(source_path: Path, output: Path, car_id: int, *, y_offset=None,
+         target.write_bytes(blob)
+         files.append(dict(archive=archive, path=path, source=source_name))
+ 
++    # The game draws the player's plate text with its own numberplate
++    # material (+Cars\license.dds); a rear plate needs that record too.
++    plate_material = None
++    if source.get('plates'):
++        if len(native_materials) >= 23:
++            raise ValueError('No material slot left for the number plate')
++        plate_material = len(native_materials)
++        tint = source['plates'].get('color')
++        plate_texture = '+Cars\\license.dds'
++        if tint:
++            # The plate draws its characters from the game's font atlas
++            # (black glyphs on white, a blank cell for the background); a
++            # copy with white turned to the plate colour, in this car's folder.
++            import mm3view
++            atlas = mm3view.load_image('Cars/License.cdds', data.read('Cars/License.cdds')).convert('RGB')
++            px = np.asarray(atlas, dtype=float) / 255
++            light = px.mean(axis=2, keepdims=True)
++            coloured = Image.fromarray(np.uint8(np.clip(light * np.asarray(tint[:3]) * 255, 0, 255)))
++            plate_path = output / 'baked-textures' / 'license_plate.png'
++            plate_path.parent.mkdir(parents=True, exist_ok=True)
++            coloured.save(plate_path)
++            asset('Data_dvd.zip', f'Cars/{alias}/license_plate.cdds',
++                  mm3_textures.image_to_cdds(plate_path, max_size=128))
++            plate_texture = f'+Cars\\{alias}\\license_plate.dds'
++        native_materials.append(dict(name='numberplate', texture=plate_texture,
++                                     diffuse=[0, 0, 0, 255], mode=0))
++    # Windows split out as GLASS_H take a see-through material like the
++    # Koenigsegg's own "windows" record, in the donor's glass part.
++    glass_material = None
++    if any(mesh['name'] == 'GLASS_H' and mesh['triangles'] for mesh in source['meshes']):
++        if len(native_materials) >= 23:
++            raise ValueError('No material slot left for the windows')
++        glass_material = len(native_materials)
++        native_materials.append(dict(name='windows', texture=None, diffuse=[114, 127, 135, 89], mode=0))
++        material_shading[glass_material] = mm3_model.source_material_shading({'name': 'glass'})
+     for suffix in ('', '_lod1'):
+         template = alias_paths(data.read(f'cars/{donor}{suffix}/body.cmp'), donor, alias)
+         blob, report = mm3_model.convert_exterior(template, source,
+             material_map=mapping, body_names=body_names,
+             source_transform=transform, flip_winding=True, keep_interior=False,
+-            material_shading=material_shading)
++            material_shading=material_shading, plate_material=plate_material,
++            glass_material=glass_material)
+         blob, report['lights'] = mm3_lights.align_lights(blob, light_anchors,
+                                                            source_transform=transform)
+         asset('loose', f'Data/Shared/Cars/{alias}{suffix}/body.cmp', blob)
+diff --git a/car-models/mm3_model.py b/car-models/mm3_model.py
+index 44b7009..90d4fa8 100644
+--- a/car-models/mm3_model.py
++++ b/car-models/mm3_model.py
+@@ -425,6 +425,14 @@ def mesh_metadata(block: MeshBlock, version: int) -> dict:
+                 vertex_count=vertex_count, material_offsets=material_offsets)
+ 
+ 
++def _all_materials_to(block: MeshBlock, version: int, slot: int) -> dict:
++    """A material map sending every material the mesh uses to one slot."""
++    meta = mesh_metadata(block, version)
++    used = {struct.unpack_from("<I", block.payload, o)[0] for o in meta["material_offsets"]}
++    used |= {block.payload[meta["vertex_offset"] + i * 24 + 12] // 11 for i in range(meta["vertex_count"])}
++    return {m: slot for m in used}
++
++
+ def remap_mesh_materials(block: MeshBlock, version: int,
+                          material_map: Mapping[int, int]) -> MeshBlock:
+     """Change retained interior material slots without changing its geometry."""
+@@ -661,7 +669,8 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+                      source_transform=None, keep_interior=True,
+                      flip_winding=True, specular=MATTE_VERTEX_SHADING,
+                      material_palette_offsets=None,
+-                     material_shading=None) -> tuple[bytes, dict]:
++                     material_shading=None, plate_material=None,
++                     glass_material=None) -> tuple[bytes, dict]:
+     """Replace body/wheels in a donor. Returns bytes and a conversion report.
+ 
+     Visible meshes receive the imported geometry; a closed convex stencil proxy
+@@ -704,8 +713,20 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+     geometry_parts = {"body": split_mesh_geometry(*body)}
+     geometry_parts.update({name: split_mesh_geometry(*global_meshes[source_name][:4])
+                            for name, source_name in wheel_names.items()})
++    # GLASS_H, with glass_material: the windows go into the donor's own
++    # glass_windows part, drawn in the game's see-through car glass pass.
++    glass_map = {}
++    if glass_material is not None and "GLASS_H" in source_meshes and source_meshes["GLASS_H"]["triangles"]:
++        gp, gn, guv, gtri, _ = _neutral_world(source_meshes["GLASS_H"], transform)
++        glass_map = {int(m): int(glass_material) for m in np.unique(gtri[:, 3])}
++        geometry_parts["glass"] = split_mesh_geometry(gp, gn, guv, gtri)
+     all_positions = np.concatenate([body[0]] + [global_meshes[n][0] for n in wheel_names.values()])
+-    report = dict(version=model.version, replaced=[], hidden=[], retained=[], shadows=[],
++    # "plates": {"back": [x, y, z]} in the source's coordinates: keep the
++    # donor's rear number plate (the game draws the player's plate text on
++    # it) and move it there. Front plates stay hidden.
++    plates = {key: (transform @ np.append(np.asarray(point, dtype=float), 1.0))[:3]
++              for key, point in (source.get("plates") or {}).items() if key == "back"}
++    report = dict(version=model.version, replaced=[], hidden=[], retained=[], shadows=[], plates={},
+                   split_meshes=[], wheel_pivots={}, bounds_min=all_positions.min(0).tolist(),
+                   bounds_max=all_positions.max(0).tolist())
+     found_body, found_wheels = False, set()
+@@ -717,7 +738,17 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+     if shadow_template is None:
+         raise FormatError("Donor has no native stencil shadow template")
+ 
+-    def visit(node: Node, parent_matrix: np.ndarray, path: str, wheel=None):
++    def plate_centre(node: Node) -> np.ndarray | None:
++        """The centre of a plate node's first mesh, in the node's frame."""
++        for child in node.children:
++            for block in child.meshes:
++                if block.payload and len(block.payload) >= 28:
++                    b = native_bounds(np.array(struct.unpack_from("<6f", block.payload, 4)).reshape(2, 3))
++                    centre = np.append(b.mean(0), 1.0)
++                    return (child.relative_matrix() @ centre)[:3]
++        return None
++
++    def visit(node: Node, parent_matrix: np.ndarray, path: str, wheel=None, plate=False):
+         nonlocal found_body
+         siblings = []
+         path += "/" + node.name
+@@ -729,6 +760,15 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+             node.set_translation(pivot, relative_pivot)
+             current_matrix = parent_matrix @ node.relative_matrix()
+             report["wheel_pivots"][wheel] = pivot.tolist()
++        if node.kind == 1 and node.name.lower() == "backnumber" and "back" in plates:
++            local = plate_centre(node)
++            if local is not None:
++                now = (current_matrix @ np.append(local, 1.0))[:3]
++                world = current_matrix[:3, 3] + (plates["back"] - now)
++                node.set_translation(world, np.linalg.solve(parent_matrix[:3, :3], world - parent_matrix[:3, 3]))
++                current_matrix = parent_matrix @ node.relative_matrix()
++                report["plates"]["back"] = plates["back"].tolist()
++                plate = True
+         if node.kind == 1 and (node.name.lower() in ("car", "body") or node.name in wheel_names):
+             points = (global_meshes[wheel_names[node.name]][0] if node.name in wheel_names
+                       else body[0] if node.name.lower() == "body" else all_positions)
+@@ -738,9 +778,15 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+         if node.kind in (2, 6):
+             if not node.meshes:
+                 return []
+-            retained = keep_interior and "lowdash" in path.lower()
++            retained = (keep_interior and "lowdash" in path.lower()) or plate
+             if retained:
+                 report["retained"].append(path)
++                if plate and plate_material is not None:
++                    # The donor's plate material is appended to the imported
++                    # set at plate_material; point every plate face there.
++                    node.meshes = [remap_mesh_materials(block, model.version,
++                                                        _all_materials_to(block, model.version, plate_material))
++                                   if block.payload else block for block in node.meshes]
+                 if interior_material_map:
+                     node.meshes = [remap_mesh_materials(block, model.version, interior_material_map)
+                                    if block.payload else block for block in node.meshes]
+@@ -751,6 +797,9 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+                 elif "/body/" in path.lower():
+                     parts = geometry_parts["body"]
+                     found_body = True
++                elif "glass" in geometry_parts and "glass_windows" in path.lower():
++                    parts = geometry_parts["glass"]
++                    report["replaced"].append(path)
+                 else:
+                     p = np.zeros((3, 3)); n = np.tile((0, 1, 0), (3, 1))
+                     uv = np.zeros((3, 2)); tri = np.array([[0, 1, 2, 0]])
+@@ -790,10 +839,11 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+                         name = f"mm3import_{target.name}_{wheel or 'body'}_{suffix}.dob"
+                         if directory:
+                             name = directory + "\\" + name
++                        glass = "glass_windows" in path.lower() and "glass" in geometry_parts
+                         if shadow:
+                             complete = (global_meshes[wheel_names[wheel]][0] if wheel else body[0])
+                             shadowp = ((complete - current_matrix[:3, 3]) @
+-                                       np.linalg.inv(current_matrix[:3, :3]).T) if part_index == 0 else []
++                                       np.linalg.inv(current_matrix[:3, :3]).T) if part_index == 0 and not glass else []
+                             block = encode_shadow_mesh(name, shadowp, localn, tri,
+                                 original_mesh, model.version, flip_winding=flip_winding)
+                             new_meshes.append(block)
+@@ -805,14 +855,14 @@ def convert_exterior(template: bytes, source: dict, *, body_names=("BODY_H",),
+                                 vertices=mesh_metadata(block, model.version)["vertex_count"]))
+                         else:
+                             new_meshes.append(encode_mesh(name, localp, localn, uv, tri,
+-                                material_map, donor_block, model.version,
++                                glass_map if glass else material_map, donor_block, model.version,
+                                 specular=specular, flip_winding=flip_winding,
+                                 material_palette_offsets=material_palette_offsets,
+                                 material_shading=material_shading))
+                     target.meshes = new_meshes
+         children = []
+         for child in node.children:
+-            extras = visit(child, current_matrix, path, wheel)
++            extras = visit(child, current_matrix, path, wheel, plate)
+             children.append(child)
+             children.extend(extras)
+         node.children = children
+diff --git a/car-mods/cars.imported.json b/car-mods/cars.imported.json
+index e891b66..9d32b07 100644
+--- a/car-mods/cars.imported.json
++++ b/car-mods/cars.imported.json
+@@ -40,7 +40,8 @@
+         "max_kmh": 360,
+         "max_mph": 240
+       },
+-      "model_package": "../../../out/car-models/packages/Panoz"
++      "model_package": "../../../out/car-models/packages/Panoz",
++      "hidden": true
+     },
+     {
+       "id": 9005,
+@@ -67,7 +68,8 @@
+         "max_kmh": 360,
+         "max_mph": 240
+       },
+-      "model_package": "../../../out/car-models/packages/McLaren_F1"
++      "model_package": "../../../out/car-models/packages/McLaren_F1",
++      "hidden": true
+     },
+     {
+       "id": 9006,
+@@ -94,23 +96,31 @@
+         "max_kmh": 380,
+         "max_mph": 240
+       },
+-      "model_package": "../../../out/car-models/packages/Form1"
++      "model_package": "../../../out/car-models/packages/Form1",
++      "hidden": true
+     },
+     {
+       "id": 9009,
+       "alias": "Ford_GTcar",
+       "donor": "Koenigsegg",
+-      "display_name": "Ford GT",
++      "display_name": "Porsche 930 Turbo",
+       "ratings": {
+-        "TOPSPEED": 8,
+-        "ACCELERATION": 8,
+-        "MASS": 6,
+-        "HANDLING": 7,
+-        "DURABILITY": 4
++        "TOPSPEED": 6,
++        "ACCELERATION": 6,
++        "MASS": 4,
++        "HANDLING": 5,
++        "DURABILITY": 6
+       },
+       "physics": {
+-        "Mass": 1520,
+-        "TorqueScale": 1000
++        "Mass": 1140,
++        "TorqueScale": 550,
++        "GearRatioVector": [
++          -3.3,
++          3.24,
++          1.87,
++          1.28,
++          0.95
++        ]
+       },
+       "colors": [
+         "#68b7d1",
+@@ -118,8 +128,8 @@
+         "#ad1828"
+       ],
+       "speedometer": {
+-        "max_kmh": 380,
+-        "max_mph": 240
++        "max_kmh": 300,
++        "max_mph": 180
+       },
+       "model_package": "../../../out/car-models/packages/Ford_GTcar"
+     },
+@@ -127,17 +137,26 @@
+       "id": 9010,
+       "alias": "Senna_Road",
+       "donor": "Koenigsegg",
+-      "display_name": "McLaren Senna",
++      "display_name": "Aston Martin DBS",
+       "ratings": {
+         "TOPSPEED": 8,
+-        "ACCELERATION": 9,
+-        "MASS": 5,
+-        "HANDLING": 8,
+-        "DURABILITY": 3
++        "ACCELERATION": 7,
++        "MASS": 7,
++        "HANDLING": 7,
++        "DURABILITY": 6
+       },
+       "physics": {
+-        "Mass": 1309,
+-        "TorqueScale": 1000
++        "Mass": 1695,
++        "TorqueScale": 1070,
++        "GearRatioVector": [
++          -3.3,
++          3.28,
++          1.92,
++          1.28,
++          1.02,
++          0.85,
++          0.79
++        ]
+       },
+       "colors": [
+         "#ff8526",
+@@ -145,8 +164,8 @@
+         "#d9e2e9"
+       ],
+       "speedometer": {
+-        "max_kmh": 360,
+-        "max_mph": 240
++        "max_kmh": 340,
++        "max_mph": 200
+       },
+       "model_package": "../../../out/car-models/packages/Senna_Road"
+     },
+@@ -154,17 +173,26 @@
+       "id": 9011,
+       "alias": "Senna_GTR1",
+       "donor": "Koenigsegg",
+-      "display_name": "McLaren Senna GTR",
++      "display_name": "Porsche 911 GT3",
+       "ratings": {
+         "TOPSPEED": 8,
+-        "ACCELERATION": 9,
++        "ACCELERATION": 8,
+         "MASS": 5,
+         "HANDLING": 9,
+-        "DURABILITY": 2
++        "DURABILITY": 4
+       },
+       "physics": {
+-        "Mass": 1270,
+-        "TorqueScale": 1025
++        "Mass": 1435,
++        "TorqueScale": 1055,
++        "GearRatioVector": [
++          -3.3,
++          3.35,
++          2.13,
++          1.54,
++          1.2,
++          0.95,
++          0.75
++        ]
+       },
+       "colors": [
+         "#efeff2",
+@@ -172,8 +200,8 @@
+         "#b32431"
+       ],
+       "speedometer": {
+-        "max_kmh": 360,
+-        "max_mph": 240
++        "max_kmh": 340,
++        "max_mph": 200
+       },
+       "model_package": "../../../out/car-models/packages/Senna_GTR1"
+     },
+@@ -181,17 +209,24 @@
+       "id": 9012,
+       "alias": "FXXK_Racer",
+       "donor": "Koenigsegg",
+-      "display_name": "Ferrari FXX K",
++      "display_name": "Porsche 930 Turbo Red",
+       "ratings": {
+-        "TOPSPEED": 8,
+-        "ACCELERATION": 9,
+-        "MASS": 6,
+-        "HANDLING": 9,
+-        "DURABILITY": 2
++        "TOPSPEED": 6,
++        "ACCELERATION": 6,
++        "MASS": 4,
++        "HANDLING": 5,
++        "DURABILITY": 6
+       },
+       "physics": {
+-        "Mass": 1590,
+-        "TorqueScale": 1150
++        "Mass": 1140,
++        "TorqueScale": 550,
++        "GearRatioVector": [
++          -3.3,
++          3.24,
++          1.87,
++          1.28,
++          0.95
++        ]
+       },
+       "colors": [
+         "#d2202c",
+@@ -199,8 +234,8 @@
+         "#e7e8ea"
+       ],
+       "speedometer": {
+-        "max_kmh": 400,
+-        "max_mph": 260
++        "max_kmh": 300,
++        "max_mph": 180
+       },
+       "model_package": "../../../out/car-models/packages/FXXK_Racer"
+     },
+@@ -229,7 +264,8 @@
+         "max_kmh": 440,
+         "max_mph": 280
+       },
+-      "model_package": "../../../out/car-models/packages/Regera_GT1"
++      "model_package": "../../../out/car-models/packages/Regera_GT1",
++      "hidden": true
+     },
+     {
+       "id": 9014,
+@@ -256,7 +292,8 @@
+         "max_kmh": 380,
+         "max_mph": 240
+       },
+-      "model_package": "../../../out/car-models/packages/AventadorX"
++      "model_package": "../../../out/car-models/packages/AventadorX",
++      "hidden": true
+     }
+   ]
+ }
+diff --git a/car-mods/cars.json b/car-mods/cars.json
+index b9526f6..3045359 100644
+--- a/car-mods/cars.json
++++ b/car-mods/cars.json
+@@ -39,7 +39,8 @@
+       "speedometer": {
+         "max_kmh": 360,
+         "max_mph": 240
+-      }
++      },
++      "hidden": true
+     },
+     {
+       "id": 9005,
+@@ -65,7 +66,8 @@
+       "speedometer": {
+         "max_kmh": 360,
+         "max_mph": 240
+-      }
++      },
++      "hidden": true
+     },
+     {
+       "id": 9006,
+@@ -91,23 +93,31 @@
+       "speedometer": {
+         "max_kmh": 380,
+         "max_mph": 240
+-      }
++      },
++      "hidden": true
+     },
+     {
+       "id": 9009,
+       "alias": "Ford_GTcar",
+       "donor": "Koenigsegg",
+-      "display_name": "Ford GT",
++      "display_name": "Porsche 930 Turbo",
+       "ratings": {
+-        "TOPSPEED": 8,
+-        "ACCELERATION": 8,
+-        "MASS": 6,
+-        "HANDLING": 7,
+-        "DURABILITY": 4
++        "TOPSPEED": 6,
++        "ACCELERATION": 6,
++        "MASS": 4,
++        "HANDLING": 5,
++        "DURABILITY": 6
+       },
+       "physics": {
+-        "Mass": 1520,
+-        "TorqueScale": 1000
++        "Mass": 1140,
++        "TorqueScale": 550,
++        "GearRatioVector": [
++          -3.3,
++          3.24,
++          1.87,
++          1.28,
++          0.95
++        ]
+       },
+       "colors": [
+         "#68b7d1",
+@@ -115,25 +125,34 @@
+         "#ad1828"
+       ],
+       "speedometer": {
+-        "max_kmh": 380,
+-        "max_mph": 240
++        "max_kmh": 300,
++        "max_mph": 180
+       }
+     },
+     {
+       "id": 9010,
+       "alias": "Senna_Road",
+       "donor": "Koenigsegg",
+-      "display_name": "McLaren Senna",
++      "display_name": "Aston Martin DBS",
+       "ratings": {
+         "TOPSPEED": 8,
+-        "ACCELERATION": 9,
+-        "MASS": 5,
+-        "HANDLING": 8,
+-        "DURABILITY": 3
++        "ACCELERATION": 7,
++        "MASS": 7,
++        "HANDLING": 7,
++        "DURABILITY": 6
+       },
+       "physics": {
+-        "Mass": 1309,
+-        "TorqueScale": 1000
++        "Mass": 1695,
++        "TorqueScale": 1070,
++        "GearRatioVector": [
++          -3.3,
++          3.28,
++          1.92,
++          1.28,
++          1.02,
++          0.85,
++          0.79
++        ]
+       },
+       "colors": [
+         "#ff8526",
+@@ -141,25 +160,34 @@
+         "#d9e2e9"
+       ],
+       "speedometer": {
+-        "max_kmh": 360,
+-        "max_mph": 240
++        "max_kmh": 340,
++        "max_mph": 200
+       }
+     },
+     {
+       "id": 9011,
+       "alias": "Senna_GTR1",
+       "donor": "Koenigsegg",
+-      "display_name": "McLaren Senna GTR",
++      "display_name": "Porsche 911 GT3",
+       "ratings": {
+         "TOPSPEED": 8,
+-        "ACCELERATION": 9,
++        "ACCELERATION": 8,
+         "MASS": 5,
+         "HANDLING": 9,
+-        "DURABILITY": 2
++        "DURABILITY": 4
+       },
+       "physics": {
+-        "Mass": 1270,
+-        "TorqueScale": 1025
++        "Mass": 1435,
++        "TorqueScale": 1055,
++        "GearRatioVector": [
++          -3.3,
++          3.35,
++          2.13,
++          1.54,
++          1.2,
++          0.95,
++          0.75
++        ]
+       },
+       "colors": [
+         "#efeff2",
+@@ -167,25 +195,32 @@
+         "#b32431"
+       ],
+       "speedometer": {
+-        "max_kmh": 360,
+-        "max_mph": 240
++        "max_kmh": 340,
++        "max_mph": 200
+       }
+     },
+     {
+       "id": 9012,
+       "alias": "FXXK_Racer",
+       "donor": "Koenigsegg",
+-      "display_name": "Ferrari FXX K",
++      "display_name": "Porsche 930 Turbo Red",
+       "ratings": {
+-        "TOPSPEED": 8,
+-        "ACCELERATION": 9,
+-        "MASS": 6,
+-        "HANDLING": 9,
+-        "DURABILITY": 2
++        "TOPSPEED": 6,
++        "ACCELERATION": 6,
++        "MASS": 4,
++        "HANDLING": 5,
++        "DURABILITY": 6
+       },
+       "physics": {
+-        "Mass": 1590,
+-        "TorqueScale": 1150
++        "Mass": 1140,
++        "TorqueScale": 550,
++        "GearRatioVector": [
++          -3.3,
++          3.24,
++          1.87,
++          1.28,
++          0.95
++        ]
+       },
+       "colors": [
+         "#d2202c",
+@@ -193,8 +228,8 @@
+         "#e7e8ea"
+       ],
+       "speedometer": {
+-        "max_kmh": 400,
+-        "max_mph": 260
++        "max_kmh": 300,
++        "max_mph": 180
+       }
+     },
+     {
+@@ -221,7 +256,8 @@
+       "speedometer": {
+         "max_kmh": 440,
+         "max_mph": 280
+-      }
++      },
++      "hidden": true
+     },
+     {
+       "id": 9014,
+@@ -247,7 +283,8 @@
+       "speedometer": {
+         "max_kmh": 380,
+         "max_mph": 240
+-      }
++      },
++      "hidden": true
+     }
+   ]
+ }
+diff --git a/car-mods/driving_defaults.py b/car-mods/driving_defaults.py
+index b667535..66a8164 100644
+--- a/car-mods/driving_defaults.py
++++ b/car-mods/driving_defaults.py
+@@ -14,15 +14,25 @@ TUNING = {
+     "Panoz": (980, 750),
+     "McLaren_F1": (1050, 800),
+     "Form1": (600, 420),
+-    "Ford_GTcar": (1520, 1000),
+-    "Senna_Road": (1309, 1000),
+-    "Senna_GTR1": (1270, 1025),
+-    "FXXK_Racer": (1590, 1150),
++    "Ford_GTcar": (1140, 550),          # Porsche 930 Turbo
++    "Senna_Road": (1695, 1070),         # Aston Martin DBS
++    "Senna_GTR1": (1435, 1055),         # Porsche 911 GT3 (992)
++    "FXXK_Racer": (1140, 550),          # Porsche 930 Turbo, Guards Red
+     "Regera_GT1": (1590, 1250),
+     "AventadorX": (1675, 1100),
+ }
+ 
+ 
++# The imported cars also carry their own gearbox: reverse, then forward ratios
++# scaled from the donor's top gear for each car's real top speed.
++GEARS = {
++    "Ford_GTcar": [-3.3, 3.24, 1.87, 1.28, 0.95],
++    "Senna_Road": [-3.3, 3.28, 1.92, 1.28, 1.02, 0.85, 0.79],
++    "Senna_GTR1": [-3.3, 3.35, 2.13, 1.54, 1.2, 0.95, 0.75],
++    "FXXK_Racer": [-3.3, 3.24, 1.87, 1.28, 0.95],
++}
++
++
+ def apply_preset(car: dict) -> dict:
+     """Reset driving only; preserve identity, model, paint, ratings and gauges."""
+     alias = car.get("alias")
+@@ -31,5 +41,7 @@ def apply_preset(car: dict) -> dict:
+     result = copy.deepcopy(car)
+     mass, torque = TUNING[alias]
+     result["physics"] = {"Mass": mass, "TorqueScale": torque}
++    if alias in GEARS:
++        result["physics"]["GearRatioVector"] = list(GEARS[alias])
+     result.pop("engine_profile", None)
+     return result
+diff --git a/car-mods/factory_specs.json b/car-mods/factory_specs.json
+index 49ca372..cae9260 100644
+--- a/car-mods/factory_specs.json
++++ b/car-mods/factory_specs.json
+@@ -374,57 +374,49 @@
+       }
+     },
+     "Ford_GTcar": {
+-      "variant": "2017 Ford GT",
++      "variant": "1975 Porsche 911 Turbo (930) 3.0",
+       "specification": {
+-        "power_kw": 482.467817184,
+-        "power_label": "647 SAE hp",
+-        "torque_nm": 745.6998714,
+-        "mass_kg": 1385,
+-        "mass_basis": "Dry",
+-        "top_speed_kmh": 347,
+-        "zero_to_100_s": null,
+-        "gear_count": 7,
+-        "power_rpm": 6250,
+-        "torque_rpm": 5900,
+-        "zero_to_60_mph_s": "less than 3",
+-        "redline_rpm": 7000,
+-        "drivetrain": "Rear-wheel drive",
+-        "engine": "3.5-litre twin-turbo V6",
++        "power_kw": 191.0,
++        "power_label": "260 PS (DIN)",
++        "torque_nm": 343,
++        "mass_kg": 1140,
++        "mass_basis": "Kerb (DIN)",
++        "top_speed_kmh": 250,
++        "zero_to_100_s": 5.5,
++        "gear_count": 4,
++        "power_rpm": 5500,
++        "torque_rpm": 4000,
++        "zero_to_60_mph_s": null,
++        "redline_rpm": 6800,
++        "drivetrain": "Rear-wheel drive, rear engine",
++        "engine": "3.0-litre turbocharged flat-six",
+         "gear_ratios": [
+-          3.397,
+-          2.186,
+-          1.626,
+-          1.285,
+-          1.029,
+-          0.839,
+-          0.634
++          2.25,
++          1.304,
++          0.893,
++          0.656
+         ],
+-        "final_drive": 3.667
++        "final_drive": 4.0
+       },
+       "notes": [
+-        "Imported source is explicitly the 2017 GT, not the earlier supercharged V8 model.",
+-        "1,520 kg operating mass is a calibration allowance over the published 1,385 kg dry figure, not a certified curb weight.",
+-        "Ford claims under three seconds to 97 km/h / 60 mph, not 0-100 km/h; 3.0 s to 100 is only a game target.",
+-        "7,000 rpm is verified in the November 2017 same-generation owner manual (2018 model year). Net torque already includes turbo contribution; native TurboSize is zero."
++        "Lionsharp Studios model; silver (slot 9009) and Guards Red (slot 9012) share these figures.",
++        "4-speed 930 gearbox; the in-game installed tuning uses arcade units (Mass 1140, TorqueScale 550, 4 gears for ~250 km/h).",
++        "Redline 6,800 rpm is approximate for the 3.0 Turbo."
+       ],
+       "sources": [
+         {
+-          "title": "Ford GT May 2017 technical specifications",
+-          "url": "https://media.ford.com/content/dam/fordmedia/Europe/documents/productReleases/FordGT/FordGT_2017_WEC_tech_specs_EU.pdf"
+-        },
+-        {
+-          "title": "Ford GT owner manual, November 2017 edition, page 204",
+-          "url": "https://www.fordservicecontent.com/Ford_Content/Catalog/owner_information/2018-Ford-GT-Owners-Manual-version-1_om-EN-US_12_2017.pdf"
++          "title": "Porsche 911 Turbo (930) 3.0, Porsche AG model history",
++          "url": "https://www.porsche.com/international/aboutporsche/porschehistory/"
+         }
+       ],
+       "calibration": {
+-        "status": "Initial physics calibration; performance targets require in-game measurement",
+-        "target_top_speed_kmh": 347,
+-        "target_zero_to_100_s": 3,
+-        "mass_kg": 1520,
+-        "peak_torque_nm": 745.7,
+-        "shift_rpm": 6700,
+-        "reference_wheel_radius_m": 0.3515,
++        "status": "Arcade tuning installed; this factory preset is an untested alternative",
++        "target_top_speed_kmh": 250,
++        "target_zero_to_100_s": 5.5,
++        "mass_kg": 1140,
++        "peak_torque_nm": 343,
++        "shift_rpm": 6500,
++        "reference_wheel_radius_m": 0.31,
+         "torque_curve": [
+           [
+             0,
+@@ -432,447 +424,428 @@
+           ],
+           [
+             800,
+-            0.42
++            0.3
+           ],
+           [
+-            2000,
+-            0.66
++            2500,
++            0.45
+           ],
+           [
+             3500,
+-            0.9
++            0.8
+           ],
+           [
+-            5900,
++            4000,
+             1
+           ],
+           [
+-            6250,
+-            0.988542024305
++            5500,
++            0.95
+           ],
+           [
+-            7000,
+-            0.82
++            6800,
++            0.75
+           ]
+         ],
+         "drag_coefficient_native": 0.46,
+         "assumptions": "Piecewise torque fractions, drag, tyre grip, brakes, shift timing, reverse ratio where unavailable, and menu ratings are game calibration, not manufacturer specifications. Runtime compensates geometry wheel radius in final drive; native TorqueScale uses Nm only with engine_profile=factory."
+       },
+       "physics": {
+-        "Mass": 1520,
+-        "TorqueScale": 745.7,
++        "Mass": 1140,
++        "TorqueScale": 343,
+         "TorqueScaleFactor": 1,
+         "TurboSize": 0,
+         "WheelDrive": 1,
+-        "BrakeTorque": 6500,
+-        "HandBrakeTorque": 3575,
++        "BrakeTorque": 4500,
++        "HandBrakeTorque": 2500,
+         "LatFrictionFactor": 1.5,
+         "AirKZZ": 0.46,
+         "AirKZY": 0.05,
+-        "MaxTorqueRPM": 5900,
+-        "MaxTurboTorqueRPM": 5900,
++        "MaxTorqueRPM": 4000,
++        "MaxTurboTorqueRPM": 4000,
+         "MinRPM": 800,
+         "MinRPMGearChange": 2200,
+-        "CutRPM": 7000,
+-        "MaxRPM": 7000,
++        "CutRPM": 6800,
++        "MaxRPM": 6800,
+         "TimeChangeGear": 0.08,
+         "TimeChangeGearFR": 0.3,
+-        "WheelRatio": 3.667,
+-        "WheelRadius": 0.3515,
++        "WheelRatio": 4.0,
++        "WheelRadius": 0.31,
+         "GearRatioVector": [
+-          -3.5,
+-          3.397,
+-          2.186,
+-          1.626,
+-          1.285,
+-          1.029,
+-          0.839,
+-          0.634
++          -3.25,
++          2.25,
++          1.304,
++          0.893,
++          0.656
+         ],
+         "GearStatusDownGearFactor": 0.72,
+-        "SteeringEndSpeed": 243
++        "SteeringEndSpeed": 210
+       },
+       "ratings": {
+-        "TOPSPEED": 8,
+-        "ACCELERATION": 8,
+-        "MASS": 6,
+-        "HANDLING": 7,
+-        "DURABILITY": 4
++        "TOPSPEED": 6,
++        "ACCELERATION": 6,
++        "MASS": 4,
++        "HANDLING": 5,
++        "DURABILITY": 6
+       },
+       "speedometer": {
+-        "max_kmh": 380,
+-        "max_mph": 240
++        "max_kmh": 300,
++        "max_mph": 180
+       }
+     },
+     "Senna_Road": {
+-      "variant": "2019 McLaren Senna",
++      "variant": "2009 Aston Martin DBS (coupé, manual)",
+       "specification": {
+-        "power_kw": 588,
+-        "power_label": "800 PS / 588 kW",
+-        "torque_nm": 800,
+-        "mass_kg": 1309,
+-        "mass_basis": "Fluids and 90% fuel; dry mass 1,198 kg",
+-        "top_speed_kmh": 335,
+-        "zero_to_100_s": 2.8,
+-        "gear_count": 7,
+-        "power_rpm": 7500,
+-        "torque_rpm": "5500-6500",
+-        "dry_mass_kg": 1198,
+-        "redline_rpm": 8415,
+-        "drivetrain": "Rear-wheel drive",
+-        "gear_ratios": [
+-          3.982,
+-          2.612,
+-          1.905,
+-          1.479,
+-          1.16,
+-          0.906,
+-          0.686
+-        ],
+-        "final_drive": 3.308
++        "power_kw": 380.0,
++        "power_label": "517 PS",
++        "torque_nm": 570,
++        "mass_kg": 1695,
++        "mass_basis": "Kerb",
++        "top_speed_kmh": 307,
++        "zero_to_100_s": 4.3,
++        "gear_count": 6,
++        "power_rpm": 6500,
++        "torque_rpm": 5750,
++        "zero_to_60_mph_s": null,
++        "redline_rpm": 7200,
++        "drivetrain": "Rear-wheel drive, front-mid engine",
++        "engine": "6.0-litre V12",
++        "gear_ratios": null,
++        "final_drive": null
+       },
+       "notes": [
+-        "The owner's portal lists maximum engine speed 8,415 rpm; this is retained rather than silently replacing it with an 8,250 rpm figure.",
+-        "Full-load torque shape between published endpoints, shift rpm, reverse gear, drag and tyre grip are game calibration."
++        "Galaxy Car Showroom model (CC BY), slot 9010.",
++        "Gear ratios and final drive not verified; the preset gearing is scaled for 307 km/h.",
++        "Installed arcade tuning: Mass 1695, TorqueScale 1070, 6 gears for ~300 km/h."
+       ],
+       "sources": [
+         {
+-          "title": "McLaren Senna manufacturer specification",
+-          "url": "https://www.mclaren.com/cars/gl_en/ultimate-models/mclaren-senna"
+-        },
+-        {
+-          "title": "McLaren Owners Handbook: Senna technical data",
+-          "url": "https://owners.mclaren.com/"
++          "title": "Aston Martin DBS (2007-2012), Aston Martin heritage",
++          "url": "https://www.astonmartin.com/en/our-world/heritage"
+         }
+       ],
+       "calibration": {
+-        "status": "Initial physics calibration; performance targets require in-game measurement",
+-        "target_top_speed_kmh": 335,
+-        "target_zero_to_100_s": 2.8,
+-        "mass_kg": 1309,
+-        "peak_torque_nm": 800,
+-        "shift_rpm": 8000,
+-        "reference_wheel_radius_m": 0.3485,
++        "status": "Arcade tuning installed; this factory preset is an untested alternative",
++        "target_top_speed_kmh": 307,
++        "target_zero_to_100_s": 4.3,
++        "mass_kg": 1695,
++        "peak_torque_nm": 570,
++        "shift_rpm": 7000,
++        "reference_wheel_radius_m": 0.345,
+         "torque_curve": [
+           [
+             0,
+-            0.25
++            0.3
+           ],
+           [
+-            850,
+-            0.4
++            800,
++            0.45
+           ],
+           [
+             2500,
+-            0.72
++            0.75
+           ],
+           [
+-            5500,
+-            1
++            4500,
++            0.93
+           ],
+           [
+-            6500,
++            5750,
+             1
+           ],
+           [
+-            7500,
+-            0.935830129549
++            6500,
++            0.97
+           ],
+           [
+-            8415,
+-            0.78
++            7200,
++            0.85
+           ]
+         ],
+-        "drag_coefficient_native": 0.58,
++        "drag_coefficient_native": 0.46,
+         "assumptions": "Piecewise torque fractions, drag, tyre grip, brakes, shift timing, reverse ratio where unavailable, and menu ratings are game calibration, not manufacturer specifications. Runtime compensates geometry wheel radius in final drive; native TorqueScale uses Nm only with engine_profile=factory."
+       },
+       "physics": {
+-        "Mass": 1309,
+-        "TorqueScale": 800,
++        "Mass": 1695,
++        "TorqueScale": 570,
+         "TorqueScaleFactor": 1,
+         "TurboSize": 0,
+         "WheelDrive": 1,
+-        "BrakeTorque": 7600,
+-        "HandBrakeTorque": 4180,
+-        "LatFrictionFactor": 1.7,
+-        "AirKZZ": 0.58,
++        "BrakeTorque": 6500,
++        "HandBrakeTorque": 3575,
++        "LatFrictionFactor": 1.5,
++        "AirKZZ": 0.46,
+         "AirKZY": 0.05,
+-        "MaxTorqueRPM": 6000,
+-        "MaxTurboTorqueRPM": 6000,
+-        "MinRPM": 850,
+-        "MinRPMGearChange": 2500,
+-        "CutRPM": 8415,
+-        "MaxRPM": 8415,
++        "MaxTorqueRPM": 5750,
++        "MaxTurboTorqueRPM": 5750,
++        "MinRPM": 800,
++        "MinRPMGearChange": 2200,
++        "CutRPM": 7200,
++        "MaxRPM": 7200,
+         "TimeChangeGear": 0.08,
+         "TimeChangeGearFR": 0.3,
+-        "WheelRatio": 3.308,
+-        "WheelRadius": 0.3485,
++        "WheelRatio": 3.71,
++        "WheelRadius": 0.345,
+         "GearRatioVector": [
+-          -3.9,
+-          3.982,
+-          2.612,
+-          1.905,
+-          1.479,
+-          1.16,
+-          0.906,
+-          0.686
++          -3.3,
++          2.66,
++          1.78,
++          1.3,
++          1.0,
++          0.8,
++          0.63
+         ],
+         "GearStatusDownGearFactor": 0.72,
+-        "SteeringEndSpeed": 234
++        "SteeringEndSpeed": 230
+       },
+       "ratings": {
+         "TOPSPEED": 8,
+-        "ACCELERATION": 9,
+-        "MASS": 5,
+-        "HANDLING": 8,
+-        "DURABILITY": 3
++        "ACCELERATION": 7,
++        "MASS": 7,
++        "HANDLING": 7,
++        "DURABILITY": 6
+       },
+       "speedometer": {
+-        "max_kmh": 360,
+-        "max_mph": 240
++        "max_kmh": 340,
++        "max_mph": 200
+       }
+     },
+     "Senna_GTR1": {
+-      "variant": "2020 McLaren Senna GTR",
++      "variant": "2021 Porsche 911 GT3 (992, PDK)",
+       "specification": {
+-        "power_kw": 607,
+-        "power_label": "825 PS / 607 kW",
+-        "torque_nm": 800,
+-        "mass_kg": 1188,
+-        "mass_basis": "Dry; running mass not published",
+-        "top_speed_kmh": null,
+-        "zero_to_100_s": null,
++        "power_kw": 375.0,
++        "power_label": "510 PS",
++        "torque_nm": 470,
++        "mass_kg": 1435,
++        "mass_basis": "Kerb (DIN), PDK",
++        "top_speed_kmh": 318,
++        "zero_to_100_s": 3.4,
+         "gear_count": 7,
+-        "power_rpm": 7500,
+-        "torque_rpm": "5500-6500",
+-        "redline_rpm": 8250,
+-        "drivetrain": "Rear-wheel drive",
+-        "gear_ratios": [
+-          3.982,
+-          2.612,
+-          1.905,
+-          1.479,
+-          1.16,
+-          0.906,
+-          0.686
+-        ]
++        "power_rpm": 8400,
++        "torque_rpm": 6100,
++        "zero_to_60_mph_s": null,
++        "redline_rpm": 9000,
++        "drivetrain": "Rear-wheel drive, rear engine",
++        "engine": "4.0-litre naturally aspirated flat-six",
++        "gear_ratios": null,
++        "final_drive": null
+       },
+       "notes": [
+-        "The handbook specifies seven ratios but does not verify a final drive; 3.308 is inferred from the road Senna and remains a calibration assumption.",
+-        "1,270 kg operating mass is estimated from 1,188 kg dry. Reference tyre radius 0.3525 m is a calibration assumption.",
+-        "No factory 0-100 or top speed was found. 2.7 s and 325 km/h are provisional targets for a high-downforce setup, not published facts."
++        "Ddiaz Design model (from CSR2; personal use), slot 9011.",
++        "7-speed PDK ratios not verified; the installed tuning uses 6 game gears for ~320 km/h.",
++        "Installed arcade tuning: Mass 1435, TorqueScale 1055."
+       ],
+       "sources": [
+         {
+-          "title": "McLaren Senna GTR owner manual, pages 82-84",
+-          "url": "https://mclaren-web.s3.eu-west-2.amazonaws.com/files/Owner%20Manual%20-%20P15R%20-%20English.pdf"
++          "title": "Porsche 911 GT3 (992) technical data, Porsche AG",
++          "url": "https://www.porsche.com/international/models/911/911-gt3-models/911-gt3/"
+         }
+       ],
+       "calibration": {
+-        "status": "Initial physics calibration; performance targets require in-game measurement",
+-        "target_top_speed_kmh": 325,
+-        "target_zero_to_100_s": 2.7,
+-        "mass_kg": 1270,
+-        "peak_torque_nm": 800,
+-        "shift_rpm": 7900,
+-        "reference_wheel_radius_m": 0.3525,
++        "status": "Arcade tuning installed; this factory preset is an untested alternative",
++        "target_top_speed_kmh": 318,
++        "target_zero_to_100_s": 3.4,
++        "mass_kg": 1435,
++        "peak_torque_nm": 470,
++        "shift_rpm": 8800,
++        "reference_wheel_radius_m": 0.345,
+         "torque_curve": [
+           [
+             0,
+-            0.25
++            0.3
+           ],
+           [
+-            1000,
+-            0.42
++            800,
++            0.4
+           ],
+           [
+-            2500,
+-            0.73
++            3000,
++            0.78
+           ],
+           [
+-            5500,
+-            1
++            5000,
++            0.93
+           ],
+           [
+-            6500,
++            6100,
+             1
+           ],
+           [
+-            7500,
+-            0.966069538497
++            8400,
++            0.907
+           ],
+           [
+-            8250,
+-            0.84
++            9000,
++            0.8
+           ]
+         ],
+-        "drag_coefficient_native": 0.67,
++        "drag_coefficient_native": 0.46,
+         "assumptions": "Piecewise torque fractions, drag, tyre grip, brakes, shift timing, reverse ratio where unavailable, and menu ratings are game calibration, not manufacturer specifications. Runtime compensates geometry wheel radius in final drive; native TorqueScale uses Nm only with engine_profile=factory."
+       },
+       "physics": {
+-        "Mass": 1270,
+-        "TorqueScale": 800,
++        "Mass": 1435,
++        "TorqueScale": 470,
+         "TorqueScaleFactor": 1,
+         "TurboSize": 0,
+         "WheelDrive": 1,
+-        "BrakeTorque": 8200,
+-        "HandBrakeTorque": 4510,
+-        "LatFrictionFactor": 1.95,
+-        "AirKZZ": 0.67,
++        "BrakeTorque": 6500,
++        "HandBrakeTorque": 3575,
++        "LatFrictionFactor": 1.5,
++        "AirKZZ": 0.46,
+         "AirKZY": 0.05,
+-        "MaxTorqueRPM": 6000,
+-        "MaxTurboTorqueRPM": 6000,
+-        "MinRPM": 1000,
+-        "MinRPMGearChange": 2500,
+-        "CutRPM": 8250,
+-        "MaxRPM": 8250,
++        "MaxTorqueRPM": 6100,
++        "MaxTurboTorqueRPM": 6100,
++        "MinRPM": 800,
++        "MinRPMGearChange": 2200,
++        "CutRPM": 9000,
++        "MaxRPM": 9000,
+         "TimeChangeGear": 0.08,
+         "TimeChangeGearFR": 0.3,
+-        "WheelRatio": 3.308,
+-        "WheelRadius": 0.3525,
++        "WheelRatio": 4.0,
++        "WheelRadius": 0.345,
+         "GearRatioVector": [
+-          -3.9,
+-          3.982,
+-          2.612,
+-          1.905,
+-          1.479,
+-          1.16,
+-          0.906,
+-          0.686
++          -3.3,
++          3.75,
++          2.38,
++          1.72,
++          1.34,
++          1.11,
++          0.96,
++          0.84
+         ],
+         "GearStatusDownGearFactor": 0.72,
+-        "SteeringEndSpeed": 227
++        "SteeringEndSpeed": 250
+       },
+       "ratings": {
+         "TOPSPEED": 8,
+-        "ACCELERATION": 9,
++        "ACCELERATION": 8,
+         "MASS": 5,
+         "HANDLING": 9,
+-        "DURABILITY": 2
++        "DURABILITY": 4
+       },
+       "speedometer": {
+-        "max_kmh": 360,
+-        "max_mph": 240
++        "max_kmh": 340,
++        "max_mph": 200
+       }
+     },
+     "FXXK_Racer": {
+-      "variant": "2015 Ferrari FXX K",
++      "variant": "1975 Porsche 911 Turbo (930) 3.0, Guards Red",
+       "specification": {
+-        "power_kw": 772.2736874999999,
+-        "power_label": "1,050 CV combined; 860 CV combustion + 190 CV electric",
+-        "torque_nm": null,
+-        "mass_kg": null,
+-        "mass_basis": "Not published in the verified source",
+-        "top_speed_kmh": null,
+-        "zero_to_100_s": null,
+-        "gear_count": 7,
+-        "ice_power_kw": 632.528925,
+-        "ice_power_rpm": 9200,
+-        "electric_power_kw": 139.7447625,
+-        "torque_label": "more than 900 Nm combined; 750 Nm combustion at 6,500 rpm",
+-        "redline_rpm": 9250,
+-        "drivetrain": "Rear-wheel drive"
++        "power_kw": 191.0,
++        "power_label": "260 PS (DIN)",
++        "torque_nm": 343,
++        "mass_kg": 1140,
++        "mass_basis": "Kerb (DIN)",
++        "top_speed_kmh": 250,
++        "zero_to_100_s": 5.5,
++        "gear_count": 4,
++        "power_rpm": 5500,
++        "torque_rpm": 4000,
++        "zero_to_60_mph_s": null,
++        "redline_rpm": 6800,
++        "drivetrain": "Rear-wheel drive, rear engine",
++        "engine": "3.0-litre turbocharged flat-six",
++        "gear_ratios": [
++          2.25,
++          1.304,
++          0.893,
++          0.656
++        ],
++        "final_drive": 4.0
+       },
+       "notes": [
+-        "Factory total mass, ratios, final drive, 0-100 and maximum speed were not verified; 1,590 kg, selected seven ratios, 4.375 final drive, 2.8 s and 350 km/h are explicit calibration estimates.",
+-        "The single normalized curve approximates combined combustion/electric output with a 950 Nm peak. It does not model battery charge, regeneration or deploy-duration limits.",
+-        "Combined power is 1,050 CV, not 1,050 SAE hp. 9,250 rpm maximum is from the Ferrari brochure."
++        "Lionsharp Studios model; silver (slot 9009) and Guards Red (slot 9012) share these figures.",
++        "4-speed 930 gearbox; the in-game installed tuning uses arcade units (Mass 1140, TorqueScale 550, 4 gears for ~250 km/h).",
++        "Redline 6,800 rpm is approximate for the 3.0 Turbo."
+       ],
+       "sources": [
+         {
+-          "title": "Ferrari XX Programme and F1 Clienti brochure, page 8",
+-          "url": "https://cdn.ferrari.com/cms/network/media/pdf/XXPROGRAMME_F1CLIENTI_Brochure_Ferrari.pdf"
+-        },
+-        {
+-          "title": "Ferrari-issued FXX K launch release (preserved copy)",
+-          "url": "https://www.allcarindex.com/blog/2014-ferrari-fxx-k"
++          "title": "Porsche 911 Turbo (930) 3.0, Porsche AG model history",
++          "url": "https://www.porsche.com/international/aboutporsche/porschehistory/"
+         }
+       ],
+       "calibration": {
+-        "status": "Initial physics calibration; performance targets require in-game measurement",
+-        "target_top_speed_kmh": 350,
+-        "target_zero_to_100_s": 2.8,
+-        "mass_kg": 1590,
+-        "peak_torque_nm": 950,
+-        "shift_rpm": 9000,
+-        "reference_wheel_radius_m": 0.3575,
++        "status": "Arcade tuning installed; this factory preset is an untested alternative",
++        "target_top_speed_kmh": 250,
++        "target_zero_to_100_s": 5.5,
++        "mass_kg": 1140,
++        "peak_torque_nm": 343,
++        "shift_rpm": 6500,
++        "reference_wheel_radius_m": 0.31,
+         "torque_curve": [
+           [
+             0,
+-            0.35
++            0.25
+           ],
+           [
+-            1000,
+-            0.55
++            800,
++            0.3
++          ],
++          [
++            2500,
++            0.45
+           ],
+           [
+             3500,
+             0.8
+           ],
+           [
+-            6500,
++            4000,
+             1
+           ],
+           [
+-            8000,
++            5500,
+             0.95
+           ],
+           [
+-            9200,
+-            0.843782964812
+-          ],
+-          [
+-            9250,
+-            0.835
++            6800,
++            0.75
+           ]
+         ],
+-        "drag_coefficient_native": 0.74,
++        "drag_coefficient_native": 0.46,
+         "assumptions": "Piecewise torque fractions, drag, tyre grip, brakes, shift timing, reverse ratio where unavailable, and menu ratings are game calibration, not manufacturer specifications. Runtime compensates geometry wheel radius in final drive; native TorqueScale uses Nm only with engine_profile=factory."
+       },
+       "physics": {
+-        "Mass": 1590,
+-        "TorqueScale": 950,
++        "Mass": 1140,
++        "TorqueScale": 343,
+         "TorqueScaleFactor": 1,
+         "TurboSize": 0,
+         "WheelDrive": 1,
+-        "BrakeTorque": 8500,
+-        "HandBrakeTorque": 4675,
+-        "LatFrictionFactor": 1.95,
+-        "AirKZZ": 0.74,
++        "BrakeTorque": 4500,
++        "HandBrakeTorque": 2500,
++        "LatFrictionFactor": 1.5,
++        "AirKZZ": 0.46,
+         "AirKZY": 0.05,
+-        "MaxTorqueRPM": 6500,
+-        "MaxTurboTorqueRPM": 6500,
+-        "MinRPM": 1000,
+-        "MinRPMGearChange": 3500,
+-        "CutRPM": 9250,
+-        "MaxRPM": 9250,
++        "MaxTorqueRPM": 4000,
++        "MaxTurboTorqueRPM": 4000,
++        "MinRPM": 800,
++        "MinRPMGearChange": 2200,
++        "CutRPM": 6800,
++        "MaxRPM": 6800,
+         "TimeChangeGear": 0.08,
+         "TimeChangeGearFR": 0.3,
+-        "WheelRatio": 4.375,
+-        "WheelRadius": 0.3575,
++        "WheelRatio": 4.0,
++        "WheelRadius": 0.31,
+         "GearRatioVector": [
+-          -3.5,
+-          3.08,
+-          2.19,
+-          1.626,
+-          1.286,
+-          1.028,
+-          0.839,
+-          0.693
++          -3.25,
++          2.25,
++          1.304,
++          0.893,
++          0.656
+         ],
+         "GearStatusDownGearFactor": 0.72,
+-        "SteeringEndSpeed": 245
++        "SteeringEndSpeed": 210
+       },
+       "ratings": {
+-        "TOPSPEED": 8,
+-        "ACCELERATION": 9,
+-        "MASS": 6,
+-        "HANDLING": 9,
+-        "DURABILITY": 2
++        "TOPSPEED": 6,
++        "ACCELERATION": 6,
++        "MASS": 4,
++        "HANDLING": 5,
++        "DURABILITY": 6
+       },
+       "speedometer": {
+-        "max_kmh": 400,
+-        "max_mph": 260
++        "max_kmh": 300,
++        "max_mph": 180
+       }
+     },
+     "Regera_GT1": {
+diff --git a/car-mods/prepare.py b/car-mods/prepare.py
+index 1bfdfa3..806ba6a 100644
+--- a/car-mods/prepare.py
++++ b/car-mods/prepare.py
+@@ -76,10 +76,10 @@ IDENTITIES = {
+     9004: ("Panoz", "Viper", "Panoz GTR-1"),
+     9005: ("McLaren_F1", "Koenigsegg", "McLaren F1"),
+     9006: ("Form1", "Lotus", "Formula 1"),
+-    9009: ("Ford_GTcar", "Koenigsegg", "Ford GT"),
+-    9010: ("Senna_Road", "Koenigsegg", "McLaren Senna"),
+-    9011: ("Senna_GTR1", "Koenigsegg", "McLaren Senna GTR"),
+-    9012: ("FXXK_Racer", "Koenigsegg", "Ferrari FXX K"),
++    9009: ("Ford_GTcar", "Koenigsegg", "Porsche 930 Turbo"),
++    9010: ("Senna_Road", "Koenigsegg", "Aston Martin DBS"),
++    9011: ("Senna_GTR1", "Koenigsegg", "Porsche 911 GT3"),
++    9012: ("FXXK_Racer", "Koenigsegg", "Porsche 930 Turbo Red"),
+     9013: ("Regera_GT1", "Koenigsegg", "Koenigsegg Regera"),
+     9014: ("AventadorX", "Koenigsegg", "Lamborghini Aventador"),
+ }
+@@ -109,7 +109,9 @@ def load_config(path: Path) -> dict:
+     seen_ids, seen_aliases = set(), set()
+     for car in config["cars"]:
+         required = {"id", "alias", "donor", "display_name", "ratings", "physics", "colors"}
+-        exact_keys(car, required | {"speedometer", "model_package", "engine_profile"}, "car")
++        exact_keys(car, required | {"speedometer", "model_package", "engine_profile", "hidden"}, "car")
++        if not isinstance(car.get("hidden", False), bool):
++            raise ValueError("hidden must be true or false")
+         if not required <= set(car):
+             raise ValueError("Each car requires id, alias, donor, display_name, ratings, physics, colors")
+         ident = car["id"]
+@@ -328,6 +330,10 @@ def tweak_variant(original: bytes, car: dict) -> bytes:
+     info = {"ID": car["id"], **car["ratings"], "PAINTJOBNAME": car["alias"]}
+     text = update_section(text, "CarInfo", info, {"LOCKED", "HIDDEN", "ADMITTANCE", "SKIN", "COLOR"})
+     colors = "".join(f"\tCOLOR\t\t{i} 0x{c[1:]} 0x{c[1:]}\r\n" for i, c in enumerate(car["colors"]))
++    # A hidden car is left out of the menus the way retail hides its unused
++    # cars: locked, hidden and with no admittance to unlock it.
++    if car.get("hidden"):
++        colors += "\tHIDDEN\r\n\tLOCKED\r\n"
+     text = text.replace("End(CarInfo)", colors + "End(CarInfo)", 1)
+     physics = dict(car["physics"])
+     if "GearRatioVector" in physics:
