@@ -5332,8 +5332,11 @@ void nv2a_d3d_tick(void)
         /* A title can keep drawing the displayed buffer with the CPU after its
          * last GPU flip, without another AvSetDisplayMode -- or with the GPU:
          * the CRTC scans the front buffer out, so what is drawn into it shows
-         * (MM3 draws its briefing that way and waits for A without a flip). */
-        if (s_shown && now - s_last_flip > 50) {
+         * (MM3 draws its briefing that way and waits for A without a flip).
+         * Only once flips have really stopped: a race intro runs at about
+         * 20 fps (45-65 ms a frame), and at 50 ms this showed the next frame
+         * half drawn -- no trees, lamps or letterbox -- as a flash. */
+        if (s_shown && now - s_last_flip > 250) {
             uint32_t generation = s_shown->gen;
             /* Do not commit a new shadow while an older GPU readback is pending:
              * readback uses that shadow to identify and preserve later CPU writes. */
